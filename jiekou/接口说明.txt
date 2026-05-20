@@ -1,0 +1,47 @@
+接口说明：
+
+1、获取状态: http://192.168.3.200:8888/api/status
+结果: 返回 JSON 格式的设备状态信息。
+
+2、获取原始图像: 浏览器会直接显示一张摄像头拍摄的原始图片。
+参数: ?pre_move=true (可选，设为true则拍照前先将机械臂移到安全位置)
+直接获取图像：http://192.168.3.200:8888/capture
+移动后获取图像：http://192.168.3.200:8888/capture?pre_move=true
+
+3、获取透视图像:浏览器会直接显示一张经过裁剪和透视变换后的图片。
+参数: ?pre_move=true (可选，设为true则拍照前先将机械臂移到安全位置)
+直接获取图像：http://192.168.3.200:8888/transform
+移动后获取透视图像：http://192.168.3.200:8888/transform?pre_move=true
+
+4、下发机械臂命令（超时定义 ?wait=true/false/3000）
+curl -X POST -d "cmd=move_click, 0.5, 0.5, 1, 200" "http://192.168.3.200:8888/api/command?wait=true"
+curl -X POST -d "cmd=drag, 0.1, 0.1, 0.9, 0.9" "http://192.168.3.200:8888/api/command?wait=true"
+curl -X POST -d "cmd=move,1000,1000" "http://192.168.3.200:8888/api/command?wait=true"
+curl -X POST -d "cmd=z_click, 1, 0" "http://192.168.3.200:8888/api/command?wait=true"
+curl -X POST "http://192.168.3.200:8888/api/reset_device?wait=true"
+
+5、下发 TTS 语音（最大支持20个汉字）
+curl -X POST -d "text=hello world" "http://192.168.3.200:8888/api/audio?wait=true"
+
+6、复位
+curl -X POST "http://192.168.3.200:8888/api/reset_device?wait=true"
+
+7、重启
+curl -X POST http://192.168.3.200:8888/api/restart_system
+
+8、设备上线状态上报 (ESP32 -> Python服务器)
+说明: 设备启动连接WiFi成功后，主动向服务器汇报自身状态。
+URL: http://<server_ip>:5000/api/report
+Method: POST
+Content-Type: application/json
+Body:
+{
+    "mac": "AA:BB:CC:DD:EE:FF",
+    "ip": "192.168.3.200",
+    "gateway": "192.168.3.1",
+    "subnet": "255.255.255.0",
+    "dns": "8.8.8.8",
+    "ap_mac": "00:11:22:33:44:55",
+    "version": "1.0.0",
+    "rssi": -65
+}
