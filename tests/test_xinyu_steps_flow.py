@@ -1,0 +1,435 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from PIL import Image
+
+from apps.xinyu import app as xinyu_app
+from apps.xinyu import steps
+
+
+class FakeRobot:
+    def __init__(self, images: list[object]) -> None:
+        self.images = list(images)
+        self.clicks: list[tuple[float, float]] = []
+        self.played: list[str] = []
+
+    def get_transform_image(self, pre_move: bool = True, save_path=None):
+        return self.images.pop(0) if self.images else "list"
+
+    def move_click(self, x: float, y: float) -> None:
+        self.clicks.append((x, y))
+
+    def play_audio(self, chunk: str, wait: bool = True) -> None:
+        self.played.append(chunk)
+
+
+def _touch(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"template")
+
+
+def _config(tmp_path: Path) -> dict[str, object]:
+    buttons_dir = tmp_path / "buttons"
+    screens_dir = tmp_path / "screens"
+    for path in [
+        buttons_dir / "btn_返回按钮.jpg",
+        buttons_dir / "btn_返回按钮_2.jpg",
+        buttons_dir / "btn_未读消息按钮.jpg",
+        buttons_dir / "btn_输入框.jpg",
+        buttons_dir / "btn_麦克风按钮.jpg",
+        buttons_dir / "btn_发送按钮.jpg",
+        buttons_dir / "popup_custom_1.jpg",
+        screens_dir / "screen_聊天列表.jpg",
+        screens_dir / "screen_聊天界面.jpg",
+        screens_dir / "screen_黑屏异常.jpg",
+    ]:
+        _touch(path)
+    return {
+        "templates": {"buttons": str(buttons_dir), "screens": str(screens_dir)},
+        "step_timeout": 0.2,
+        "greetings_dir": str(tmp_path / "greetings"),
+    }
+
+
+def test_xinyu_list_ocr_treats_left_badge_as_default_unread(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list"])
+
+    def fake_match(image, template, threshold=0.85):
+        if image == "list" and Path(template).name == "screen_聊天列表.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+    monkeypatch.setattr(steps, "_has_red_pixels", lambda image, match_result: True)
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "result": {
+                "message_list": [
+                    {"name": "白嫖", "favorability": 44, "unread_count": 1, "content": "", "bounds": [0.1, 0.2, 0.4, 0.3]},
+                    {"name": "张三", "favorability": 12, "unread_count": 1, "content": "你好", "bounds": [0.2, 0.4, 0.5, 0.5]},
+                ]
+            },
+            "ocr_items": [],
+        },
+    )
+
+    target = steps.find_unread_target(robot, config)
+
+    assert target["name"] == "白嫖"
+    assert target["favorability"] == 44
+    assert target["unread_count"] == 1
+
+
+def test_xinyu_ensure_list_screen_raises_on_black_screen(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["black"])
+
+    def fake_match(image, template, threshold=0.85):
+        if image == "black" and Path(template).name == "screen_黑屏异常.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+
+    with pytest.raises(steps.BlackScreenError):
+        steps.ensure_list_screen(robot, config)
+
+
+def test_xinyu_ensure_list_screen_raises_on_pixel_black_screen(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    black_image = Image.new("RGB", (200, 400), (3, 3, 3))
+    robot = FakeRobot([black_image])
+
+    monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
+
+    with pytest.raises(steps.BlackScreenError):
+        steps.ensure_list_screen(robot, config)
+    assert robot.clicks == []
+
+
+def test_xinyu_app_black_screen_opens_circuit_without_recovery(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["black"])
+    logs: list[tuple[str, str, dict | None]] = []
+
+    monkeypatch.setattr(
+        xinyu_app.steps,
+        "find_unread_target",
+        lambda robot, config, reporter=None: (_ for _ in ()).throw(steps.BlackScreenError("black screen detected")),
+    )
+
+    app = xinyu_app.XinyuApp(robot, config, reply_provider=lambda message: "AI回复")
+    app.set_log_callback(lambda level, message, payload=None: logs.append((level, message, payload)))
+    app.run_once()
+
+    assert app.status.is_circuit_open is True
+    assert "black screen" in app.status.last_error
+    assert app.status.current_step == "black_screen_circuit_open"
+    assert app.status.current_step_label == "黑屏熔断"
+    assert logs[-1][1] == "black_screen_detected"
+
+
+def test_xinyu_unread_red_pixel_detection_accepts_pink_red_badge():
+    red_badge = Image.new("RGB", (28, 27), (90, 128, 165))
+    for x in range(9, 19):
+        for y in range(8, 18):
+            red_badge.putpixel((x, y), (104, 54, 91))
+    no_red = Image.new("RGB", (28, 27), (90, 128, 165))
+    full_match = {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
+
+    assert steps._has_red_pixels(red_badge, full_match) is True
+    assert steps._has_red_pixels(no_red, full_match) is False
+
+
+def test_xinyu_list_selects_highest_favorability_target(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list"])
+
+    def fake_match(image, template, threshold=0.85):
+        if image == "list" and Path(template).name == "screen_聊天列表.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+    monkeypatch.setattr(steps, "_has_red_pixels", lambda image, match_result: True)
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "result": {
+                "message_list": [
+                    {"name": "甲", "favorability": 4, "unread_count": 1, "content": "短消息", "bounds": [0.1, 0.2, 0.3, 0.3]},
+                    {"name": "乙", "favorability": 9, "unread_count": 1, "content": "更高", "bounds": [0.2, 0.4, 0.5, 0.5]},
+                ]
+            },
+            "ocr_items": [],
+        },
+    )
+
+    target = steps.find_unread_target(robot, config)
+
+    assert target["name"] == "乙"
+
+
+def test_xinyu_app_uses_short_list_content_directly(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list", "chat", "chat", "chat", "chat", "list"])
+    sent: list[tuple[str, str]] = []
+    replies: list[dict[str, str]] = []
+
+    monkeypatch.setattr(xinyu_app.steps, "find_unread_target", lambda robot, config, reporter=None: {"name": "白嫖", "content": "在吗", "favorability": 44, "unread_count": 1, "bounds": [0.1, 0.2, 0.3, 0.4], "x": 0.2, "y": 0.3})
+    monkeypatch.setattr(xinyu_app.steps, "enter_chat", lambda robot, x, y: robot.move_click(x, y))
+    monkeypatch.setattr(xinyu_app.steps, "confirm_chat_window", lambda robot, config, reporter=None: "chat")
+    monkeypatch.setattr(xinyu_app.steps, "build_list_message", lambda target, content: {"contact": target["name"], "content": content})
+    monkeypatch.setattr(xinyu_app.steps, "input_reply", lambda robot, text, config, reporter=None: replies.append({"text": text}))
+    monkeypatch.setattr(xinyu_app.steps, "send_reply", lambda robot, config, reporter=None: 1)
+    monkeypatch.setattr(xinyu_app.steps, "go_back", lambda robot, config, reporter=None: robot.move_click(0.08, 0.06))
+
+    events: list[dict[str, object]] = []
+    app = xinyu_app.XinyuApp(
+        robot,
+        config,
+        reply_provider=lambda message: "AI回复",
+        sent_callback=lambda action, message: sent.append((action.text, message["content"])),
+    )
+    app.set_status_callback(events.append)
+
+    app.run_once()
+
+    assert replies == [{"text": "AI回复"}]
+    assert sent == [("AI回复", "在吗")]
+    assert any(event.get("current_step_label") == "进入聊天界面" for event in events)
+    assert any(event.get("current_step_log_label") == "进入聊天界面：白嫖 (0.200, 0.300)" for event in events)
+
+
+def test_xinyu_app_logs_list_content_used_for_reply(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list", "chat", "chat", "chat", "list"])
+    statuses: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        xinyu_app.steps,
+        "find_unread_target",
+        lambda robot, config, reporter=None: {"name": "白嫖", "content": "在吗", "favorability": 44, "unread_count": 1, "bounds": [0.1, 0.2, 0.3, 0.4], "x": 0.2, "y": 0.3},
+    )
+    monkeypatch.setattr(xinyu_app.steps, "enter_chat", lambda robot, x, y: robot.move_click(x, y))
+    monkeypatch.setattr(xinyu_app.steps, "confirm_chat_window", lambda robot, config, reporter=None: "chat")
+    monkeypatch.setattr(xinyu_app.steps, "build_list_message", lambda target, content: {"contact": target["name"], "content": content})
+    monkeypatch.setattr(xinyu_app.steps, "input_reply", lambda robot, text, config, reporter=None: None)
+    monkeypatch.setattr(xinyu_app.steps, "send_reply", lambda robot, config, reporter=None: 1)
+    monkeypatch.setattr(xinyu_app.steps, "go_back", lambda robot, config, reporter=None: None)
+    monkeypatch.setattr(xinyu_app.random, "choice", lambda values: values[0])
+
+    app = xinyu_app.XinyuApp(robot, config, reply_provider=lambda message: "AI回复")
+    app.set_status_callback(statuses.append)
+    app.run_once()
+
+    assert any(
+        status.get("current_step") == "direct_content_reply"
+        and status.get("current_step_label") == "使用列表内容作为对话输入"
+        and status.get("current_step_log_label") == "使用列表内容作为对话输入：在吗"
+        for status in statuses
+    )
+
+
+def test_xinyu_app_empty_target_does_not_keep_awake_before_idle_interval(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    config["keep_awake_interval_seconds"] = 30
+    robot = FakeRobot(["list"])
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        xinyu_app.steps,
+        "find_unread_target",
+        lambda robot, config, reporter=None: {
+            "name": "暂无消息",
+            "content": "",
+            "favorability": None,
+            "unread_count": 1,
+            "bounds": [0.1, 0.2, 0.3, 0.4],
+            "x": 0.2,
+            "y": 0.3,
+        },
+    )
+    monkeypatch.setattr(xinyu_app.steps, "keep_screen_awake", lambda robot, config, reporter=None: calls.append("keep_awake") or True)
+    monkeypatch.setattr(xinyu_app.steps, "enter_chat", lambda robot, x, y: calls.append("enter_chat"))
+
+    app = xinyu_app.XinyuApp(robot, config, reply_provider=lambda message: "AI回复")
+    app.run_once()
+
+    assert calls == []
+    assert app.status.last_error == ""
+
+
+def test_xinyu_app_empty_target_keep_awake_only_after_idle_interval(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    config["keep_awake_interval_seconds"] = 30
+    robot = FakeRobot(["list"])
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        xinyu_app.steps,
+        "find_unread_target",
+        lambda robot, config, reporter=None: {
+            "name": "暂无消息",
+            "content": "",
+            "favorability": None,
+            "unread_count": 1,
+            "bounds": [0.1, 0.2, 0.3, 0.4],
+            "x": 0.2,
+            "y": 0.3,
+        },
+    )
+    monkeypatch.setattr(xinyu_app.steps, "keep_screen_awake", lambda robot, config, reporter=None: calls.append("keep_awake") or True)
+    monkeypatch.setattr(xinyu_app.steps, "enter_chat", lambda robot, x, y: calls.append("enter_chat"))
+
+    app = xinyu_app.XinyuApp(robot, config, reply_provider=lambda message: "AI回复")
+    app.last_activity_at -= 31
+    app.run_once()
+
+    assert calls == ["keep_awake"]
+    assert app.status.last_error == ""
+
+
+def test_xinyu_app_uses_greeting_file_for_nihao(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    greetings = Path(config["greetings_dir"])
+    greetings.mkdir(parents=True, exist_ok=True)
+    (greetings / "pingtai.txt").write_text("您好\n你好呀\n", encoding="utf-8")
+    robot = FakeRobot(["list", "chat", "chat", "chat", "list"])
+    sent: list[str] = []
+
+    monkeypatch.setattr(xinyu_app.steps, "find_unread_target", lambda robot, config, reporter=None: {"name": "白嫖", "content": "你好", "favorability": 44, "unread_count": 1, "bounds": [0.1, 0.2, 0.3, 0.4], "x": 0.2, "y": 0.3})
+    monkeypatch.setattr(xinyu_app.steps, "enter_chat", lambda robot, x, y: robot.move_click(x, y))
+    monkeypatch.setattr(xinyu_app.steps, "confirm_chat_window", lambda robot, config, reporter=None: "chat")
+    monkeypatch.setattr(xinyu_app.steps, "build_list_message", lambda target, content: {"contact": target["name"], "content": content})
+    monkeypatch.setattr(xinyu_app.steps, "input_reply", lambda robot, text, config, reporter=None: sent.append(text))
+    monkeypatch.setattr(xinyu_app.steps, "send_reply", lambda robot, config, reporter=None: 1)
+    monkeypatch.setattr(xinyu_app.steps, "go_back", lambda robot, config, reporter=None: robot.move_click(0.08, 0.06))
+    monkeypatch.setattr(xinyu_app.random, "choice", lambda values: values[0])
+
+    app = xinyu_app.XinyuApp(robot, config, reply_provider=lambda message: "AI回复")
+    app.run_once()
+
+    assert sent == ["您好"]
+
+
+def test_xinyu_app_reads_dialogue_sender1_last_message(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list", "chat", "chat", "chat", "chat", "list"])
+    seen: list[dict[str, str]] = []
+
+    monkeypatch.setattr(xinyu_app.steps, "find_unread_target", lambda robot, config, reporter=None: {"name": "白嫖", "content": "这是一个很长的消息内容，需要进详情", "favorability": 44, "unread_count": 1, "bounds": [0.1, 0.2, 0.3, 0.4], "x": 0.2, "y": 0.3})
+    monkeypatch.setattr(xinyu_app.steps, "enter_chat", lambda robot, x, y: robot.move_click(x, y))
+    monkeypatch.setattr(xinyu_app.steps, "confirm_chat_window", lambda robot, config, reporter=None: "chat")
+    monkeypatch.setattr(
+        xinyu_app.steps,
+        "read_message",
+        lambda robot, config, target, image=None, reporter=None: {"contact": target["name"], "content": "最后一条", "message_time": ""},
+    )
+    monkeypatch.setattr(xinyu_app.steps, "input_reply", lambda robot, text, config, reporter=None: seen.append({"text": text}))
+    monkeypatch.setattr(xinyu_app.steps, "send_reply", lambda robot, config, reporter=None: 1)
+    monkeypatch.setattr(xinyu_app.steps, "go_back", lambda robot, config, reporter=None: robot.move_click(0.08, 0.06))
+
+    app = xinyu_app.XinyuApp(robot, config, reply_provider=lambda message: "AI回复")
+    app.run_once()
+
+    assert seen == [{"text": "AI回复"}]
+
+
+def test_xinyu_go_back_clicks_back_twice(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["chat", "list"])
+
+    def fake_match(image, template, threshold=0.85):
+        if image == "chat" and Path(template).name in {"btn_返回按钮_2.jpg", "btn_返回按钮.jpg"}:
+            return {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1, "score": 0.99}
+        if image == "list" and Path(template).name == "screen_聊天列表.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+    monkeypatch.setattr(steps, "ensure_send_cleared", lambda robot, config, reporter=None: 0)
+    monkeypatch.setattr(
+        steps,
+        "capture_after_popups",
+        lambda robot, config, label="screen", max_dismiss=3, reporter=None: robot.get_transform_image(),
+    )
+
+    steps.go_back(robot, config)
+
+    assert robot.clicks == [pytest.approx((0.15, 0.15)), pytest.approx((0.15, 0.15))]
+
+
+def test_xinyu_keep_screen_awake_clicks_message_bottom_nav(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list"])
+
+    monkeypatch.setattr(steps, "ensure_list_screen", lambda robot, config, reporter=None: "list")
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "result": {
+                "bottom_nav": [
+                    {"name": "全部消息", "bounds": [0.0, 0.1, 0.2, 0.2]},
+                    {"name": "喜欢", "bounds": [0.0, 0.8, 0.2, 1.0]},
+                    {"name": "消息", "bounds": [0.6, 0.8, 0.8, 1.0]},
+                ]
+            },
+            "ocr_items": [],
+        },
+    )
+    monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
+
+    assert steps.keep_screen_awake(robot, config)
+    assert robot.clicks == [pytest.approx((0.7, 0.9))]
+
+
+def test_xinyu_keep_screen_awake_does_not_click_without_message_bottom_nav(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list"])
+
+    monkeypatch.setattr(steps, "ensure_list_screen", lambda robot, config, reporter=None: "list")
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "result": {"bottom_nav": [{"name": "主页", "bounds": [0.8, 0.8, 1.0, 1.0]}]},
+            "ocr_items": [],
+        },
+    )
+
+    assert steps.keep_screen_awake(robot, config) is False
+    assert robot.clicks == []
+
+
+def test_xinyu_play_voice_reply_reclicks_microphone_when_tts_fails(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    config["tts_retry_attempts"] = 1
+    robot = FakeRobot(["microphone", "microphone"])
+    played: list[str] = []
+
+    def fake_match(image, template, threshold=0.85):
+        if image == "microphone" and Path(template).name == "btn_麦克风按钮.jpg":
+            return {"x": 0.4, "y": 0.5, "w": 0.2, "h": 0.2, "score": 0.99}
+        return None
+
+    def fake_tts(robot, text):
+        played.append(text)
+        if len(played) == 1:
+            raise RuntimeError("speaker timeout")
+
+    monkeypatch.setattr(steps, "match", fake_match)
+    monkeypatch.setattr(steps, "tts_input", fake_tts)
+    monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
+
+    steps.play_voice_reply(robot, "你好", config)
+
+    assert played == ["你好", "你好"]
+    assert robot.clicks == [pytest.approx((0.5, 0.6)), pytest.approx((0.5, 0.6))]

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jixiebijiaoben"
+version = "0.1.0"
+description = "Robot-arm visual control skeleton for app automation"
+requires-python = ">=3.13"
+dependencies = [
+  "opencv-python",
+  "Pillow",
+  "PyQt6",
+  "PyYAML",
+  "requests",
+  "pywin32; platform_system == 'Windows'",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"

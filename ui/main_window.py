@@ -1,0 +1,1905 @@
+from __future__ import annotations
+
+import copy
+import importlib
+import queue
+import re
+import signal
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
+from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
+    QAbstractItemView,
+    QApplication,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QHeaderView,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QRubberBand,
+    QScrollArea,
+    QSpinBox,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+from PIL import Image
+from PIL.ImageQt import ImageQt
+
+from apps import get_registered_apps
+from apps.defaults import DEFAULT_RUNTIME_CONFIG, with_app_defaults
+from apps.visual_assets import CUSTOM_POPUP, import_target_path
+from lgb.lgb import RobotInterface, scan_devices
+from services import ConfigManager, LicenseClient
+from vision.screen import ensure_portrait_image
+from workers import DeviceWorker, WorkerEvent
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _app_default_config(app_name: str) -> dict[str, Any]:
+    try:
+        module = importlib.import_module(f"apps.{app_name}.config")
+    except ImportError:
+        return with_app_defaults({})
+    default_config = getattr(module, "DEFAULT_CONFIG", {})
+    return with_app_defaults(default_config if isinstance(default_config, dict) else {})
+
+
+APP_STYLESHEET = """
+QMainWindow {
+  background: #f8fafc;
+}
+QWidget {
+  color: #334155;
+  font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+  font-size: 13px;
+}
+QFrame#TopPanel, QFrame#AddPanel, QFrame#SummaryPanel, QFrame#ActionPanel {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+QFrame#DialogPanel, QFrame#InsetPanel {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+QLabel#TitleLabel {
+  color: #0f172a;
+  font-size: 18px;
+  font-weight: 700;
+}
+QLabel#DialogTitle {
+  color: #0f172a;
+  font-size: 16px;
+  font-weight: 700;
+}
+QLabel#SectionLabel {
+  color: #475569;
+  font-weight: 600;
+}
+QLabel#HelperLabel {
+  color: #64748b;
+  font-size: 12px;
+}
+QLabel#MetricValue {
+  color: #0f172a;
+  font-size: 18px;
+  font-weight: 700;
+}
+QLabel#MetricLabel {
+  color: #64748b;
+  font-size: 12px;
+}
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+  min-height: 30px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 3px 8px;
+  background: #ffffff;
+  selection-background-color: #f97316;
+}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+  border: 1px solid #f97316;
+}
+QPushButton {
+  min-height: 30px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 4px 10px;
+  background: #ffffff;
+  color: #334155;
+}
+QPushButton:hover {
+  background: #f1f5f9;
+  border-color: #94a3b8;
+}
+QPushButton:pressed {
+  background: #e2e8f0;
+}
+QPushButton:disabled {
+  color: #94a3b8;
+  background: #f8fafc;
+}
+QPushButton#PrimaryButton {
+  background: #f97316;
+  border-color: #ea580c;
+  color: #ffffff;
+  font-weight: 600;
+}
+QPushButton#PrimaryButton:hover {
+  background: #ea580c;
+}
+QPushButton#DangerButton {
+  color: #b91c1c;
+  border-color: #fecaca;
+  background: #fff7f7;
+}
+QPushButton#DangerButton:hover {
+  background: #fee2e2;
+}
+QPushButton#QuietButton {
+  border-color: transparent;
+  background: transparent;
+}
+QTableWidget {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  gridline-color: #e2e8f0;
+  selection-background-color: #ffedd5;
+  selection-color: #0f172a;
+}
+QTableWidget::indicator {
+  width: 18px;
+  height: 18px;
+}
+QHeaderView::section {
+  background: #f1f5f9;
+  color: #475569;
+  border: none;
+  border-bottom: 1px solid #cbd5e1;
+  padding: 8px;
+  font-weight: 600;
+}
+QTextEdit {
+  background: #0f172a;
+  color: #e2e8f0;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  font-family: "Consolas", "Fira Code", monospace;
+  font-size: 12px;
+}
+QTextEdit#KeywordEditor {
+  background: #ffffff;
+  color: #334155;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+  font-size: 13px;
+}
+QTextEdit#KeywordEditor:focus {
+  border: 1px solid #f97316;
+}
+QTabWidget::pane {
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+}
+QTabBar::tab {
+  padding: 7px 12px;
+  margin-right: 2px;
+}
+QTabBar::tab:selected {
+  color: #ea580c;
+  font-weight: 600;
+}
+"""
+
+
+STATUS_COLORS = {
+    "normal": ("正常", "#dcfce7", "#166534"),
+    "running": ("运行中", "#dbeafe", "#1d4ed8"),
+    "paused": ("已暂停", "#fef3c7", "#92400e"),
+    "stopping": ("停止中", "#f1f5f9", "#475569"),
+    "stopped": ("已停止", "#f1f5f9", "#475569"),
+    "circuit_open": ("已熔断", "#fee2e2", "#991b1b"),
+    "license_error": ("卡密异常", "#fee2e2", "#991b1b"),
+    "offline": ("离线授权", "#e0f2fe", "#0369a1"),
+}
+
+
+COL_SELECT = 0
+COL_LICENSE = 1
+COL_EXPIRES = 2
+COL_DEVICE_IP = 3
+COL_STATUS = 4
+COL_AVG_REPLY_SECONDS = 5
+COL_UNATTENDED_SECONDS = 6
+COL_RUNNING_APP = 7
+STATUS_COLUMN_WIDTH = 150
+UNATTENDED_COLUMN_WIDTH = 112
+
+STATUS_COORDINATE_RE = re.compile(r"\s*[：:,-]?\s*\(?\s*-?\d+(?:\.\d+)?\s*[,，]\s*-?\d+(?:\.\d+)?\s*\)?\s*$")
+
+
+def mask_secret(value: str) -> str:
+    if not value:
+        return ""
+    return "****" + value[-4:] if len(value) > 4 else "****"
+
+
+def strip_status_coordinates(detail: str) -> str:
+    cleaned = STATUS_COORDINATE_RE.sub("", str(detail or "").strip()).strip()
+    return cleaned.rstrip("：:,，- ").strip()
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "--"
+    total_seconds = max(0, int(seconds))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    remaining_seconds = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
+
+
+class NoWheelSpinBox(QSpinBox):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        event.ignore()
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() in {
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+            Qt.Key.Key_PageUp,
+            Qt.Key.Key_PageDown,
+        }:
+            event.ignore()
+            return
+        super().keyPressEvent(event)
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        event.ignore()
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() in {
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+            Qt.Key.Key_PageUp,
+            Qt.Key.Key_PageDown,
+        }:
+            event.ignore()
+            return
+        super().keyPressEvent(event)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, config_manager: ConfigManager | None = None) -> None:
+        super().__init__()
+        self.config_manager = config_manager or ConfigManager()
+        self.events: "queue.Queue[WorkerEvent]" = queue.Queue()
+        self.workers: dict[str, DeviceWorker] = {}
+        self.unattended_started_at: dict[str, float] = {}
+        self.unattended_elapsed_seconds: dict[str, float] = {}
+        self.setWindowTitle("机械臂视觉控制系统")
+        self.resize(1180, 720)
+        self.setStyleSheet(APP_STYLESHEET)
+
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        title_row = QHBoxLayout()
+        title = QLabel("机械臂视觉控制系统")
+        title.setObjectName("TitleLabel")
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        layout.addLayout(title_row)
+
+        top_panel = QFrame()
+        top_panel.setObjectName("TopPanel")
+        top_bar = QHBoxLayout(top_panel)
+        top_bar.setContentsMargins(12, 10, 12, 10)
+        top_bar.setSpacing(8)
+        top_bar.addWidget(QLabel("API Key"))
+        self.apikey_input = QLineEdit(mask_secret(self.config_manager.get("global", "apikey", default="")))
+        self.apikey_input.setEchoMode(QLineEdit.EchoMode.Password)
+        top_bar.addWidget(self.apikey_input)
+        self.save_apikey_button = self._button("保存", "primary")
+        self.save_apikey_button.clicked.connect(self._save_apikey)
+        top_bar.addWidget(self.save_apikey_button)
+        top_bar.addSpacing(12)
+        top_bar.addWidget(QLabel("设备 IP"))
+        self.device_ip_input = QLineEdit()
+        self.device_ip_input.setPlaceholderText("192.168.1.108")
+        top_bar.addWidget(self.device_ip_input)
+        self.add_device_button = self._button("添加设备", "primary")
+        self.add_device_button.clicked.connect(self._add_device)
+        top_bar.addWidget(self.add_device_button)
+        self.scan_device_button = self._button("扫描设备")
+        self.scan_device_button.clicked.connect(self._scan_devices)
+        top_bar.addWidget(self.scan_device_button)
+        top_bar.addStretch(1)
+        layout.addWidget(top_panel)
+
+        summary_panel = QFrame()
+        summary_panel.setObjectName("SummaryPanel")
+        summary = QHBoxLayout(summary_panel)
+        summary.setContentsMargins(12, 10, 12, 10)
+        summary.setSpacing(22)
+        self.total_devices_value = self._metric(summary, "设备总数")
+        self.running_devices_value = self._metric(summary, "运行中")
+        self.alert_devices_value = self._metric(summary, "异常/熔断")
+        summary.addStretch(1)
+        layout.addWidget(summary_panel)
+
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(["\u9009\u62e9", "\u5f53\u524d\u5361\u5bc6", "\u5230\u671f\u65f6\u95f4", "\u8bbe\u5907IP", "\u8fd0\u884c\u72b6\u6001", "\u5e73\u5747\u7528\u65f6", "\u65e0\u5e72\u9884\u65f6\u957f", "\u8fd0\u884cApp"])
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(44)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_device_context_menu)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(COL_SELECT, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_LICENSE, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_EXPIRES, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_DEVICE_IP, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(COL_STATUS, STATUS_COLUMN_WIDTH)
+        header.setSectionResizeMode(COL_AVG_REPLY_SECONDS, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_UNATTENDED_SECONDS, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(COL_UNATTENDED_SECONDS, UNATTENDED_COLUMN_WIDTH)
+        header.setSectionResizeMode(COL_RUNNING_APP, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.table)
+
+        action_panel = QFrame()
+        action_panel.setObjectName("ActionPanel")
+        action_bar = QHBoxLayout(action_panel)
+        action_bar.setContentsMargins(12, 10, 12, 10)
+        action_bar.setSpacing(8)
+        self.log_toggle = self._button("运行日志")
+        self.log_toggle.setCheckable(True)
+        self.log_toggle.setChecked(False)
+        self.log_toggle.clicked.connect(self._toggle_logs)
+        action_bar.addWidget(self.log_toggle)
+        self.select_all_button = self._button("全选")
+        self.select_all_button.clicked.connect(self._select_all_devices)
+        action_bar.addWidget(self.select_all_button)
+        self.clear_selection_button = self._button("清空")
+        self.clear_selection_button.clicked.connect(self._clear_device_selection)
+        action_bar.addWidget(self.clear_selection_button)
+        self.batch_start_button = self._button("启动选中", "primary")
+        self.batch_start_button.clicked.connect(lambda: self._run_for_checked_rows(self._start_worker))
+        action_bar.addWidget(self.batch_start_button)
+        self.batch_pause_button = self._button("暂停选中")
+        self.batch_pause_button.clicked.connect(lambda: self._run_for_checked_rows(self._pause_worker))
+        action_bar.addWidget(self.batch_pause_button)
+        self.batch_resume_button = self._button("恢复选中")
+        self.batch_resume_button.clicked.connect(lambda: self._run_for_checked_rows(self._resume_worker))
+        action_bar.addWidget(self.batch_resume_button)
+        self.batch_stop_button = self._button("停止选中", "danger")
+        self.batch_stop_button.clicked.connect(lambda: self._run_for_checked_rows(self._stop_worker))
+        action_bar.addWidget(self.batch_stop_button)
+        action_bar.addStretch(1)
+        layout.addWidget(action_panel)
+
+        self.logs = QTextEdit()
+        self.logs.setReadOnly(True)
+        self.logs.setMaximumHeight(180)
+        self.logs.setVisible(False)
+        layout.addWidget(self.logs)
+
+        self.setCentralWidget(root)
+        self._load_devices()
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._drain_events)
+        self.timer.start(100)
+
+    def _button(self, text: str, variant: str = "default") -> QPushButton:
+        button = QPushButton(text)
+        if variant == "primary":
+            button.setObjectName("PrimaryButton")
+        elif variant == "danger":
+            button.setObjectName("DangerButton")
+        elif variant == "quiet":
+            button.setObjectName("QuietButton")
+        return button
+
+    def _metric(self, layout: QHBoxLayout, label: str) -> QLabel:
+        group = QVBoxLayout()
+        value = QLabel("0")
+        value.setObjectName("MetricValue")
+        caption = QLabel(label)
+        caption.setObjectName("MetricLabel")
+        group.addWidget(value)
+        group.addWidget(caption)
+        layout.addLayout(group)
+        return value
+
+    def _load_devices(self) -> None:
+        devices = self.config_manager.devices()
+        self.table.setRowCount(len(devices))
+        app_names = get_registered_apps()
+        for row, device in enumerate(devices):
+            if not isinstance(device, dict):
+                continue
+            self.table.setItem(row, COL_SELECT, self._check_item())
+            self.table.setItem(row, COL_LICENSE, QTableWidgetItem(mask_secret(str(device.get("license_key", "")))))
+            self.table.setItem(row, COL_EXPIRES, QTableWidgetItem(str(device.get("license_expires", "") or "-")))
+            self.table.setItem(row, COL_DEVICE_IP, QTableWidgetItem(str(device.get("ip", ""))))
+            self.table.setItem(row, COL_STATUS, self._status_item("stopped"))
+            self.table.setItem(row, COL_AVG_REPLY_SECONDS, self._avg_reply_item())
+            self.table.setItem(row, COL_UNATTENDED_SECONDS, self._unattended_item(self._unattended_seconds_for_device(str(device.get("ip", "")))))
+            app_select = QComboBox()
+            for key, app_cls in app_names.items():
+                app_select.addItem(app_cls.name, key)
+            selected = str(device.get("selected_app", "wechat"))
+            index = app_select.findData(selected)
+            if index >= 0:
+                app_select.setCurrentIndex(index)
+            self.table.setCellWidget(row, COL_RUNNING_APP, app_select)
+        self._refresh_summary()
+
+    def _show_device_context_menu(self, position) -> None:
+        row = self.table.rowAt(position.y())
+        if row < 0:
+            return
+        self.table.selectRow(row)
+        menu = QMenu(self)
+        menu.addAction("启动", lambda: self._start_worker(row))
+        menu.addAction("暂停", lambda: self._pause_worker(row))
+        menu.addAction("恢复", lambda: self._resume_worker(row))
+        menu.addAction("停止", lambda: self._stop_worker(row))
+        menu.addSeparator()
+        menu.addAction("卡密绑定", lambda: self._bind_license(row))
+        menu.addAction("配置", lambda: self._edit_app_config(row))
+        menu.addSeparator()
+        menu.addAction("删除当前设备", lambda: self._delete_device(row))
+        menu.exec(self.table.viewport().mapToGlobal(position))
+
+    def _device_for_row(self, row: int) -> dict[str, Any] | None:
+        devices = self.config_manager.devices()
+        if row < 0 or row >= len(devices):
+            return None
+        return devices[row]
+
+    def _device_ip_for_row(self, row: int) -> str:
+        item = self.table.item(row, COL_DEVICE_IP)
+        return item.text() if item else ""
+
+    def _set_row_status(self, device_ip: str, status: str, detail: str = "") -> None:
+        for row in range(self.table.rowCount()):
+            if self._device_ip_for_row(row) == device_ip:
+                self.table.setItem(row, COL_STATUS, self._status_item(status, detail))
+                self._refresh_summary()
+                return
+
+    def _row_status_for_device(self, device_ip: str) -> str:
+        for row in range(self.table.rowCount()):
+            if self._device_ip_for_row(row) == device_ip:
+                item = self.table.item(row, COL_STATUS)
+                return str(item.data(256)) if item else ""
+        return ""
+
+    def _check_item(self, checked: bool = False) -> QTableWidgetItem:
+        item = QTableWidgetItem()
+        item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        return item
+
+    def _status_item(self, status: str, detail: str = "") -> QTableWidgetItem:
+        label, background, foreground = STATUS_COLORS.get(status, (status, "#f1f5f9", "#475569"))
+        detail_text = strip_status_coordinates(detail)
+        text = label
+        if detail_text and status == "running":
+            text = detail_text
+        elif detail_text and status == "paused":
+            text = f"{label}-{detail_text}"
+        item = QTableWidgetItem(text)
+        item.setData(256, status)
+        item.setData(257, detail_text)
+        item.setBackground(QColor(background))
+        item.setForeground(QColor(foreground))
+        font = QFont()
+        font.setBold(True)
+        item.setFont(font)
+        if detail_text:
+            item.setToolTip(detail_text)
+        return item
+
+    def _avg_reply_item(self, average_seconds: float | None = None, reply_round_count: int = 0) -> QTableWidgetItem:
+        count = max(0, int(reply_round_count))
+        value = max(0.0, float(average_seconds or 0.0))
+        text = f"{value:.1f}\u79d2" if count > 0 else "--"
+        item = QTableWidgetItem(text)
+        item.setData(256, count)
+        item.setData(257, value)
+        if count > 0:
+            item.setToolTip(f"\u5df2\u5b8c\u6210 {count} \u8f6e\u56de\u590d\uff0c\u5e73\u5747 {value:.1f} \u79d2")
+        return item
+
+    def _unattended_item(self, seconds: float | None = None) -> QTableWidgetItem:
+        item = QTableWidgetItem(format_duration(seconds))
+        item.setData(256, None if seconds is None else max(0.0, float(seconds)))
+        if seconds is not None:
+            item.setToolTip(f"从启动到停止：{format_duration(seconds)}")
+        return item
+
+    def _set_row_unattended_time(self, device_ip: str, seconds: float | None) -> None:
+        for row in range(self.table.rowCount()):
+            if self._device_ip_for_row(row) == device_ip:
+                self.table.setItem(row, COL_UNATTENDED_SECONDS, self._unattended_item(seconds))
+                return
+
+    def _start_unattended_timer(self, device_ip: str) -> None:
+        self.unattended_started_at[device_ip] = time.monotonic()
+        self.unattended_elapsed_seconds[device_ip] = 0.0
+        self._set_row_unattended_time(device_ip, 0.0)
+
+    def _unattended_seconds_for_device(self, device_ip: str) -> float | None:
+        started_at = self.unattended_started_at.get(device_ip)
+        if started_at is not None:
+            return time.monotonic() - started_at
+        return self.unattended_elapsed_seconds.get(device_ip)
+
+    def _finalize_unattended_timer(self, device_ip: str) -> None:
+        seconds = self._unattended_seconds_for_device(device_ip)
+        self.unattended_started_at.pop(device_ip, None)
+        if seconds is not None:
+            self.unattended_elapsed_seconds[device_ip] = max(0.0, float(seconds))
+        self._set_row_unattended_time(device_ip, seconds)
+
+    def _refresh_unattended_durations(self) -> None:
+        for device_ip in list(self.unattended_started_at):
+            self._set_row_unattended_time(device_ip, self._unattended_seconds_for_device(device_ip))
+
+    def _set_row_average_reply_time(
+        self,
+        device_ip: str,
+        average_seconds: float | None,
+        reply_round_count: int = 0,
+    ) -> None:
+        for row in range(self.table.rowCount()):
+            if self._device_ip_for_row(row) == device_ip:
+                self.table.setItem(row, COL_AVG_REPLY_SECONDS, self._avg_reply_item(average_seconds, reply_round_count))
+                return
+
+    def _refresh_summary(self) -> None:
+        total = self.table.rowCount()
+        running = 0
+        alerts = 0
+        for row in range(total):
+            item = self.table.item(row, COL_STATUS)
+            status = str(item.data(256)) if item else ""
+            if status == "running":
+                running += 1
+            if status in {"circuit_open", "license_error"}:
+                alerts += 1
+        self.total_devices_value.setText(str(total))
+        self.running_devices_value.setText(str(running))
+        self.alert_devices_value.setText(str(alerts))
+
+    def _selected_app_for_row(self, row: int) -> str:
+        widget = self.table.cellWidget(row, COL_RUNNING_APP)
+        if isinstance(widget, QComboBox):
+            return str(widget.currentData())
+        return "wechat"
+
+    def _checked_rows(self) -> list[int]:
+        rows: list[int] = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.checkState() == Qt.CheckState.Checked:
+                rows.append(row)
+        return rows
+
+    def _select_all_devices(self) -> None:
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.CheckState.Checked)
+
+    def _clear_device_selection(self) -> None:
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.CheckState.Unchecked)
+
+    def _default_app_overrides(self) -> dict[str, dict[str, Any]]:
+        return {app_name: {} for app_name in get_registered_apps()}
+
+    def _run_for_checked_rows(self, action) -> None:
+        for row in self._checked_rows():
+            action(row)
+
+    def _start_worker(self, row: int) -> None:
+        device = self._device_for_row(row)
+        if not device:
+            return
+        device_ip = str(device.get("ip", ""))
+        existing = self.workers.get(device_ip)
+        if existing and existing.is_alive():
+            status_item = self.table.item(row, COL_STATUS)
+            current_status = str(status_item.data(256)) if status_item else ""
+            if current_status == "paused":
+                existing.resume()
+                self._set_row_status(device_ip, "running")
+            return
+        selected_app = self._selected_app_for_row(row)
+        device["selected_app"] = selected_app
+        self.config_manager.update_device(device_ip, {"selected_app": selected_app})
+        worker = DeviceWorker(device, events=self.events, config_manager=self.config_manager)
+        self.workers[device_ip] = worker
+        worker.start()
+        self._start_unattended_timer(device_ip)
+        self._set_row_status(device_ip, "running")
+
+    def _pause_worker(self, row: int) -> None:
+        device_ip = self._device_ip_for_row(row)
+        worker = self.workers.get(device_ip)
+        if worker:
+            worker.pause()
+            self._set_row_status(device_ip, "paused")
+
+    def _resume_worker(self, row: int) -> None:
+        device_ip = self._device_ip_for_row(row)
+        worker = self.workers.get(device_ip)
+        if worker:
+            worker.resume()
+            self._set_row_status(device_ip, "running")
+
+    def _stop_worker(self, row: int) -> None:
+        device_ip = self._device_ip_for_row(row)
+        worker = self.workers.get(device_ip)
+        if worker:
+            worker.stop()
+            self._set_row_status(device_ip, "stopping")
+
+    def _delete_device(self, row: int) -> None:
+        device = self._device_for_row(row)
+        if not device:
+            return
+        device_ip = str(device.get("ip", ""))
+        answer = QMessageBox.question(
+            self,
+            "删除设备",
+            f"确认删除设备 {device_ip} 吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        worker = self.workers.get(device_ip)
+        if worker:
+            worker.stop()
+            self.workers.pop(device_ip, None)
+        self.unattended_started_at.pop(device_ip, None)
+        self.unattended_elapsed_seconds.pop(device_ip, None)
+        if self.config_manager.remove_device(device_ip):
+            self._load_devices()
+            self.logs.append(f"[info] {device_ip}: device removed")
+
+    def _save_apikey(self) -> None:
+        value = self.apikey_input.text().strip()
+        if not value or value.startswith("****"):
+            return
+        self.config_manager.set("global", "apikey", value=value)
+        self.apikey_input.setText(mask_secret(value))
+
+    def _add_device(self) -> None:
+        device_ip = self.device_ip_input.text().strip()
+        if not device_ip:
+            return
+        created = self.config_manager.add_device(
+            {
+                "ip": device_ip,
+                "license_key": "",
+                "license_expires": "",
+                "selected_app": "wechat",
+                "persona": {},
+                "contact_personas": {},
+                "app_overrides": self._default_app_overrides(),
+            }
+        )
+        if not created:
+            QMessageBox.information(self, "设备", "该设备已存在")
+            return
+        self.device_ip_input.clear()
+        self._load_devices()
+
+    def _scan_devices(self) -> None:
+        self.scan_device_button.setEnabled(False)
+        QApplication.processEvents()
+        try:
+            found = scan_devices(timeout=0.3, max_workers=50)
+        except Exception as exc:
+            QMessageBox.warning(self, "扫描设备", str(exc))
+            return
+        finally:
+            self.scan_device_button.setEnabled(True)
+        added = 0
+        for device_ip in found:
+            if self.config_manager.add_device(
+                {
+                    "ip": device_ip,
+                    "license_key": "",
+                    "license_expires": "",
+                    "selected_app": "wechat",
+                    "persona": {},
+                    "contact_personas": {},
+                    "app_overrides": self._default_app_overrides(),
+                }
+            ):
+                added += 1
+        self._load_devices()
+        QMessageBox.information(self, "扫描设备", f"发现 {len(found)} 台，新增 {added} 台")
+
+    def _bind_license(self, row: int) -> None:
+        device = self._device_for_row(row)
+        if not device:
+            return
+        device_ip = str(device.get("ip", ""))
+        current_key = str(device.get("license_key", "") or "")
+        license_key, accepted = QInputDialog.getText(
+            self,
+            "卡密绑定",
+            f"为设备 {device_ip} 输入卡密：",
+            text=current_key,
+        )
+        if not accepted:
+            return
+        license_key = license_key.strip()
+        if not license_key:
+            QMessageBox.warning(self, "卡密", "请先输入卡密")
+            return
+
+        for other in self.config_manager.devices():
+            if other.get("ip") != device_ip and other.get("license_key") == license_key:
+                QMessageBox.warning(self, "卡密", "卡密已被其他设备使用")
+                return
+
+        global_config = self.config_manager.get("global", default={})
+        client = LicenseClient(
+            api_url=str(global_config.get("license_api_url", "")),
+            project_uuid=str(global_config.get("project_uuid", "")),
+            project_secret=str(global_config.get("project_secret", "")),
+        )
+        result = client.verify_with_offline(device_ip, license_key, str(device.get("license_expires", "")))
+        if not result.ok:
+            self._set_row_status(device_ip, "license_error")
+            QMessageBox.warning(self, "卡密", result.message)
+            return
+        self.config_manager.update_device(
+            device_ip,
+            {"license_key": license_key, "license_expires": result.expires_at},
+        )
+        self.table.setItem(row, COL_LICENSE, QTableWidgetItem(mask_secret(license_key)))
+        self.table.setItem(row, COL_EXPIRES, QTableWidgetItem(result.expires_at or "-"))
+        self._set_row_status(device_ip, "normal" if result.status == "ok" else result.status)
+
+    def _edit_app_config(self, row: int) -> None:
+        device = self._device_for_row(row)
+        if not device:
+            return
+        device_ip = str(device.get("ip", ""))
+        app_name = self._selected_app_for_row(row)
+        overrides: dict[str, Any] = {}
+        app_overrides = device.get("app_overrides", {})
+        if isinstance(app_overrides, dict):
+            overrides = app_overrides.get(app_name, {}) or {}
+        template_root = Path("runtime/templates") / app_name
+        if not isinstance(overrides, dict):
+            overrides = {}
+        dialog_config = _deep_merge(_app_default_config(app_name), overrides)
+        override_templates = overrides.get("templates", {}) if isinstance(overrides.get("templates", {}), dict) else {}
+        dialog_config["templates"] = {
+            "buttons": str(override_templates.get("buttons") or template_root / "buttons"),
+            "screens": str(override_templates.get("screens") or template_root / "screens"),
+        }
+        dialog = AppConfigDialog(
+            dialog_config,
+            device_ip=device_ip,
+            app_name=app_name,
+            template_root=template_root,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        app_overrides = device.get("app_overrides", {}) if isinstance(device.get("app_overrides", {}), dict) else {}
+        app_overrides[app_name] = dialog.values()
+        self.config_manager.update_device(device_ip, {"app_overrides": app_overrides})
+        QMessageBox.information(self, "配置", f"{device_ip} / {app_name} 配置已保存")
+
+    def _toggle_logs(self) -> None:
+        self.logs.setVisible(self.log_toggle.isChecked())
+
+    def _format_log_event(self, event: WorkerEvent) -> str:
+        payload = event.payload or {}
+        if event.message == "runtime_step":
+            detail = str(payload.get("detail", "") or payload.get("step", "") or "")
+            return f"[{event.level}] {event.device_ip}: {detail}"
+        if event.message == "dialogue_ocr_last_message":
+            contact = str(payload.get("contact", "") or "")
+            content = str(payload.get("content", "") or "")
+            return f"[{event.level}] {event.device_ip}: OCR读取 [{contact}] {content}"
+        if event.message == "ai_reply_text":
+            contact = str(payload.get("contact", "") or "")
+            reply_text = str(payload.get("reply_text", "") or "")
+            if bool(payload.get("skip")):
+                reason = str(payload.get("reason", "") or "")
+                return f"[{event.level}] {event.device_ip}: AI跳过 [{contact}] {reason}"
+            return f"[{event.level}] {event.device_ip}: AI回复 [{contact}] {reply_text}"
+        if event.message == "target_selected":
+            name = str(payload.get("name", "") or "")
+            content = str(payload.get("content", "") or "")
+            unread_count = payload.get("unread_count")
+            favorability = payload.get("favorability")
+            return f"[{event.level}] {event.device_ip}: 选中目标 [{name}] 未读 {unread_count} 相似度 {favorability} 内容：{content}"
+        if event.message == "xinyu_message_input":
+            contact = str(payload.get("contact", "") or "")
+            content = str(payload.get("content", "") or "")
+            source = str(payload.get("source", "") or "")
+            return f"[{event.level}] {event.device_ip}: 心遇输入来源 {source} [{contact}] {content}"
+        if event.message == "xinyu_reply_text":
+            contact = str(payload.get("contact", "") or "")
+            reply_text = str(payload.get("reply_text", "") or "")
+            if bool(payload.get("skip")):
+                reason = str(payload.get("reason", "") or "")
+                return f"[{event.level}] {event.device_ip}: 心遇跳过 [{contact}] {reason}"
+            return f"[{event.level}] {event.device_ip}: 心遇回复 [{contact}] {reply_text}"
+        if event.message == "xinyu_send_clicks":
+            return f"[{event.level}] {event.device_ip}: 心遇发送点击次数 {payload.get('clicks', '')}"
+        if event.message in {"memory hit", "memory miss", "memory updated", "memory lookup failed", "memory update failed"}:
+            contact = str(payload.get("contact", "") or "")
+            conversation_id = str(payload.get("conversation_id", "") or "")
+            short_id = conversation_id[-8:] if conversation_id else "-"
+            error = str(payload.get("error", "") or "")
+            labels = {
+                "memory hit": "记忆命中",
+                "memory miss": "记忆未命中",
+                "memory updated": "记忆已更新",
+                "memory lookup failed": "记忆读取失败",
+                "memory update failed": "记忆更新失败",
+            }
+            detail = f" [{contact}] 会话 {short_id}"
+            if error:
+                detail += f"：{error}"
+            return f"[{event.level}] {event.device_ip}: {labels[event.message]}{detail}"
+        return f"[{event.level}] {event.device_ip}: {event.message}"
+
+    def _drain_events(self) -> None:
+        while True:
+            try:
+                event = self.events.get_nowait()
+            except queue.Empty:
+                break
+            self.logs.append(self._format_log_event(event))
+            if event.level == "status":
+                if self._row_status_for_device(event.device_ip) in {"stopping", "stopped"}:
+                    continue
+                is_open = bool((event.payload or {}).get("is_circuit_open"))
+                detail = strip_status_coordinates(str((event.payload or {}).get("current_step_label", "") or ""))
+                reply_round_count = int((event.payload or {}).get("reply_round_count") or 0)
+                average_reply_seconds = (event.payload or {}).get("average_reply_seconds")
+                self._set_row_average_reply_time(event.device_ip, average_reply_seconds, reply_round_count)
+                self._set_row_status(event.device_ip, "circuit_open" if is_open else "running", detail)
+            elif event.message in {"paused", "stopped", "stopping"}:
+                if event.message == "stopped":
+                    self._finalize_unattended_timer(event.device_ip)
+                detail = str((event.payload or {}).get("detail", "") or "")
+                self._set_row_status(event.device_ip, event.message, detail)
+        self._refresh_unattended_durations()
+
+
+class _LegacyAppConfigDialog(QDialog):
+    def __init__(
+        self,
+        overrides: dict[str, Any],
+        device_ip: str,
+        app_name: str,
+        template_root: Path,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.overrides = with_app_defaults(overrides)
+        self.device_ip = device_ip
+        self.app_name = app_name
+        self.template_root = template_root
+        self.setWindowTitle(f"App 配置 - {device_ip} / {app_name}")
+        self.resize(840, 620)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        header_panel = QFrame()
+        header_panel.setObjectName("DialogPanel")
+        header_layout = QVBoxLayout(header_panel)
+        header_layout.setContentsMargins(14, 12, 14, 12)
+        header_layout.setSpacing(4)
+        title = QLabel(f"设备配置 / {device_ip} / {app_name}")
+        title.setObjectName("DialogTitle")
+        header_layout.addWidget(title)
+        scope = QLabel("当前设置只作用于这台设备当前选中的 App，包括运行参数、模板和人设。")
+        scope.setObjectName("HelperLabel")
+        header_layout.addWidget(scope)
+        root.addWidget(header_panel)
+
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        root.addWidget(tabs)
+
+        config_page = QWidget()
+        config_root = QVBoxLayout(config_page)
+        config_root.setContentsMargins(0, 0, 0, 0)
+        config_root.setSpacing(10)
+        runtime_panel = QFrame()
+        runtime_panel.setObjectName("InsetPanel")
+        runtime_layout = QVBoxLayout(runtime_panel)
+        runtime_layout.setContentsMargins(14, 12, 14, 12)
+        runtime_layout.setSpacing(8)
+        runtime_title = QLabel("运行参数")
+        runtime_title.setObjectName("SectionLabel")
+        runtime_layout.addWidget(runtime_title)
+        runtime_help = QLabel("这些参数只影响当前设备当前 App 的识别轮询和匹配策略。")
+        runtime_help.setObjectName("HelperLabel")
+        runtime_layout.addWidget(runtime_help)
+        coordinate_help = QLabel("OCR、模板匹配、联动测试和实际点击统一使用竖屏归一化坐标，当前调试阶段不再额外转换点击坐标。")
+        coordinate_help.setObjectName("HelperLabel")
+        coordinate_help.setWordWrap(True)
+        runtime_layout.addWidget(coordinate_help)
+        layout = QFormLayout()
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(10)
+        runtime_layout.addLayout(layout)
+        config_root.addWidget(runtime_panel)
+
+        self.poll_interval = QSpinBox()
+        self.poll_interval.setRange(1, 3600)
+        self.poll_interval.setValue(int(overrides.get("poll_interval", 1)))
+        layout.addRow("轮询间隔（秒）", self.poll_interval)
+
+        self.step_timeout = QSpinBox()
+        self.step_timeout.setRange(1, 300)
+        self.step_timeout.setValue(int(overrides.get("step_timeout", 10)))
+        layout.addRow("单步超时（秒）", self.step_timeout)
+
+        self.match_threshold = QDoubleSpinBox()
+        self.match_threshold.setRange(0.1, 1.0)
+        self.match_threshold.setSingleStep(0.01)
+        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.85)))
+        layout.addRow("模板阈值", self.match_threshold)
+
+        ocr = overrides.get("ocr", {}) if isinstance(overrides.get("ocr", {}), dict) else {}
+        self.det_db_thresh = QDoubleSpinBox()
+        self.det_db_thresh.setRange(0.0, 1.0)
+        self.det_db_thresh.setSingleStep(0.01)
+        self.det_db_thresh.setValue(float(ocr.get("det_db_thresh", 0.3)))
+        layout.addRow("OCR det_db_thresh", self.det_db_thresh)
+
+        self.rec_thresh = QDoubleSpinBox()
+        self.rec_thresh.setRange(0.0, 1.0)
+        self.rec_thresh.setSingleStep(0.01)
+        self.rec_thresh.setValue(float(ocr.get("rec_thresh", 0.5)))
+        layout.addRow("OCR rec_thresh", self.rec_thresh)
+
+        ocr_modes = overrides.get("ocr_modes", {}) if isinstance(overrides.get("ocr_modes", {}), dict) else {}
+        self.ocr_mode_fields: dict[str, dict[str, Any]] = {}
+        for mode_key, mode_label in [("dialogue", "对话模式"), ("list", "列表模式")]:
+            mode_config = ocr_modes.get(mode_key, {}) if isinstance(ocr_modes.get(mode_key, {}), dict) else {}
+            preprocess = mode_config.get("preprocess", {}) if isinstance(mode_config.get("preprocess", {}), dict) else {}
+            rules = mode_config.get("rules", {}) if isinstance(mode_config.get("rules", {}), dict) else {}
+
+            mode_panel = QFrame()
+            mode_panel.setObjectName("InsetPanel")
+            mode_panel_layout = QFormLayout(mode_panel)
+            mode_panel_layout.setContentsMargins(12, 10, 12, 10)
+            mode_panel_layout.setSpacing(8)
+
+            preprocess_box = QComboBox()
+            preprocess_box.addItems(["original"])
+            preprocess_box.setCurrentText("original")
+            mode_panel_layout.addRow(f"{mode_label} 预处理", preprocess_box)
+
+            scale_box = QSpinBox()
+            scale_box.setRange(1, 4)
+            scale_box.setValue(int(preprocess.get("scale", 2)))
+            mode_panel_layout.addRow(f"{mode_label} 放大倍数", scale_box)
+
+            min_confidence = QDoubleSpinBox()
+            min_confidence.setRange(0.0, 1.0)
+            min_confidence.setSingleStep(0.01)
+            min_confidence.setValue(float(rules.get("min_confidence", 0.3)))
+            mode_panel_layout.addRow(f"{mode_label} 最低置信度", min_confidence)
+
+            min_height = QDoubleSpinBox()
+            min_height.setRange(0.0, 0.2)
+            min_height.setSingleStep(0.005)
+            min_height.setDecimals(3)
+            min_height.setValue(float(rules.get("min_box_height_ratio", 0.02)))
+            mode_panel_layout.addRow(f"{mode_label} 最小框高比例", min_height)
+
+            fields: dict[str, Any] = {
+                "preprocess": preprocess_box,
+                "scale": scale_box,
+                "min_confidence": min_confidence,
+                "min_box_height_ratio": min_height,
+            }
+            self.ocr_mode_fields[mode_key] = fields
+            runtime_layout.addWidget(mode_panel)
+
+        config_root.addStretch(1)
+        tabs.addTab(config_page, "运行设置")
+
+        template_page = QWidget()
+        template_layout = QVBoxLayout(template_page)
+        template_layout.setContentsMargins(0, 0, 0, 0)
+        self.template_manager = TemplateManagerWidget(template_root, template_page)
+        template_layout.addWidget(self.template_manager)
+        tabs.addTab(template_page, "模板管理")
+
+        persona_page = QWidget()
+        persona_root = QVBoxLayout(persona_page)
+        persona_root.setContentsMargins(0, 0, 0, 0)
+        persona_root.setSpacing(10)
+        persona_panel = QFrame()
+        persona_panel.setObjectName("InsetPanel")
+        persona_panel_layout = QVBoxLayout(persona_panel)
+        persona_panel_layout.setContentsMargins(14, 12, 14, 12)
+        persona_panel_layout.setSpacing(8)
+        persona_title = QLabel("人设参数")
+        persona_title.setObjectName("SectionLabel")
+        persona_panel_layout.addWidget(persona_title)
+        persona_help = QLabel("AI 回复时会优先使用这里的人设，覆盖全局默认值。")
+        persona_help.setObjectName("HelperLabel")
+        persona_panel_layout.addWidget(persona_help)
+        persona_layout = QFormLayout()
+        persona_layout.setContentsMargins(0, 4, 0, 0)
+        persona_layout.setSpacing(10)
+        persona = overrides.get("persona", {}) if isinstance(overrides.get("persona", {}), dict) else {}
+        self.persona_inputs: dict[str, QLineEdit] = {}
+        for key, label in [
+            ("requestPersona", "人设授权 ID"),
+            ("name", "名字"),
+            ("age", "年龄"),
+            ("work", "职业"),
+            ("location", "住址"),
+            ("renshe", "自定义人设"),
+        ]:
+            line = QLineEdit(str(persona.get(key, "")))
+            self.persona_inputs[key] = line
+            persona_layout.addRow(label, line)
+        persona_panel_layout.addLayout(persona_layout)
+        persona_root.addWidget(persona_panel)
+        persona_root.addStretch(1)
+        tabs.addTab(persona_page, "人设")
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if ok_button:
+            ok_button.setText("保存")
+            ok_button.setObjectName("PrimaryButton")
+        if cancel_button:
+            cancel_button.setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def values(self) -> dict[str, Any]:
+        values = dict(self.overrides)
+        ocr = dict(values.get("ocr", {}) if isinstance(values.get("ocr", {}), dict) else {})
+        ocr["det_db_thresh"] = self.det_db_thresh.value()
+        ocr["rec_thresh"] = self.rec_thresh.value()
+
+        ocr_modes = dict(values.get("ocr_modes", {}) if isinstance(values.get("ocr_modes", {}), dict) else {})
+        for mode_key, fields in self.ocr_mode_fields.items():
+            mode_config = dict(ocr_modes.get(mode_key, {}) if isinstance(ocr_modes.get(mode_key, {}), dict) else {})
+            preprocess = dict(mode_config.get("preprocess", {}) if isinstance(mode_config.get("preprocess", {}), dict) else {})
+            rules = dict(mode_config.get("rules", {}) if isinstance(mode_config.get("rules", {}), dict) else {})
+            preprocess["mode"] = "original"
+            preprocess["scale"] = fields["scale"].value()
+            preprocess.pop("auxiliary_mode", None)
+            rules["min_confidence"] = fields["min_confidence"].value()
+            rules["min_box_height_ratio"] = fields["min_box_height_ratio"].value()
+            if mode_key == "dialogue":
+                rules["ocr_result_excluded_keywords"] = self._keywords_from_editor(
+                    self.dialogue_ocr_result_excluded_keywords
+                )
+                rules["line_excluded_keywords"] = self._keywords_from_editor(
+                    self.dialogue_line_excluded_keywords
+                )
+            mode_config["preprocess"] = preprocess
+            mode_config["rules"] = rules
+            ocr_modes[mode_key] = mode_config
+
+        values.update({
+            "poll_interval": self.poll_interval.value(),
+            "step_timeout": self.step_timeout.value(),
+            "match_threshold": self.match_threshold.value(),
+            "ocr": ocr,
+            "ocr_modes": ocr_modes,
+            "templates": {
+                "buttons": str(self.template_manager.buttons_dir),
+                "screens": str(self.template_manager.screens_dir),
+            },
+            "persona": {key: field.text().strip() for key, field in self.persona_inputs.items()},
+        })
+        return values
+
+
+class _LegacyTemplateManagerWidget(QWidget):
+    def __init__(self, template_root: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.template_root = template_root
+        self.buttons_dir = template_root / "buttons"
+        self.screens_dir = template_root / "screens"
+        self.buttons_dir.mkdir(parents=True, exist_ok=True)
+        self.screens_dir.mkdir(parents=True, exist_ok=True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        intro_panel = QFrame()
+        intro_panel.setObjectName("InsetPanel")
+        intro_layout = QVBoxLayout(intro_panel)
+        intro_layout.setContentsMargins(14, 12, 14, 12)
+        intro_layout.setSpacing(4)
+        title = QLabel("模板资源")
+        title.setObjectName("SectionLabel")
+        intro_layout.addWidget(title)
+        subtitle = QLabel("导入的模板只保存在当前设备当前 App 目录，不会影响其他设备。")
+        subtitle.setObjectName("HelperLabel")
+        intro_layout.addWidget(subtitle)
+        coordinate_note = QLabel("模板匹配、弹窗关闭点位、OCR 结果坐标、联动测试输入和当前实际点击，都按竖屏归一化坐标理解。")
+        coordinate_note.setObjectName("HelperLabel")
+        coordinate_note.setWordWrap(True)
+        intro_layout.addWidget(coordinate_note)
+        location = QLabel(f"目录：{self.template_root}")
+        location.setObjectName("HelperLabel")
+        intro_layout.addWidget(location)
+        layout.addWidget(intro_panel)
+
+        import_panel = QFrame()
+        import_panel.setObjectName("InsetPanel")
+        import_layout = QVBoxLayout(import_panel)
+        import_layout.setContentsMargins(14, 12, 14, 12)
+        import_layout.setSpacing(8)
+        import_title = QLabel("导入模板")
+        import_title.setObjectName("SectionLabel")
+        import_layout.addWidget(import_title)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        import_layout.addLayout(buttons)
+        layout.addWidget(import_panel)
+
+        list_panel = QFrame()
+        list_panel.setObjectName("InsetPanel")
+        list_layout = QVBoxLayout(list_panel)
+        list_layout.setContentsMargins(14, 12, 14, 12)
+        list_layout.setSpacing(8)
+        list_title = QLabel("当前模板清单")
+        list_title.setObjectName("SectionLabel")
+        list_layout.addWidget(list_title)
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["类型", "文件", "操作"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(40)
+        table_header = self.table.horizontalHeader()
+        table_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        list_layout.addWidget(self.table)
+        layout.addWidget(list_panel)
+
+        for rule in import_template_rules():
+            button = QPushButton(f"导入{rule.label}")
+            button.clicked.connect(lambda checked=False, k=rule.key: self._import_template(k))
+            buttons.addWidget(button)
+        self.reload()
+
+    def reload(self) -> None:
+        files: list[tuple[str, Path]] = []
+        for path in sorted(self.buttons_dir.glob("*.jpg")):
+            kind = "弹窗" if is_popup_template_name(path.name) else "按钮"
+            files.append((kind, path))
+        for path in sorted(self.screens_dir.glob("*.jpg")):
+            files.append(("界面", path))
+        self.table.setRowCount(len(files))
+        for row, (kind, path) in enumerate(files):
+            self.table.setItem(row, 0, QTableWidgetItem(kind))
+            self.table.setItem(row, 1, QTableWidgetItem(path.name))
+            delete_button = QPushButton("删除")
+            delete_button.clicked.connect(lambda checked=False, p=path: self._delete_template(p))
+            self.table.setCellWidget(row, 2, delete_button)
+
+    def _import_template(self, key: str) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择模板图片",
+            "",
+            "Images (*.jpg *.jpeg *.png)",
+        )
+        if not file_path:
+            return
+        source = Path(file_path)
+        target = import_target_path(key, self.buttons_dir, self.screens_dir)
+        Image.open(source).convert("RGB").save(target, format="JPEG", quality=95)
+        self.reload()
+
+    def _delete_template(self, path: Path) -> None:
+        path.unlink(missing_ok=True)
+        self.reload()
+
+
+class PopupCropLabel(QWidget):
+    def __init__(self, pixmap: QPixmap, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.source_pixmap = pixmap
+        self.display_pixmap = pixmap.scaled(
+            760,
+            1200,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setFixedSize(self.display_pixmap.size())
+        self.setMouseTracking(True)
+        self.origin = QPoint()
+        self.selection = QRect()
+        self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self.origin = self._clamp_point(event.position().toPoint())
+        self.selection = QRect(self.origin, self.origin)
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        if not event.buttons() & Qt.MouseButton.LeftButton:
+            return
+        self.selection = QRect(self.origin, self._clamp_point(event.position().toPoint())).normalized()
+        self.update()
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self.selection = QRect(self.origin, self._clamp_point(event.position().toPoint())).normalized()
+        self.update()
+
+    def paintEvent(self, event: Any) -> None:
+        painter = QPainter(self)
+        painter.drawPixmap(0, 0, self.display_pixmap)
+        if self.selection.isValid() and not self.selection.isNull():
+            painter.setPen(QPen(QColor(249, 115, 22), 2))
+            painter.setBrush(QColor(249, 115, 22, 40))
+            painter.drawRect(self.selection)
+
+    def _clamp_point(self, point: QPoint) -> QPoint:
+        return QPoint(
+            max(0, min(point.x(), self.display_pixmap.width())),
+            max(0, min(point.y(), self.display_pixmap.height())),
+        )
+
+    def crop_box(self) -> tuple[int, int, int, int] | None:
+        rect = self.selection.intersected(QRect(0, 0, self.display_pixmap.width(), self.display_pixmap.height()))
+        if rect.width() < 4 or rect.height() < 4:
+            return None
+        scale_x = self.source_pixmap.width() / self.display_pixmap.width()
+        scale_y = self.source_pixmap.height() / self.display_pixmap.height()
+        left = int(rect.left() * scale_x)
+        top = int(rect.top() * scale_y)
+        right = int((rect.left() + rect.width()) * scale_x)
+        bottom = int((rect.top() + rect.height()) * scale_y)
+        return left, top, right, bottom
+
+
+class PopupCropDialog(QDialog):
+    def __init__(self, image: Image.Image, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.source_image = image.convert("RGB")
+        self.cropped_image: Image.Image | None = None
+        self.setWindowTitle("选择弹窗区域")
+        self.resize(860, 720)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        help_label = QLabel("拖拽框选弹窗区域，然后点击“保存弹窗”。")
+        help_label.setObjectName("HelperLabel")
+        root.addWidget(help_label)
+
+        qimage = ImageQt(self.source_image)
+        self.crop_label = PopupCropLabel(QPixmap.fromImage(qimage))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        scroll.setWidget(self.crop_label)
+        root.addWidget(scroll, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if ok_button:
+            ok_button.setText("保存弹窗")
+            ok_button.setObjectName("PrimaryButton")
+        if cancel_button:
+            cancel_button.setText("取消")
+        buttons.accepted.connect(self._accept_crop)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _accept_crop(self) -> None:
+        box = self.crop_label.crop_box()
+        if box is None:
+            QMessageBox.warning(self, "未选择区域", "请先拖拽选择弹窗区域。")
+            return
+        self.cropped_image = self.source_image.crop(box)
+        self.accept()
+
+
+class TemplateManagerWidget(QWidget):
+    def __init__(self, template_root: Path, device_ip: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.template_root = template_root
+        self.device_ip = device_ip
+        self.buttons_dir = template_root / "buttons"
+        self.screens_dir = template_root / "screens"
+        self.buttons_dir.mkdir(parents=True, exist_ok=True)
+        self.screens_dir.mkdir(parents=True, exist_ok=True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        intro_panel = QFrame()
+        intro_panel.setObjectName("InsetPanel")
+        intro_layout = QVBoxLayout(intro_panel)
+        intro_layout.setContentsMargins(14, 12, 14, 12)
+        intro_layout.setSpacing(6)
+        title = QLabel("模板管理")
+        title.setObjectName("SectionLabel")
+        intro_layout.addWidget(title)
+        subtitle = QLabel("这里只保留弹窗模板采集：从当前机械臂截图，手动框选弹窗区域后保存到当前设备当前 App 的模板目录。")
+        subtitle.setObjectName("HelperLabel")
+        subtitle.setWordWrap(True)
+        intro_layout.addWidget(subtitle)
+        location = QLabel(f"目录：{self.template_root}")
+        location.setObjectName("HelperLabel")
+        intro_layout.addWidget(location)
+        layout.addWidget(intro_panel)
+
+        action_panel = QFrame()
+        action_panel.setObjectName("InsetPanel")
+        action_layout = QVBoxLayout(action_panel)
+        action_layout.setContentsMargins(14, 12, 14, 12)
+        action_layout.setSpacing(8)
+        add_popup = QPushButton("添加弹窗")
+        add_popup.setObjectName("PrimaryButton")
+        add_popup.clicked.connect(self._capture_popup_template)
+        action_layout.addWidget(add_popup, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(action_panel)
+
+        list_panel = QFrame()
+        list_panel.setObjectName("InsetPanel")
+        list_layout = QVBoxLayout(list_panel)
+        list_layout.setContentsMargins(14, 12, 14, 12)
+        list_layout.setSpacing(8)
+        list_title = QLabel("当前弹窗模板")
+        list_title.setObjectName("SectionLabel")
+        list_layout.addWidget(list_title)
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["类型", "文件", "操作"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(40)
+        table_header = self.table.horizontalHeader()
+        table_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        list_layout.addWidget(self.table)
+        layout.addWidget(list_panel)
+        self.reload()
+
+    def reload(self) -> None:
+        files = sorted(self.buttons_dir.glob("popup_*.jpg"))
+        self.table.setRowCount(len(files))
+        for row, path in enumerate(files):
+            self.table.setItem(row, 0, QTableWidgetItem("弹窗"))
+            self.table.setItem(row, 1, QTableWidgetItem(path.name))
+            delete_button = QPushButton("删除")
+            delete_button.clicked.connect(lambda checked=False, p=path: self._delete_template(p))
+            self.table.setCellWidget(row, 2, delete_button)
+
+    def _capture_popup_template(self) -> None:
+        try:
+            image_bytes = RobotInterface(self.device_ip).get_transform_image(pre_move=True)
+            image = ensure_portrait_image(image_bytes)
+        except Exception as exc:
+            QMessageBox.critical(self, "截图失败", f"无法从机械臂获取截图：{exc}")
+            return
+
+        dialog = PopupCropDialog(image, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.cropped_image is None:
+            return
+
+        target = import_target_path(CUSTOM_POPUP, self.buttons_dir, self.screens_dir)
+        try:
+            dialog.cropped_image.convert("RGB").save(target, format="JPEG", quality=95)
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", f"无法保存弹窗模板：{exc}")
+            return
+        self.reload()
+        QMessageBox.information(self, "已保存", f"弹窗模板已保存：{target.name}")
+
+    def _delete_template(self, path: Path) -> None:
+        path.unlink(missing_ok=True)
+        self.reload()
+
+
+class AppConfigDialog(QDialog):
+    def __init__(
+        self,
+        overrides: dict[str, Any],
+        device_ip: str,
+        app_name: str,
+        template_root: Path,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.overrides = with_app_defaults(overrides)
+        self.device_ip = device_ip
+        self.app_name = app_name
+        self.template_root = template_root
+        self.setWindowTitle(f"App 配置 - {device_ip} / {app_name}")
+        self.resize(860, 660)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        header_panel = QFrame()
+        header_panel.setObjectName("DialogPanel")
+        header_layout = QVBoxLayout(header_panel)
+        header_layout.setContentsMargins(14, 12, 14, 12)
+        header_layout.setSpacing(4)
+        title = QLabel(f"设备配置 / {device_ip} / {app_name}")
+        title.setObjectName("DialogTitle")
+        header_layout.addWidget(title)
+        scope = QLabel("当前设置只作用于这台设备当前选中的 App。")
+        scope.setObjectName("HelperLabel")
+        header_layout.addWidget(scope)
+        root.addWidget(header_panel)
+
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        root.addWidget(self.tabs, 1)
+
+        self._build_runtime_tab(self.overrides)
+        self._build_ocr_tab(self.overrides)
+        self._build_template_tab(template_root)
+        self._build_persona_tab(self.overrides)
+        self.tabs.setTabVisible(self.ocr_tab_index, False)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if ok_button:
+            ok_button.setText("保存")
+            ok_button.setObjectName("PrimaryButton")
+        if cancel_button:
+            cancel_button.setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _build_runtime_tab(self, overrides: dict[str, Any]) -> None:
+        page = QWidget()
+        page_root = QVBoxLayout(page)
+        page_root.setContentsMargins(0, 0, 0, 0)
+        page_root.setSpacing(10)
+
+        panel = QFrame()
+        panel.setObjectName("InsetPanel")
+        panel_root = QVBoxLayout(panel)
+        panel_root.setContentsMargins(14, 12, 14, 12)
+        panel_root.setSpacing(8)
+        title = QLabel("运行设置")
+        title.setObjectName("SectionLabel")
+        panel_root.addWidget(title)
+        help_label = QLabel("配置主循环、单步超时和防熄屏跳转。防熄屏会通过列表 OCR 识别底部导航，点击“发现”后再点回“微信”。")
+        help_label.setObjectName("HelperLabel")
+        help_label.setWordWrap(True)
+        panel_root.addWidget(help_label)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setSpacing(10)
+        panel_root.addLayout(form)
+
+        self.poll_interval = QSpinBox()
+        self.poll_interval.setRange(1, 3600)
+        self.poll_interval.setValue(int(overrides.get("poll_interval", 1)))
+        form.addRow("轮询间隔（秒）", self.poll_interval)
+
+        self.step_timeout = QSpinBox()
+        self.step_timeout.setRange(1, 300)
+        self.step_timeout.setValue(int(overrides.get("step_timeout", 10)))
+        form.addRow("单步超时（秒）", self.step_timeout)
+
+        self.keep_awake_interval_seconds = QSpinBox()
+        self.keep_awake_interval_seconds.setRange(0, 86400)
+        self.keep_awake_interval_seconds.setValue(int(overrides.get("keep_awake_interval_seconds", DEFAULT_RUNTIME_CONFIG["keep_awake_interval_seconds"])))
+        form.addRow("防熄屏跳转间隔（秒，0关闭）", self.keep_awake_interval_seconds)
+
+        self.ocr_toggle_button = QPushButton("显示OCR设置")
+        self.ocr_toggle_button.clicked.connect(self._toggle_ocr_tab)
+        panel_root.addWidget(self.ocr_toggle_button, 0, Qt.AlignmentFlag.AlignLeft)
+
+        page_root.addWidget(panel)
+        page_root.addStretch(1)
+        self.tabs.addTab(page, "运行设置")
+
+    def _build_ocr_tab(self, overrides: dict[str, Any]) -> None:
+        page = QWidget()
+        page_root = QVBoxLayout(page)
+        page_root.setContentsMargins(0, 0, 0, 0)
+        page_root.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        panel = QFrame()
+        panel.setObjectName("InsetPanel")
+        panel_root = QVBoxLayout(panel)
+        panel_root.setContentsMargins(14, 12, 14, 12)
+        panel_root.setSpacing(8)
+        title = QLabel("OCR设置")
+        title.setObjectName("SectionLabel")
+        panel_root.addWidget(title)
+        help_label = QLabel("OCR、模板匹配、联动测试和实际点击统一使用竖屏归一化坐标，当前阶段不再额外转换点击坐标。")
+        help_label.setObjectName("HelperLabel")
+        help_label.setWordWrap(True)
+        panel_root.addWidget(help_label)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setSpacing(10)
+        panel_root.addLayout(form)
+
+        self.match_threshold = NoWheelDoubleSpinBox()
+        self.match_threshold.setRange(0.1, 1.0)
+        self.match_threshold.setSingleStep(0.01)
+        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.85)))
+        form.addRow("模板阈值", self.match_threshold)
+
+        ocr = overrides.get("ocr", {}) if isinstance(overrides.get("ocr", {}), dict) else {}
+        self.det_db_thresh = NoWheelDoubleSpinBox()
+        self.det_db_thresh.setRange(0.0, 1.0)
+        self.det_db_thresh.setSingleStep(0.01)
+        self.det_db_thresh.setValue(float(ocr.get("det_db_thresh", 0.3)))
+        form.addRow("OCR det_db_thresh", self.det_db_thresh)
+
+        self.rec_thresh = NoWheelDoubleSpinBox()
+        self.rec_thresh.setRange(0.0, 1.0)
+        self.rec_thresh.setSingleStep(0.01)
+        self.rec_thresh.setValue(float(ocr.get("rec_thresh", 0.5)))
+        form.addRow("OCR rec_thresh", self.rec_thresh)
+
+        ocr_modes = overrides.get("ocr_modes", {}) if isinstance(overrides.get("ocr_modes", {}), dict) else {}
+        dialogue_config = ocr_modes.get("dialogue", {}) if isinstance(ocr_modes.get("dialogue", {}), dict) else {}
+        dialogue_rules = (
+            dialogue_config.get("rules", {}) if isinstance(dialogue_config.get("rules", {}), dict) else {}
+        )
+
+        regions = ocr.get("regions", {}) if isinstance(ocr.get("regions", {}), dict) else {}
+        chat_area = regions.get("chat_area", [0.0, 0.1, 1.0, 0.8])
+        if not isinstance(chat_area, (list, tuple)) or len(chat_area) != 4:
+            chat_area = [0.0, 0.1, 1.0, 0.8]
+        chat_left = float(chat_area[0])
+        chat_top = float(chat_area[1])
+        chat_right = min(1.0, chat_left + float(chat_area[2]))
+        chat_bottom = min(1.0, chat_top + float(chat_area[3]))
+
+        region_title = QLabel("对话模式识别范围（竖屏归一化坐标）")
+        region_title.setObjectName("SectionLabel")
+        panel_root.addWidget(region_title)
+        region_help = QLabel("这里控制聊天详情页 OCR 只识别哪块区域：左/上是起点，右/下是终点，范围都是 0 到 1。")
+        region_help.setObjectName("HelperLabel")
+        region_help.setWordWrap(True)
+        panel_root.addWidget(region_help)
+
+        region_form = QFormLayout()
+        region_form.setContentsMargins(0, 0, 0, 0)
+        region_form.setSpacing(8)
+        panel_root.addLayout(region_form)
+
+        self.dialogue_region_left = self._region_spin(chat_left)
+        self.dialogue_region_top = self._region_spin(chat_top)
+        self.dialogue_region_right = self._region_spin(chat_right)
+        self.dialogue_region_bottom = self._region_spin(chat_bottom)
+        region_form.addRow("对话模式左边界", self.dialogue_region_left)
+        region_form.addRow("对话模式上边界", self.dialogue_region_top)
+        region_form.addRow("对话模式右边界", self.dialogue_region_right)
+        region_form.addRow("对话模式下边界", self.dialogue_region_bottom)
+
+        keyword_title = QLabel("对话模式过滤词")
+        keyword_title.setObjectName("SectionLabel")
+        panel_root.addWidget(keyword_title)
+        keyword_help = QLabel("每行一个关键词。第一组作用在单个 OCR 文字块，第二组作用在合并后的整条对话。只要包含关键词就会按规则过滤。")
+        keyword_help.setObjectName("HelperLabel")
+        keyword_help.setWordWrap(True)
+        panel_root.addWidget(keyword_help)
+
+        keyword_form = QFormLayout()
+        keyword_form.setContentsMargins(0, 0, 0, 0)
+        keyword_form.setSpacing(8)
+        panel_root.addLayout(keyword_form)
+        self.dialogue_ocr_result_excluded_keywords = self._keyword_editor(
+            dialogue_rules.get("ocr_result_excluded_keywords", [])
+        )
+        self.dialogue_line_excluded_keywords = self._keyword_editor(
+            dialogue_rules.get("line_excluded_keywords", [])
+        )
+        keyword_form.addRow("单个 OCR 块命中即丢弃", self.dialogue_ocr_result_excluded_keywords)
+        keyword_form.addRow("整条对话命中即丢弃", self.dialogue_line_excluded_keywords)
+
+        self.ocr_mode_fields: dict[str, dict[str, Any]] = {}
+        for mode_key, mode_label in [("dialogue", "对话模式"), ("list", "列表模式")]:
+            mode_config = ocr_modes.get(mode_key, {}) if isinstance(ocr_modes.get(mode_key, {}), dict) else {}
+            preprocess = mode_config.get("preprocess", {}) if isinstance(mode_config.get("preprocess", {}), dict) else {}
+            rules = mode_config.get("rules", {}) if isinstance(mode_config.get("rules", {}), dict) else {}
+
+            mode_panel = QFrame()
+            mode_panel.setObjectName("InsetPanel")
+            mode_panel_layout = QFormLayout(mode_panel)
+            mode_panel_layout.setContentsMargins(12, 10, 12, 10)
+            mode_panel_layout.setSpacing(8)
+
+            preprocess_box = QComboBox()
+            preprocess_box.addItems(["original"])
+            preprocess_box.setCurrentText("original")
+            mode_panel_layout.addRow(f"{mode_label} 预处理", preprocess_box)
+
+            scale_box = NoWheelSpinBox()
+            scale_box.setRange(1, 4)
+            scale_box.setValue(int(preprocess.get("scale", 2)))
+            mode_panel_layout.addRow(f"{mode_label} 放大倍数", scale_box)
+
+            min_confidence = NoWheelDoubleSpinBox()
+            min_confidence.setRange(0.0, 1.0)
+            min_confidence.setSingleStep(0.01)
+            min_confidence.setValue(float(rules.get("min_confidence", 0.3)))
+            mode_panel_layout.addRow(f"{mode_label} 最低置信度", min_confidence)
+
+            min_height = NoWheelDoubleSpinBox()
+            min_height.setRange(0.0, 0.2)
+            min_height.setSingleStep(0.005)
+            min_height.setDecimals(3)
+            min_height.setValue(float(rules.get("min_box_height_ratio", 0.02)))
+            mode_panel_layout.addRow(f"{mode_label} 最小框高比例", min_height)
+
+            self.ocr_mode_fields[mode_key] = {
+                "preprocess": preprocess_box,
+                "scale": scale_box,
+                "min_confidence": min_confidence,
+                "min_box_height_ratio": min_height,
+            }
+            panel_root.addWidget(mode_panel)
+
+        panel_root.addStretch(1)
+        scroll.setWidget(panel)
+        page_root.addWidget(scroll, 1)
+        self.ocr_tab_index = self.tabs.addTab(page, "OCR设置")
+
+    def _region_spin(self, value: float) -> QDoubleSpinBox:
+        spin = NoWheelDoubleSpinBox()
+        spin.setRange(0.0, 1.0)
+        spin.setDecimals(3)
+        spin.setSingleStep(0.01)
+        spin.setValue(max(0.0, min(1.0, float(value))))
+        return spin
+
+    def _keyword_editor(self, keywords: Any) -> QTextEdit:
+        editor = QTextEdit()
+        editor.setObjectName("KeywordEditor")
+        editor.setAcceptRichText(False)
+        editor.setMinimumHeight(92)
+        editor.setMaximumHeight(130)
+        editor.setPlainText("\n".join(self._keyword_lines(keywords)))
+        return editor
+
+    @staticmethod
+    def _keyword_lines(keywords: Any) -> list[str]:
+        if isinstance(keywords, str):
+            raw_items = keywords.splitlines()
+        elif isinstance(keywords, (list, tuple)):
+            raw_items = [str(item) for item in keywords]
+        else:
+            raw_items = []
+        return [item.strip() for item in raw_items if item.strip()]
+
+    @classmethod
+    def _keywords_from_editor(cls, editor: QTextEdit) -> list[str]:
+        return cls._keyword_lines(editor.toPlainText())
+
+    def _build_template_tab(self, template_root: Path) -> None:
+        page = QWidget()
+        page_root = QVBoxLayout(page)
+        page_root.setContentsMargins(0, 0, 0, 0)
+        self.template_manager = TemplateManagerWidget(template_root, self.device_ip, page)
+        page_root.addWidget(self.template_manager)
+        self.tabs.addTab(page, "模板管理")
+
+    def _build_persona_tab(self, overrides: dict[str, Any]) -> None:
+        page = QWidget()
+        page_root = QVBoxLayout(page)
+        page_root.setContentsMargins(0, 0, 0, 0)
+        page_root.setSpacing(10)
+
+        panel = QFrame()
+        panel.setObjectName("InsetPanel")
+        panel_root = QVBoxLayout(panel)
+        panel_root.setContentsMargins(14, 12, 14, 12)
+        panel_root.setSpacing(8)
+        title = QLabel("人设参数")
+        title.setObjectName("SectionLabel")
+        panel_root.addWidget(title)
+        help_label = QLabel("AI 回复时会优先使用这里的人设，覆盖全局默认值。")
+        help_label.setObjectName("HelperLabel")
+        panel_root.addWidget(help_label)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setSpacing(10)
+        persona = overrides.get("persona", {}) if isinstance(overrides.get("persona", {}), dict) else {}
+        self.persona_inputs: dict[str, QLineEdit] = {}
+        for key, label in [
+            ("requestPersona", "人设授权 ID"),
+            ("name", "名字"),
+            ("age", "年龄"),
+            ("work", "职业"),
+            ("location", "住址"),
+            ("renshe", "自定义人设"),
+        ]:
+            line = QLineEdit(str(persona.get(key, "")))
+            self.persona_inputs[key] = line
+            form.addRow(label, line)
+        panel_root.addLayout(form)
+        page_root.addWidget(panel)
+        page_root.addStretch(1)
+        self.tabs.addTab(page, "人设")
+
+    def _toggle_ocr_tab(self) -> None:
+        is_visible = self.tabs.isTabVisible(self.ocr_tab_index)
+        self.tabs.setTabVisible(self.ocr_tab_index, not is_visible)
+        self.ocr_toggle_button.setText("隐藏OCR设置" if not is_visible else "显示OCR设置")
+        if not is_visible:
+            self.tabs.setCurrentIndex(self.ocr_tab_index)
+
+    def values(self) -> dict[str, Any]:
+        values = dict(self.overrides)
+        ocr = dict(values.get("ocr", {}) if isinstance(values.get("ocr", {}), dict) else {})
+        ocr["det_db_thresh"] = self.det_db_thresh.value()
+        ocr["rec_thresh"] = self.rec_thresh.value()
+        regions = dict(ocr.get("regions", {}) if isinstance(ocr.get("regions", {}), dict) else {})
+        chat_left = self.dialogue_region_left.value()
+        chat_top = self.dialogue_region_top.value()
+        chat_right = max(chat_left, self.dialogue_region_right.value())
+        chat_bottom = max(chat_top, self.dialogue_region_bottom.value())
+        regions["chat_area"] = [
+            round(chat_left, 3),
+            round(chat_top, 3),
+            round(chat_right - chat_left, 3),
+            round(chat_bottom - chat_top, 3),
+        ]
+        ocr["regions"] = regions
+
+        ocr_modes = dict(values.get("ocr_modes", {}) if isinstance(values.get("ocr_modes", {}), dict) else {})
+        for mode_key, fields in self.ocr_mode_fields.items():
+            mode_config = dict(ocr_modes.get(mode_key, {}) if isinstance(ocr_modes.get(mode_key, {}), dict) else {})
+            preprocess = dict(mode_config.get("preprocess", {}) if isinstance(mode_config.get("preprocess", {}), dict) else {})
+            rules = dict(mode_config.get("rules", {}) if isinstance(mode_config.get("rules", {}), dict) else {})
+            preprocess["mode"] = "original"
+            preprocess["scale"] = fields["scale"].value()
+            preprocess.pop("auxiliary_mode", None)
+            rules["min_confidence"] = fields["min_confidence"].value()
+            rules["min_box_height_ratio"] = fields["min_box_height_ratio"].value()
+            if mode_key == "dialogue":
+                rules["ocr_result_excluded_keywords"] = self._keywords_from_editor(
+                    self.dialogue_ocr_result_excluded_keywords
+                )
+                rules["line_excluded_keywords"] = self._keywords_from_editor(
+                    self.dialogue_line_excluded_keywords
+                )
+            mode_config["preprocess"] = preprocess
+            mode_config["rules"] = rules
+            ocr_modes[mode_key] = mode_config
+
+        values.update({
+            "poll_interval": self.poll_interval.value(),
+            "step_timeout": self.step_timeout.value(),
+            "keep_awake_interval_seconds": self.keep_awake_interval_seconds.value(),
+            "match_threshold": self.match_threshold.value(),
+            "ocr": ocr,
+            "ocr_modes": ocr_modes,
+            "templates": {
+                "buttons": str(self.template_manager.buttons_dir),
+                "screens": str(self.template_manager.screens_dir),
+            },
+            "persona": {key: field.text().strip() for key, field in self.persona_inputs.items()},
+        })
+        return values
+
+
+def run_app(argv: list[str] | None = None) -> int:
+    app = QApplication(argv or sys.argv)
+    previous_handler = signal.getsignal(signal.SIGINT)
+
+    def handle_sigint(signum: int, frame: Any) -> None:
+        app.quit()
+
+    signal.signal(signal.SIGINT, handle_sigint)
+    signal_timer = QTimer()
+    signal_timer.timeout.connect(lambda: None)
+    signal_timer.start(200)
+
+    window = MainWindow()
+    window.show()
+    try:
+        return app.exec()
+    except KeyboardInterrupt:
+        app.quit()
+        return 130
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
