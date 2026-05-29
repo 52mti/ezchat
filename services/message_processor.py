@@ -12,6 +12,9 @@ from .memory_store import MemoryStore
 from .message_state import build_message_fingerprint, contact_key, find_outbox_entry
 
 
+DUPLICATE_PROTECTION_THRESHOLD = 5
+
+
 class MessageProcessor:
     def __init__(
         self,
@@ -70,8 +73,27 @@ class MessageProcessor:
 
         existing = find_outbox_entry(self.config_manager.load_outbox(), fingerprint)
         if existing and not existing.get("pending_send"):
-            self._log("info", "message already processed", {"fingerprint": fingerprint})
-            return ReplyAction(message_fingerprint=fingerprint, skip=True, reason="already_processed")
+            duplicate_hits = int(existing.get("duplicate_hit_count") or 0) + 1
+            self.config_manager.save_outbox_entry(
+                {
+                    "message_fingerprint": fingerprint,
+                    "duplicate_hit_count": duplicate_hits,
+                    "duplicate_last_hit_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+            payload = {
+                "fingerprint": fingerprint,
+                "duplicate_hit_count": duplicate_hits,
+                "duplicate_threshold": DUPLICATE_PROTECTION_THRESHOLD,
+            }
+            if duplicate_hits >= DUPLICATE_PROTECTION_THRESHOLD:
+                self._log("warning", "duplicate message protection triggered", payload)
+                return ReplyAction(
+                    message_fingerprint=fingerprint,
+                    skip=True,
+                    reason="duplicate_message_protection",
+                )
+            self._log("info", "duplicate message hit", payload)
         if existing and existing.get("pending_send") and existing.get("pending_reply_text"):
             self._log("info", "using pending reply", {"fingerprint": fingerprint})
             return ReplyAction(

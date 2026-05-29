@@ -20,7 +20,7 @@ from apps.visual_assets import (
     template_path,
     template_root,
 )
-from vision import match, run_ocr_mode
+from vision import crop_region, match, run_ocr_mode
 
 from .config import DEFAULT_CONFIG
 
@@ -43,6 +43,7 @@ BUTTON_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
     BACK_BUTTON: ("btn_返回按钮_2.jpg", "btn_返回按钮.jpg", "btn_back.jpg"),
     "button.send": ("btn_发送按钮.jpg", "btn_send.jpg"),
 }
+POPUP_SEARCH_REGION = (0.0, 0.0, 0.9, 1.0)
 
 SEND_BUTTON_KEY = "button.send"
 SYSTEM_TARGET_KEYWORDS = ("用户通知", "系统通知", "微信团队", "服务通知")
@@ -66,6 +67,41 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 def _threshold(config: dict[str, Any]) -> float:
     return float(config.get("match_threshold", 0.85))
+
+
+def _popup_search_region(config: dict[str, Any]) -> tuple[float, float, float, float]:
+    raw = config.get("popup_search_region", POPUP_SEARCH_REGION)
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        return POPUP_SEARCH_REGION
+    x, y, w, h = (float(value) for value in raw)
+    left = max(0.0, min(1.0, x))
+    top = max(0.0, min(1.0, y))
+    right = max(left, min(1.0, x + w))
+    bottom = max(top, min(1.0, y + h))
+    return left, top, right - left, bottom - top
+
+
+def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> dict[str, float] | None:
+    x, y, w, h = _popup_search_region(config)
+    if w <= 0 or h <= 0:
+        return None
+    try:
+        target_image = crop_region(image, (x, y, w, h))
+        cropped = True
+    except Exception:
+        target_image = image
+        cropped = False
+    result = match(target_image, popup_template, threshold=_threshold(config))
+    if not result:
+        return None
+    if not cropped:
+        return result
+    return {
+        "x": x + result["x"] * w,
+        "y": y + result["y"] * h,
+        "w": result["w"] * w,
+        "h": result["h"] * h,
+    }
 
 
 def _step_timeout(config: dict[str, Any]) -> float:
@@ -175,7 +211,7 @@ def current_screen(image: Any, config: dict[str, Any]) -> str:
 
 def _popup_close_point(image: Any, config: dict[str, Any]) -> tuple[float, float] | None:
     for popup_template in popup_template_paths(config):
-        result = match(image, popup_template, threshold=_threshold(config))
+        result = _popup_match(image, popup_template, config)
         if not result:
             continue
         return min(0.98, result["x"] + result["w"] * 0.9), max(0.02, result["y"] + result["h"] * 0.1)

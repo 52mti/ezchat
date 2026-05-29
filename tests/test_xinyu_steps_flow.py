@@ -186,7 +186,8 @@ def test_xinyu_app_uses_short_list_content_directly(monkeypatch, tmp_path):
     monkeypatch.setattr(xinyu_app.steps, "enter_chat", lambda robot, x, y: robot.move_click(x, y))
     monkeypatch.setattr(xinyu_app.steps, "confirm_chat_window", lambda robot, config, reporter=None: "chat")
     monkeypatch.setattr(xinyu_app.steps, "build_list_message", lambda target, content: {"contact": target["name"], "content": content})
-    monkeypatch.setattr(xinyu_app.steps, "input_reply", lambda robot, text, config, reporter=None: replies.append({"text": text}))
+    monkeypatch.setattr(xinyu_app.steps, "focus_input_box", lambda robot, config, reporter=None: robot.move_click(0.3, 0.8))
+    monkeypatch.setattr(xinyu_app.steps, "play_voice_reply", lambda robot, text, config, reporter=None: replies.append({"text": text}))
     monkeypatch.setattr(xinyu_app.steps, "send_reply", lambda robot, config, reporter=None: 1)
     monkeypatch.setattr(xinyu_app.steps, "go_back", lambda robot, config, reporter=None: robot.move_click(0.08, 0.06))
 
@@ -203,6 +204,7 @@ def test_xinyu_app_uses_short_list_content_directly(monkeypatch, tmp_path):
 
     assert replies == [{"text": "AI回复"}]
     assert sent == [("AI回复", "在吗")]
+    assert (0.3, 0.8) in robot.clicks
     assert any(event.get("current_step_label") == "进入聊天界面" for event in events)
     assert any(event.get("current_step_log_label") == "进入聊天界面：白嫖 (0.200, 0.300)" for event in events)
 
@@ -220,7 +222,8 @@ def test_xinyu_app_logs_list_content_used_for_reply(monkeypatch, tmp_path):
     monkeypatch.setattr(xinyu_app.steps, "enter_chat", lambda robot, x, y: robot.move_click(x, y))
     monkeypatch.setattr(xinyu_app.steps, "confirm_chat_window", lambda robot, config, reporter=None: "chat")
     monkeypatch.setattr(xinyu_app.steps, "build_list_message", lambda target, content: {"contact": target["name"], "content": content})
-    monkeypatch.setattr(xinyu_app.steps, "input_reply", lambda robot, text, config, reporter=None: None)
+    monkeypatch.setattr(xinyu_app.steps, "focus_input_box", lambda robot, config, reporter=None: None)
+    monkeypatch.setattr(xinyu_app.steps, "play_voice_reply", lambda robot, text, config, reporter=None: None)
     monkeypatch.setattr(xinyu_app.steps, "send_reply", lambda robot, config, reporter=None: 1)
     monkeypatch.setattr(xinyu_app.steps, "go_back", lambda robot, config, reporter=None: None)
     monkeypatch.setattr(xinyu_app.random, "choice", lambda values: values[0])
@@ -235,6 +238,35 @@ def test_xinyu_app_logs_list_content_used_for_reply(monkeypatch, tmp_path):
         and status.get("current_step_log_label") == "使用列表内容作为对话输入：在吗"
         for status in statuses
     )
+
+
+def test_xinyu_app_skip_reply_still_focuses_input_box_before_back(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list", "chat", "chat", "chat", "list"])
+    clicks: list[tuple[float, float]] = []
+
+    monkeypatch.setattr(
+        xinyu_app.steps,
+        "find_unread_target",
+        lambda robot, config, reporter=None: {"name": "白嫖", "content": "在吗", "favorability": 44, "unread_count": 1, "bounds": [0.1, 0.2, 0.3, 0.4], "x": 0.2, "y": 0.3},
+    )
+    monkeypatch.setattr(xinyu_app.steps, "enter_chat", lambda robot, x, y: robot.move_click(x, y))
+    monkeypatch.setattr(xinyu_app.steps, "confirm_chat_window", lambda robot, config, reporter=None: "chat")
+    monkeypatch.setattr(xinyu_app.steps, "build_list_message", lambda target, content: {"contact": target["name"], "content": content})
+    monkeypatch.setattr(xinyu_app.steps, "focus_input_box", lambda robot, config, reporter=None: clicks.append((0.31, 0.79)))
+    monkeypatch.setattr(xinyu_app.steps, "play_voice_reply", lambda robot, text, config, reporter=None: None)
+    monkeypatch.setattr(xinyu_app.steps, "go_back", lambda robot, config, reporter=None: clicks.append((0.08, 0.06)))
+    monkeypatch.setattr(xinyu_app.steps, "send_reply", lambda robot, config, reporter=None: 1)
+
+    app = xinyu_app.XinyuApp(
+        robot,
+        config,
+        reply_provider=lambda message: xinyu_app.ReplyAction(skip=True, reason="already_processed"),
+    )
+    app.run_once()
+
+    assert clicks[0] == (0.31, 0.79)
+    assert clicks[-1] == (0.08, 0.06)
 
 
 def test_xinyu_app_empty_target_does_not_keep_awake_before_idle_interval(monkeypatch, tmp_path):
@@ -308,7 +340,8 @@ def test_xinyu_app_uses_greeting_file_for_nihao(monkeypatch, tmp_path):
     monkeypatch.setattr(xinyu_app.steps, "enter_chat", lambda robot, x, y: robot.move_click(x, y))
     monkeypatch.setattr(xinyu_app.steps, "confirm_chat_window", lambda robot, config, reporter=None: "chat")
     monkeypatch.setattr(xinyu_app.steps, "build_list_message", lambda target, content: {"contact": target["name"], "content": content})
-    monkeypatch.setattr(xinyu_app.steps, "input_reply", lambda robot, text, config, reporter=None: sent.append(text))
+    monkeypatch.setattr(xinyu_app.steps, "focus_input_box", lambda robot, config, reporter=None: robot.move_click(0.31, 0.79))
+    monkeypatch.setattr(xinyu_app.steps, "play_voice_reply", lambda robot, text, config, reporter=None: sent.append(text))
     monkeypatch.setattr(xinyu_app.steps, "send_reply", lambda robot, config, reporter=None: 1)
     monkeypatch.setattr(xinyu_app.steps, "go_back", lambda robot, config, reporter=None: robot.move_click(0.08, 0.06))
     monkeypatch.setattr(xinyu_app.random, "choice", lambda values: values[0])
@@ -317,6 +350,7 @@ def test_xinyu_app_uses_greeting_file_for_nihao(monkeypatch, tmp_path):
     app.run_once()
 
     assert sent == ["您好"]
+    assert (0.31, 0.79) in robot.clicks
 
 
 def test_xinyu_app_reads_dialogue_sender1_last_message(monkeypatch, tmp_path):
@@ -332,7 +366,8 @@ def test_xinyu_app_reads_dialogue_sender1_last_message(monkeypatch, tmp_path):
         "read_message",
         lambda robot, config, target, image=None, reporter=None: {"contact": target["name"], "content": "最后一条", "message_time": ""},
     )
-    monkeypatch.setattr(xinyu_app.steps, "input_reply", lambda robot, text, config, reporter=None: seen.append({"text": text}))
+    monkeypatch.setattr(xinyu_app.steps, "focus_input_box", lambda robot, config, reporter=None: robot.move_click(0.31, 0.79))
+    monkeypatch.setattr(xinyu_app.steps, "play_voice_reply", lambda robot, text, config, reporter=None: seen.append({"text": text}))
     monkeypatch.setattr(xinyu_app.steps, "send_reply", lambda robot, config, reporter=None: 1)
     monkeypatch.setattr(xinyu_app.steps, "go_back", lambda robot, config, reporter=None: robot.move_click(0.08, 0.06))
 

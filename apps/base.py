@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from apps.cancellation import OperationCancelled, operation_cancelled
-from services.retention import cleanup_old_error_captures
 from vision.screen import ensure_portrait_image
 
 
@@ -23,6 +22,7 @@ class AppStatus:
     current_step_label: str = ""
     reply_round_count: int = 0
     average_reply_seconds: float = 0.0
+    pause_reason: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -34,6 +34,7 @@ class AppStatus:
             "current_step_label": self.current_step_label,
             "reply_round_count": self.reply_round_count,
             "average_reply_seconds": self.average_reply_seconds,
+            "pause_reason": self.pause_reason,
         }
 
 
@@ -94,7 +95,12 @@ class BaseApp:
         self.status.last_error = ""
         self.status.error_count = 0
         self.status.is_circuit_open = False
+        self.status.pause_reason = ""
         self.recover_error_count = 0
+
+    def request_pause(self, reason: str, step: str = "pause_requested") -> None:
+        self.status.pause_reason = str(reason)
+        self.set_runtime_step(step, str(reason))
 
     def record_reply_round(self, duration_seconds: float) -> None:
         duration = max(0.0, float(duration_seconds))
@@ -127,6 +133,8 @@ class BaseApp:
                 self.status.is_circuit_open = True
 
     def _save_error_capture(self) -> None:
+        from services.retention import cleanup_old_error_captures
+
         if not hasattr(self.robot, "get_transform_image"):
             return
         host = str(getattr(self.robot, "host", "unknown")).replace(":", "_")

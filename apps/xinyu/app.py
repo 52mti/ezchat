@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import random
 import re
 import time
@@ -154,11 +155,24 @@ class XinyuApp(BaseApp):
                 },
             )
 
+            input_focused = False
             if greeting_reply:
+                reporter("request_ai", "请求 AI 回复")
+                steps.focus_input_box(self.robot, self.config, reporter=reporter)
+                self._mark_activity()
+                input_focused = True
                 action = ReplyAction(text=greeting_reply)
             else:
                 reporter("request_ai", "请求 AI 回复")
-                raw_action = self.reply_provider(message)
+                executor = ThreadPoolExecutor(max_workers=1)
+                future = executor.submit(self.reply_provider, message)
+                try:
+                    steps.focus_input_box(self.robot, self.config, reporter=reporter)
+                    self._mark_activity()
+                    input_focused = True
+                    raw_action = future.result()
+                finally:
+                    executor.shutdown(wait=False, cancel_futures=True)
                 action = raw_action if isinstance(raw_action, ReplyAction) else ReplyAction(text=str(raw_action))
 
             self.emit_runtime_log(
@@ -175,12 +189,18 @@ class XinyuApp(BaseApp):
                 reporter("skip_reply", "跳过本轮回复")
                 steps.go_back(self.robot, self.config, reporter=reporter)
                 self._mark_activity()
+                if action.reason == "duplicate_message_protection":
+                    self.request_pause("重复消息保护", "duplicate_message_protection")
+                    return
                 self.mark_success()
                 return
             if not action.text:
                 raise RuntimeError("reply provider returned empty text")
 
-            steps.input_reply(self.robot, action.text, self.config, reporter=reporter)
+            if not input_focused:
+                steps.focus_input_box(self.robot, self.config, reporter=reporter)
+                self._mark_activity()
+            steps.play_voice_reply(self.robot, action.text, self.config, reporter=reporter)
             self._mark_activity()
             send_clicks = steps.send_reply(self.robot, self.config, reporter=reporter)
             self.emit_runtime_log("info", "xinyu_send_clicks", {"clicks": send_clicks})
