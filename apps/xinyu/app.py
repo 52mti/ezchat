@@ -189,9 +189,6 @@ class XinyuApp(BaseApp):
                 reporter("skip_reply", "跳过本轮回复")
                 steps.go_back(self.robot, self.config, reporter=reporter)
                 self._mark_activity()
-                if action.reason == "duplicate_message_protection":
-                    self.request_pause("重复消息保护", "duplicate_message_protection")
-                    return
                 self.mark_success()
                 return
             if not action.text:

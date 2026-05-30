@@ -7,6 +7,8 @@ DEFAULT_CONFIG = {
     "ocr": {
         "lang": "ch",
         "runtime_enabled": True,
+        "backend": "auto",
+        "model_tier": "lite",
         "use_gpu": True,
         "text_detection_model_name": "PP-OCRv5_mobile_det",
         "text_recognition_model_name": "PP-OCRv5_mobile_rec",

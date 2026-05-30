@@ -201,6 +201,10 @@ def _cached_paddle_engine(cache_key: str) -> Any:
 
 
 def _get_paddle_engine(config: dict[str, Any]) -> Any:
+    if config.get("backend") or config.get("ocr_backend") or config.get("model_tier") or config.get("modelTier"):
+        from .ocr_runtime import get_ocr_runtime_engine
+
+        return get_ocr_runtime_engine(config)
     cache_key = json.dumps(_runtime_init_kwargs(config), sort_keys=True)
     return _cached_paddle_engine(cache_key)
 

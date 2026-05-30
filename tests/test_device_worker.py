@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import queue
-import time
 from types import SimpleNamespace
 
 from services.config_manager import ConfigManager
@@ -31,18 +30,6 @@ class DummyApp:
 
     def run_once(self):
         return None
-
-
-class PauseRequestedApp(DummyApp):
-    def __init__(self, robot, config, reply_provider=None, sent_callback=None):
-        super().__init__(robot, config, reply_provider, sent_callback)
-        self.status = SimpleNamespace(is_circuit_open=False, error_count=0, pause_reason="")
-
-    def get_status(self):
-        return {"is_circuit_open": False, "pause_reason": self.status.pause_reason}
-
-    def run_once(self):
-        self.status.pause_reason = "重复消息保护"
 
 
 def test_worker_suppresses_app_status_after_stop(tmp_path, monkeypatch):
@@ -133,33 +120,3 @@ def test_worker_pause_can_emit_detail(tmp_path, monkeypatch):
 
     assert event.message == "paused"
     assert event.payload == {"detail": "黑屏熔断"}
-
-
-def test_worker_pauses_when_app_requests_pause(tmp_path, monkeypatch):
-    monkeypatch.setattr(device_worker_module, "get_registered_apps", lambda: {"dummy": PauseRequestedApp})
-    events: "queue.Queue" = queue.Queue()
-    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
-    worker = DeviceWorker(
-        {"ip": "192.168.1.108", "selected_app": "dummy"},
-        app_config={"poll_interval": 30},
-        events=events,
-        config_manager=manager,
-        robot=object(),
-    )
-
-    worker.start()
-    emitted = []
-    for _ in range(50):
-        while not events.empty():
-            emitted.append(events.get_nowait())
-        if any(event.message == "paused" for event in emitted):
-            break
-        time.sleep(0.02)
-    worker.stop()
-    worker.join(timeout=2)
-
-    while not events.empty():
-        emitted.append(events.get_nowait())
-    paused = [event for event in emitted if event.message == "paused"]
-    assert paused
-    assert paused[0].payload == {"detail": "重复消息保护"}

@@ -150,3 +150,36 @@ def test_ocr_runtime_uses_mobile_model_names_and_gpu(monkeypatch):
     assert "\"device\": \"gpu:0\"" in captured["cache_key"]
     assert "\"text_detection_model_name\": \"PP-OCRv5_mobile_det\"" in captured["cache_key"]
     assert "\"text_recognition_model_name\": \"PP-OCRv5_mobile_rec\"" in captured["cache_key"]
+
+
+def test_ocr_runtime_prefers_auto_backend_entry(monkeypatch):
+    image = Image.new("RGB", (100, 50), "white")
+    captured = {}
+
+    class DummyRuntimeEngine(FakePredictEngine):
+        pass
+
+    import vision.ocr_runtime as runtime_module
+
+    def fake_runtime_engine(config):
+        captured["config"] = dict(config)
+        return DummyRuntimeEngine()
+
+    monkeypatch.setattr(
+        runtime_module,
+        "get_ocr_runtime_engine",
+        fake_runtime_engine,
+    )
+
+    result = ocr(
+        image,
+        {
+            "runtime_enabled": True,
+            "backend": "auto",
+            "model_tier": "lite",
+            "use_gpu": False,
+        },
+    )
+
+    assert captured["config"]["backend"] == "auto"
+    assert result[0]["text"] == "runtime"

@@ -51,9 +51,6 @@ class HuanyouApp(BaseApp):
             action = raw_action if isinstance(raw_action, ReplyAction) else ReplyAction(text=str(raw_action))
             if action.skip:
                 steps.go_back(self.robot, self.config, reporter=reporter)
-                if action.reason == "duplicate_message_protection":
-                    self.request_pause("重复消息保护", "duplicate_message_protection")
-                    return
                 self.mark_success()
                 return
             if not action.text:

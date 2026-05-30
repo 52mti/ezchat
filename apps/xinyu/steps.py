@@ -24,7 +24,7 @@ from apps.visual_assets import (
     template_path,
     template_root,
 )
-from vision import crop_region, match, run_ocr_mode
+from vision import match, run_ocr_mode
 from vision.screen import load_image
 
 from .config import DEFAULT_CONFIG
@@ -45,7 +45,7 @@ UNREAD_BUTTON = "button.unread"
 UNREAD_BUTTON_NO_RED = "button.unread.no_red"
 SEND_BUTTON_KEY = "button.send"
 TTS_POST_DELAY_SECONDS = 3.0
-POPUP_SEARCH_REGION = (0.0, 0.0, 0.9, 1.0)
+POPUP_MAX_X = 0.9
 
 SCREEN_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
     CHAT_LIST_SCREEN: ("screen_聊天列表.jpg", "chat_list.jpg", "screen_message_list.jpg"),
@@ -81,39 +81,14 @@ def _threshold(config: dict[str, Any]) -> float:
     return float(config.get("match_threshold", 0.85))
 
 
-def _popup_search_region(config: dict[str, Any]) -> tuple[float, float, float, float]:
-    raw = config.get("popup_search_region", POPUP_SEARCH_REGION)
-    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
-        return POPUP_SEARCH_REGION
-    x, y, w, h = (float(value) for value in raw)
-    left = max(0.0, min(1.0, x))
-    top = max(0.0, min(1.0, y))
-    right = max(left, min(1.0, x + w))
-    bottom = max(top, min(1.0, y + h))
-    return left, top, right - left, bottom - top
-
-
 def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> dict[str, float] | None:
-    x, y, w, h = _popup_search_region(config)
-    if w <= 0 or h <= 0:
-        return None
-    try:
-        target_image = crop_region(image, (x, y, w, h))
-        cropped = True
-    except Exception:
-        target_image = image
-        cropped = False
-    result = match(target_image, popup_template, threshold=_threshold(config))
+    result = match(image, popup_template, threshold=_threshold(config))
     if not result:
         return None
-    if not cropped:
-        return result
-    return {
-        "x": x + result["x"] * w,
-        "y": y + result["y"] * h,
-        "w": result["w"] * w,
-        "h": result["h"] * h,
-    }
+    max_x = float(config.get("popup_max_x", POPUP_MAX_X) or POPUP_MAX_X)
+    if float(result.get("x", 0.0)) > max_x:
+        return None
+    return result
 
 
 def _step_timeout(config: dict[str, Any]) -> float:
@@ -218,6 +193,19 @@ def _bottom_nav_center(
     *,
     min_center_y: float = 0.0,
 ) -> tuple[float, float] | None:
+    match_item = _bottom_nav_item(items, keywords, min_center_y=min_center_y)
+    if match_item is None:
+        return None
+    _item, center = match_item
+    return center
+
+
+def _bottom_nav_item(
+    items: list[dict[str, Any]],
+    keywords: tuple[str, ...],
+    *,
+    min_center_y: float = 0.0,
+) -> tuple[dict[str, Any], tuple[float, float]] | None:
     for item in items:
         name = str(item.get("name", "") or "")
         if not any(keyword in name for keyword in keywords):
@@ -226,8 +214,18 @@ def _bottom_nav_center(
         if isinstance(bounds, list) and len(bounds) == 4:
             center = _center_from_bounds(bounds)
             if center[1] >= min_center_y:
-                return center
+                return item, center
     return None
+
+
+def _match_result_from_bounds(bounds: list[float]) -> dict[str, float]:
+    left, top, right, bottom = bounds
+    return {
+        "x": float(left),
+        "y": float(top),
+        "w": max(0.0, float(right) - float(left)),
+        "h": max(0.0, float(bottom) - float(top)),
+    }
 
 
 def _has_red_pixels(image: Any, match_result: dict[str, float]) -> bool:
@@ -291,7 +289,11 @@ def dismiss_popups(
     if close_point is None:
         return False
     _report(reporter, "popup_check", "关闭弹窗", log_label=f"关闭弹窗：{format_point(*close_point)}")
-    click_image_point(robot, *close_point)
+    try:
+        click_image_point(robot, *close_point)
+    except Exception:
+        _report(reporter, "popup_check", "弹窗点击失败，忽略")
+        return False
     return True
 
 
@@ -300,7 +302,7 @@ def capture_after_popups(
     config: dict[str, Any],
     *,
     label: str = "screen",
-    max_dismiss: int = 3,
+    max_dismiss: int = 2,
     reporter: Reporter | None = None,
 ) -> Any:
     image = capture_transform_image(robot, config, pre_move=True, label=label)
@@ -309,7 +311,11 @@ def capture_after_popups(
         if close_point is None:
             break
         _report(reporter, "popup_check", "关闭弹窗", log_label=f"关闭弹窗：{format_point(*close_point)}")
-        click_image_point(robot, *close_point)
+        try:
+            click_image_point(robot, *close_point)
+        except Exception:
+            _report(reporter, "popup_check", "弹窗点击失败，忽略")
+            break
         image = capture_transform_image(robot, config, pre_move=True, label=f"{label}_after_popup")
     return image
 
@@ -322,7 +328,10 @@ def _click_back_once(
 ) -> bool:
     current_image = image if image is not None else capture_after_popups(robot, config, label="back_check", reporter=reporter)
     pos = _template_center(current_image, config, BACK_BUTTON, group="buttons")
-    click_point = pos if pos is not None else (0.08, 0.06)
+    if pos is None:
+        _report(reporter, "return_from_chat", "返回按钮未找到")
+        return False
+    click_point = pos
     _report(reporter, "return_from_chat", "点击返回", log_label=f"点击返回：{format_point(*click_point)}")
     click_image_point(robot, *click_point)
     return True
@@ -336,13 +345,15 @@ def ensure_list_screen(robot: Any, config: dict[str, Any] | None = None, reporte
     if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
         return image
     if _matches_screen(image, cfg, CHAT_WINDOW_SCREEN):
-        _click_back_once(robot, cfg, image, reporter=reporter)
+        if not _click_back_once(robot, cfg, image, reporter=reporter):
+            return None
         time.sleep(0.4)
         image = capture_after_popups(robot, cfg, label="after_return_from_chat", reporter=reporter)
         _raise_if_black_screen(image, cfg)
         if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
             return image
-    _click_back_once(robot, cfg, image, reporter=reporter)
+    if not _click_back_once(robot, cfg, image, reporter=reporter):
+        return None
     time.sleep(0.4)
     image = capture_after_popups(robot, cfg, label="after_unknown_back", reporter=reporter)
     _raise_if_black_screen(image, cfg)
@@ -356,29 +367,41 @@ def check_unread_button(
     config: dict[str, Any] | None = None,
     image: Any | None = None,
     reporter: Reporter | None = None,
-) -> Any:
+    ocr_result: dict[str, Any] | None = None,
+) -> tuple[Any, dict[str, Any]]:
     cfg = _config(config)
     current_image = image if image is not None else capture_after_popups(robot, cfg, label="unread_button", reporter=reporter)
-    result = _template_match(current_image, cfg, UNREAD_BUTTON, group="buttons")
-    if result is None:
-        return current_image
-    has_red = _has_red_pixels(current_image, result)
-    unread_center = (result["x"] + result["w"] / 2, result["y"] + result["h"] / 2)
+    if ocr_result is None:
+        _report(reporter, "list_ocr_scan", "列表 OCR 扫描")
+        ocr_result = run_ocr_mode(current_image, cfg, "list", region=None)
+    bottom_nav = ocr_result["result"].get("bottom_nav", [])
+    unread_item = _bottom_nav_item(bottom_nav, ("未回复",))
+    if unread_item is None:
+        return current_image, ocr_result
+
+    nav_item, unread_center = unread_item
+    bounds = nav_item.get("bounds")
+    if not isinstance(bounds, list) or len(bounds) != 4:
+        return current_image, ocr_result
+    has_red = _has_red_pixels(current_image, _match_result_from_bounds(bounds))
     _report(
         reporter,
         "unread_button_check",
-        "未读入口已有红色" if has_red else "未读入口无红色，点击切换",
+        "未回复入口已有红色" if has_red else "未回复入口无红色，点击切换",
         log_label=(
-            f"未读入口已有红色：{format_point(*unread_center)}"
+            f"未回复入口已有红色：{format_point(*unread_center)}"
             if has_red
-            else f"未读入口无红色，点击切换：{format_point(*unread_center)}"
+            else f"未回复入口无红色，点击切换：{format_point(*unread_center)}"
         ),
     )
     if has_red:
-        return current_image
+        return current_image, ocr_result
     click_image_point(robot, *unread_center)
     time.sleep(0.4)
-    return capture_after_popups(robot, cfg, label="after_unread_button", reporter=reporter)
+    current_image = capture_after_popups(robot, cfg, label="after_unread_button", reporter=reporter)
+    _report(reporter, "list_ocr_scan", "列表 OCR 扫描")
+    ocr_result = run_ocr_mode(current_image, cfg, "list", region=None)
+    return current_image, ocr_result
 
 
 def find_unread_target(
@@ -390,10 +413,9 @@ def find_unread_target(
     image = ensure_list_screen(robot, cfg, reporter=reporter)
     if image is None:
         return None
-    image = check_unread_button(robot, cfg, image, reporter=reporter)
-
     _report(reporter, "list_ocr_scan", "列表 OCR 扫描")
     ocr_result = run_ocr_mode(image, cfg, "list", region=None)
+    image, ocr_result = check_unread_button(robot, cfg, image, reporter=reporter, ocr_result=ocr_result)
     rows = ocr_result["result"].get("message_list", [])
     candidates: list[tuple[int, int, dict[str, Any]]] = []
     for index, row in enumerate(rows):
@@ -657,7 +679,10 @@ def go_back(
     for _ in range(2):
         image = capture_after_popups(robot, cfg, label="go_back_button", reporter=reporter)
         pos = _template_center(image, cfg, BACK_BUTTON, group="buttons")
-        click_point = pos if pos is not None else (0.08, 0.06)
+        if pos is None:
+            _report(reporter, "back_double_click", "返回按钮未找到")
+            raise StepUnavailable("back button was not found")
+        click_point = pos
         _report(reporter, "back_double_click", "点击返回", log_label=f"点击返回：{format_point(*click_point)}")
         click_image_point(robot, *click_point)
         time.sleep(0.4)
@@ -680,7 +705,10 @@ def go_back(
         return
 
     pos = _template_center(image, cfg, BACK_BUTTON, group="buttons")
-    click_point = pos if pos is not None else (0.08, 0.06)
+    if pos is None:
+        _report(reporter, "back_double_click", "返回按钮未找到")
+        raise StepUnavailable("back button was not found")
+    click_point = pos
     _report(reporter, "back_double_click", "连续点击返回两次", log_label=f"连续点击返回两次：{format_point(*click_point)}")
     click_image_point(robot, *click_point)
     click_image_point(robot, *click_point)

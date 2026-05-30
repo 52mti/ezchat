@@ -68,7 +68,7 @@ def test_message_processor_writes_pending_then_marks_sent(tmp_path):
     assert config.load_outbox()[0]["conversation_id"] == "cid"
 
 
-def test_message_processor_replies_until_duplicate_threshold(tmp_path):
+def test_message_processor_replies_for_repeated_message(tmp_path):
     config = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
     ai = FakeAI()
     processor = MessageProcessor(
@@ -87,37 +87,6 @@ def test_message_processor_replies_until_duplicate_threshold(tmp_path):
     assert second.skip is False
     assert second.text == "回复"
     assert ai.calls == 2
-    assert config.load_outbox()[0]["duplicate_hit_count"] == 1
-
-
-def test_message_processor_triggers_duplicate_protection_on_fifth_hit(tmp_path):
-    config = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
-    ai = FakeAI()
-    logs = []
-    processor = MessageProcessor(
-        device={"ip": "1.1.1.1"},
-        app_name="wechat",
-        config_manager=config,
-        ai_client=ai,  # type: ignore[arg-type]
-        memory_store=MemoryStore(tmp_path / "memory"),
-        logger=lambda level, message, payload=None: logs.append((level, message, payload)),
-    )
-    message = {"contact": "寮犱笁", "content": "浣犲ソ", "message_time": "12:00"}
-    action = processor.prepare_reply(message)
-    processor.mark_sent(action, message)
-
-    result = None
-    for _ in range(5):
-        result = processor.prepare_reply(message)
-        if not result.skip:
-            processor.mark_sent(result, message)
-
-    assert result is not None
-    assert result.skip is True
-    assert result.reason == "duplicate_message_protection"
-    assert ai.calls == 5
-    assert config.load_outbox()[0]["duplicate_hit_count"] == 5
-    assert any(message == "duplicate message protection triggered" for _, message, _ in logs)
 
 
 def test_message_processor_uses_app_scoped_persona(tmp_path):

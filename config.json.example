@@ -23,6 +23,8 @@
           "ocr": {
             "lang": "ch",
             "runtime_enabled": false,
+            "backend": "auto",
+            "model_tier": "lite",
             "use_gpu": false,
             "det_db_thresh": 0.3,
             "rec_thresh": 0.5,

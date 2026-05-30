@@ -7,7 +7,7 @@ from apps.coordinates import click_image_point
 from apps.photo_capture import capture_transform_image
 from apps.reporting import Reporter, format_point, report_step
 from apps.utils import tts_input
-from vision import crop_region, match, run_ocr_mode
+from vision import match, run_ocr_mode
 
 from .visual_assets import (
     BACK_BUTTON,
@@ -27,7 +27,7 @@ class StepUnavailable(RuntimeError):
     pass
 
 
-POPUP_SEARCH_REGION = (0.0, 0.0, 0.9, 1.0)
+POPUP_MAX_X = 0.9
 
 
 def _report(reporter: Reporter | None, step: str, label: str, log_label: str | None = None) -> None:
@@ -38,39 +38,14 @@ def _threshold(config: dict[str, Any]) -> float:
     return float(config.get("match_threshold", 0.85))
 
 
-def _popup_search_region(config: dict[str, Any]) -> tuple[float, float, float, float]:
-    raw = config.get("popup_search_region", POPUP_SEARCH_REGION)
-    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
-        return POPUP_SEARCH_REGION
-    x, y, w, h = (float(value) for value in raw)
-    left = max(0.0, min(1.0, x))
-    top = max(0.0, min(1.0, y))
-    right = max(left, min(1.0, x + w))
-    bottom = max(top, min(1.0, y + h))
-    return left, top, right - left, bottom - top
-
-
 def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> dict[str, float] | None:
-    x, y, w, h = _popup_search_region(config)
-    if w <= 0 or h <= 0:
-        return None
-    try:
-        target_image = crop_region(image, (x, y, w, h))
-        cropped = True
-    except Exception:
-        target_image = image
-        cropped = False
-    result = match(target_image, popup_template, threshold=_threshold(config))
+    result = match(image, popup_template, threshold=_threshold(config))
     if not result:
         return None
-    if not cropped:
-        return result
-    return {
-        "x": x + result["x"] * w,
-        "y": y + result["y"] * h,
-        "w": result["w"] * w,
-        "h": result["h"] * h,
-    }
+    max_x = float(config.get("popup_max_x", POPUP_MAX_X) or POPUP_MAX_X)
+    if float(result.get("x", 0.0)) > max_x:
+        return None
+    return result
 
 
 def _region(config: dict[str, Any], key: str) -> Any:
@@ -123,7 +98,11 @@ def dismiss_popups(
         close_x = min(0.98, result["x"] + result["w"] * 0.9)
         close_y = max(0.02, result["y"] + result["h"] * 0.1)
         _report(reporter, "popup_check", "关闭弹窗", log_label=f"关闭弹窗：{format_point(close_x, close_y)}")
-        click_image_point(robot, close_x, close_y)
+        try:
+            click_image_point(robot, close_x, close_y)
+        except Exception:
+            _report(reporter, "popup_check", "弹窗点击失败，忽略")
+            return False
         return True
     return False
 

@@ -100,8 +100,6 @@ class DeviceWorker(threading.Thread):
         if self.app.status.is_circuit_open:
             self.app.status.is_circuit_open = False
             self.app.status.error_count = 0
-        if hasattr(self.app.status, "pause_reason"):
-            self.app.status.pause_reason = ""
         self._emit("info", "resumed")
 
     def stop(self) -> None:
@@ -178,9 +176,6 @@ class DeviceWorker(threading.Thread):
             status = self.app.get_status()
             status["checked_at"] = datetime.now().isoformat(timespec="seconds")
             self._emit("status", "tick", status)
-            pause_reason = str(status.get("pause_reason", "") or "")
-            if pause_reason:
-                self.pause(pause_reason)
             if status.get("is_circuit_open"):
                 self._emit("error", "circuit open", status)
                 self.pause(str(status.get("current_step_label", "") or status.get("current_step", "") or ""))

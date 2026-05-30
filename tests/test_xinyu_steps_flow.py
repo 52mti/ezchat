@@ -146,6 +146,96 @@ def test_xinyu_unread_red_pixel_detection_accepts_pink_red_badge():
     assert steps._has_red_pixels(no_red, full_match) is False
 
 
+def test_xinyu_unreplied_filter_clicks_when_no_red(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["after"])
+
+    ocr_calls: list[object] = []
+
+    def fake_ocr(image, cfg, mode, region=None):
+        ocr_calls.append(image)
+        return {
+            "result": {
+                "bottom_nav": [{"name": "未回复", "bounds": [0.2, 0.1, 0.4, 0.2]}],
+                "message_list": [],
+            },
+            "ocr_items": [],
+        }
+
+    monkeypatch.setattr(steps, "run_ocr_mode", fake_ocr)
+    monkeypatch.setattr(steps, "_has_red_pixels", lambda image, match_result: False)
+    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None: "after")
+    monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
+
+    image, _ocr_result = steps.check_unread_button(robot, config, image="list")
+
+    assert image == "after"
+    assert robot.clicks == [pytest.approx((0.3, 0.15))]
+    assert ocr_calls == ["list", "after"]
+
+
+def test_xinyu_unreplied_filter_does_not_click_when_red(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["after"])
+
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "result": {
+                "bottom_nav": [{"name": "未回复", "bounds": [0.2, 0.1, 0.4, 0.2]}],
+                "message_list": [],
+            },
+            "ocr_items": [],
+        },
+    )
+    monkeypatch.setattr(steps, "_has_red_pixels", lambda image, match_result: True)
+
+    image, _ocr_result = steps.check_unread_button(robot, config, image="list")
+
+    assert image == "list"
+    assert robot.clicks == []
+
+
+def test_xinyu_popup_dismiss_ignores_after_two_clicks(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["popup_1", "popup_2", "popup_3"])
+
+    def fake_match(image, template, threshold=0.85):
+        if Path(template).name == "popup_custom_1.jpg":
+            return {"x": 0.1, "y": 0.2, "w": 0.4, "h": 0.3, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+
+    image = steps.capture_after_popups(robot, config)
+
+    assert image == "popup_3"
+    assert robot.clicks == [pytest.approx((0.46, 0.23)), pytest.approx((0.46, 0.23))]
+
+
+def test_xinyu_unknown_screen_does_not_click_default_back(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["unknown"])
+
+    monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
+
+    assert steps.ensure_list_screen(robot, config) is None
+    assert robot.clicks == []
+
+
+def test_xinyu_go_back_requires_matched_back_button(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["chat"])
+
+    monkeypatch.setattr(steps, "ensure_send_cleared", lambda robot, config, reporter=None: 0)
+    monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
+
+    with pytest.raises(steps.StepUnavailable, match="back button was not found"):
+        steps.go_back(robot, config)
+    assert robot.clicks == []
+
+
 def test_xinyu_list_selects_highest_favorability_target(monkeypatch, tmp_path):
     config = _config(tmp_path)
     robot = FakeRobot(["list"])

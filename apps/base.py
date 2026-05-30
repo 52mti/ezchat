@@ -22,7 +22,6 @@ class AppStatus:
     current_step_label: str = ""
     reply_round_count: int = 0
     average_reply_seconds: float = 0.0
-    pause_reason: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -34,7 +33,6 @@ class AppStatus:
             "current_step_label": self.current_step_label,
             "reply_round_count": self.reply_round_count,
             "average_reply_seconds": self.average_reply_seconds,
-            "pause_reason": self.pause_reason,
         }
 
 
@@ -95,12 +93,7 @@ class BaseApp:
         self.status.last_error = ""
         self.status.error_count = 0
         self.status.is_circuit_open = False
-        self.status.pause_reason = ""
         self.recover_error_count = 0
-
-    def request_pause(self, reason: str, step: str = "pause_requested") -> None:
-        self.status.pause_reason = str(reason)
-        self.set_runtime_step(step, str(reason))
 
     def record_reply_round(self, duration_seconds: float) -> None:
         duration = max(0.0, float(duration_seconds))

@@ -1,34 +1,62 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+from vision.ocr_runtime import detect_gpu_environment, load_runtime_manifest, normalize_ocr_backend, select_ocr_backend
+
 
 def detect_backend() -> str:
-    if shutil.which("nvidia-smi"):
+    report = detect_gpu_environment()
+    if report.gpu_names:
         return "paddle_cuda"
+    hardware = None
+    try:
+        from vision.ocr_runtime import probe_hardware
+
+        hardware = probe_hardware()
+    except Exception:
+        hardware = None
+    if hardware and hardware.directml_available:
+        return "onnx_directml"
     return "cpu"
 
 
 def validate_backend(backend_key: str) -> None:
     if backend_key in {"paddle_cuda", "cpu"}:
-        importlib.import_module("paddleocr")
-        importlib.import_module("paddle")
+        import paddle  # noqa: F401
+        import paddleocr  # noqa: F401
         return
     if backend_key == "onnx_directml":
-        importlib.import_module("onnxruntime")
-        importlib.import_module("rapidocr_onnxruntime")
+        import onnxruntime  # noqa: F401
+        import rapidocr_onnxruntime  # noqa: F401
         return
     raise ValueError(f"Unsupported backend: {backend_key}")
 
 
+def _backend_packages(manifest: dict[str, object], backend_key: str) -> list[str]:
+    backend = manifest.get("backends", {})
+    if not isinstance(backend, dict):
+        return []
+    entry = backend.get(backend_key, {})
+    if not isinstance(entry, dict):
+        return []
+    packages = entry.get("packages", [])
+    if not isinstance(packages, list):
+        return []
+    normalized: list[str] = []
+    for item in packages:
+        if isinstance(item, str) and item.strip():
+            normalized.append(item.strip())
+    return normalized
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Install OCR runtime skeleton.")
+    parser = argparse.ArgumentParser(description="Install OCR runtime.")
     parser.add_argument("--backend", choices=["auto", "paddle_cuda", "onnx_directml", "cpu"], default="auto")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -36,8 +64,8 @@ def main() -> int:
     manifest_path = Path("runtime_manifest.json")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     backend_key = detect_backend() if args.backend == "auto" else args.backend
-    backend = manifest["backends"][backend_key]
-    packages = list(backend.get("packages", []))
+    backend_key = select_ocr_backend(normalize_ocr_backend(backend_key), None) if backend_key != "auto" else backend_key
+    packages = _backend_packages(manifest, backend_key)
 
     runtime_dir = Path("runtime")
     runtime_dir.mkdir(exist_ok=True)
@@ -60,7 +88,7 @@ def main() -> int:
                         "backend": backend_key,
                         "status": status,
                         "packages": packages,
-                        "message": backend["description"],
+                        "message": manifest["backends"][backend_key]["description"],
                         "validation": validation,
                         "validation_error": validation_error,
                     },
@@ -78,7 +106,7 @@ def main() -> int:
                 "backend": backend_key,
                 "status": status,
                 "packages": packages,
-                "message": backend["description"],
+                "message": manifest["backends"][backend_key]["description"],
                 "validation": validation,
                 "validation_error": validation_error,
             },

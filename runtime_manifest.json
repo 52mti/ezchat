@@ -3,16 +3,27 @@
   "model_tier": "lite",
   "backends": {
     "paddle_cuda": {
-      "description": "NVIDIA CUDA PaddleOCR runtime; installed explicitly by install_runtime.py in a later phase.",
-      "packages": ["paddleocr", "paddlepaddle-gpu"]
+      "description": "NVIDIA CUDA PaddleOCR runtime for PP-OCRv5 mobile",
+      "packages": [
+        "paddlepaddle-gpu==3.2.2",
+        "paddleocr==3.4.0",
+        "paddlex[ocr-core]==3.4.3"
+      ]
     },
     "onnx_directml": {
-      "description": "DirectML OCR runtime; installed explicitly by install_runtime.py in a later phase.",
-      "packages": ["onnxruntime-directml", "rapidocr_onnxruntime"]
+      "description": "DirectML OCR runtime for Windows AMD/Intel GPUs",
+      "packages": [
+        "onnxruntime-directml",
+        "rapidocr_onnxruntime"
+      ]
     },
     "cpu": {
-      "description": "CPU OCR runtime; installed explicitly by install_runtime.py in a later phase.",
-      "packages": ["paddleocr", "paddlepaddle"]
+      "description": "CPU OCR runtime for PP-OCRv5 mobile",
+      "packages": [
+        "paddlepaddle==3.2.2",
+        "paddleocr==3.4.0",
+        "paddlex[ocr-core]==3.4.3"
+      ]
     }
   }
 }

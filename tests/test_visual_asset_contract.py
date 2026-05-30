@@ -88,6 +88,18 @@ def test_runtime_loads_multiple_popup_templates(tmp_path):
     assert [path.name for path in paths] == ["popup_custom_1.jpg", "popup_custom_2.jpg"]
 
 
+def test_popup_match_drops_results_beyond_right_edge(monkeypatch, tmp_path):
+    popup_template = tmp_path / "popup_custom_1.jpg"
+    popup_template.write_bytes(b"template")
+
+    def fake_match(image, template, threshold=0.85):
+        return {"x": 0.91, "y": 0.2, "w": 0.05, "h": 0.1, "score": 0.99}
+
+    monkeypatch.setattr(wechat_steps, "match", fake_match)
+
+    assert wechat_steps._popup_match("screen", popup_template, {}) is None
+
+
 def test_runtime_detects_user_named_screens(monkeypatch, tmp_path):
     screens_dir = tmp_path / "screens"
     screens_dir.mkdir()

@@ -4,3 +4,8 @@ PyQt6
 PyYAML
 requests
 pywin32; platform_system == "Windows"
+
+# OCR runtime packages are installed per customer hardware by install_runtime.py:
+# - NVIDIA: paddlepaddle-gpu + paddleocr + paddlex[ocr-core]
+# - AMD/Intel Windows GPU: onnxruntime-directml + rapidocr_onnxruntime
+# - CPU: paddlepaddle + paddleocr + paddlex[ocr-core]
