@@ -98,10 +98,13 @@ def test_write_customer_update_archive_excludes_bootstrap(tmp_path):
     assert all(not name.startswith(f"{build.PACKAGE_NAME}/_bootstrap/") for name in names)
 
 
-def test_write_full_package_archive_excludes_bootstrap(tmp_path):
+def test_write_full_package_archive_includes_bootstrap_and_empty_photo_dir(tmp_path):
     package_root = tmp_path / build.PACKAGE_NAME
     dist_root = tmp_path / "dist"
     (package_root / "apps").mkdir(parents=True)
+    (package_root / "_bootstrap" / "python").mkdir(parents=True)
+    (package_root / "_bootstrap" / "python" / "python.exe").write_bytes(b"python")
+    (package_root / "photo").mkdir(parents=True)
     (package_root / "main.py").write_text("print('ok')\n", encoding="utf-8")
     (package_root / "apps" / "config.json").write_text("{}", encoding="utf-8")
     (package_root / build.INSTALLER_EXE).write_bytes(b"binary")
@@ -117,7 +120,10 @@ def test_write_full_package_archive_excludes_bootstrap(tmp_path):
     assert f"{build.PACKAGE_NAME}/main.py" in names
     assert f"{build.PACKAGE_NAME}/apps/config.json" in names
     assert f"{build.PACKAGE_NAME}/{build.INSTALLER_EXE}" in names
-    assert all(not name.startswith(f"{build.PACKAGE_NAME}/_bootstrap/") for name in names)
+    assert f"{build.PACKAGE_NAME}/_bootstrap/" in names
+    assert f"{build.PACKAGE_NAME}/_bootstrap/python/" in names
+    assert f"{build.PACKAGE_NAME}/_bootstrap/python/python.exe" in names
+    assert f"{build.PACKAGE_NAME}/photo/" in names
     assert all("runtime/install_state.json" not in name for name in names)
 
 

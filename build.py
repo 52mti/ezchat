@@ -145,19 +145,24 @@ def _bundled_dependency_specs(root: Path) -> list[str]:
     return [spec for spec in _requirements_specs(root) if spec not in shared]
 
 
+def _relative_matches_prefix(relative: str, prefix: str) -> bool:
+    normalized = prefix.rstrip("/")
+    return relative == normalized or relative.startswith(normalized + "/")
+
+
 # --------------------------------------------------------------------------- #
 # 压缩档
 # --------------------------------------------------------------------------- #
 
-def _archive_excludes(relative: str, *, exclude_wheelhouse: bool) -> bool:
+def _archive_excludes(relative: str, *, exclude_wheelhouse: bool, exclude_bootstrap: bool) -> bool:
     """判断交付包内的相对路径是否应被压缩档排除。"""
-    if relative.startswith("_bootstrap/"):
+    if exclude_bootstrap and _relative_matches_prefix(relative, "_bootstrap"):
         return True
     if relative == "runtime/install_state.json":
         return True
-    if relative.startswith("runtime/.paddlex/"):
+    if _relative_matches_prefix(relative, "runtime/.paddlex"):
         return True
-    if exclude_wheelhouse and relative.startswith("wheelhouse/"):
+    if exclude_wheelhouse and _relative_matches_prefix(relative, "wheelhouse"):
         return True
     parts = relative.split("/")
     if "__pycache__" in parts:
@@ -167,34 +172,93 @@ def _archive_excludes(relative: str, *, exclude_wheelhouse: bool) -> bool:
     return False
 
 
-def _iter_archive_files(package_root: Path, *, exclude_wheelhouse: bool) -> Iterator[tuple[Path, str]]:
+def _iter_archive_dirs(
+    package_root: Path,
+    *,
+    exclude_wheelhouse: bool,
+    exclude_bootstrap: bool,
+) -> Iterator[str]:
+    for path in sorted(package_root.rglob("*")):
+        if not path.is_dir():
+            continue
+        relative = path.relative_to(package_root).as_posix()
+        if not relative:
+            continue
+        if _archive_excludes(
+            relative,
+            exclude_wheelhouse=exclude_wheelhouse,
+            exclude_bootstrap=exclude_bootstrap,
+        ):
+            continue
+        yield f"{package_root.name}/{relative}/"
+
+
+def _iter_archive_files(
+    package_root: Path,
+    *,
+    exclude_wheelhouse: bool,
+    exclude_bootstrap: bool,
+) -> Iterator[tuple[Path, str]]:
     for path in sorted(package_root.rglob("*")):
         if not path.is_file():
             continue
         relative = path.relative_to(package_root).as_posix()
-        if _archive_excludes(relative, exclude_wheelhouse=exclude_wheelhouse):
+        if _archive_excludes(
+            relative,
+            exclude_wheelhouse=exclude_wheelhouse,
+            exclude_bootstrap=exclude_bootstrap,
+        ):
             continue
         yield path, f"{package_root.name}/{relative}"
 
 
-def _write_archive(package_root: Path, dist_root: Path, suffix: str, *, exclude_wheelhouse: bool) -> Path:
+def _write_archive(
+    package_root: Path,
+    dist_root: Path,
+    suffix: str,
+    *,
+    exclude_wheelhouse: bool,
+    exclude_bootstrap: bool,
+) -> Path:
     dist_root.mkdir(parents=True, exist_ok=True)
     archive_path = dist_root / f"{package_root.name}{suffix}.zip"
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path, arcname in _iter_archive_files(package_root, exclude_wheelhouse=exclude_wheelhouse):
+        for arcname in _iter_archive_dirs(
+            package_root,
+            exclude_wheelhouse=exclude_wheelhouse,
+            exclude_bootstrap=exclude_bootstrap,
+        ):
+            archive.writestr(arcname, "")
+        for path, arcname in _iter_archive_files(
+            package_root,
+            exclude_wheelhouse=exclude_wheelhouse,
+            exclude_bootstrap=exclude_bootstrap,
+        ):
             compress = zipfile.ZIP_STORED if path.suffix.lower() in _STORED_SUFFIXES else zipfile.ZIP_DEFLATED
             archive.write(path, arcname, compress_type=compress)
     return archive_path
 
 
 def _write_full_package_archive(package_root: Path, dist_root: Path) -> Path:
-    """全量交付包：含 wheelhouse 等离线资源，但排除引导 Python、安装状态、模型缓存。"""
-    return _write_archive(package_root, dist_root, "_full", exclude_wheelhouse=False)
+    """全量交付包：含引导 Python、wheelhouse 等离线资源，但排除安装状态、模型缓存。"""
+    return _write_archive(
+        package_root,
+        dist_root,
+        "_full",
+        exclude_wheelhouse=False,
+        exclude_bootstrap=False,
+    )
 
 
 def _write_customer_update_archive(package_root: Path, dist_root: Path) -> Path:
     """增量更新包：仅源码/资源/exe，额外排除 wheelhouse 与引导 Python。"""
-    return _write_archive(package_root, dist_root, "_update", exclude_wheelhouse=True)
+    return _write_archive(
+        package_root,
+        dist_root,
+        "_update",
+        exclude_wheelhouse=True,
+        exclude_bootstrap=True,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -222,8 +286,11 @@ def _copy_item(source: Path, target: Path) -> None:
 
 
 def _handle_remove_readonly(function, path, _excinfo) -> None:
-    os.chmod(path, stat.S_IWRITE)
-    function(path)
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        function(path)
+    except FileNotFoundError:
+        return
 
 
 def _copy_sources(root: Path, package_root: Path) -> None:
