@@ -130,3 +130,57 @@ def test_pip_install_specs_suppresses_script_location_warning(tmp_path: Path, mo
     )
 
     assert "--no-warn-script-location" in captured["command"]
+
+
+def test_main_falls_back_to_cpu_when_gpu_validation_fails(tmp_path: Path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    state_path = runtime_root / "install_state.json"
+    cache_home = tmp_path / "cache"
+    python_exe = tmp_path / ".runtime_env" / "python.exe"
+    writes: list[dict[str, object]] = []
+    attempts: list[str] = []
+
+    def fake_install_backend_runtime(**kwargs):
+        attempts.append(str(kwargs["backend_key"]))
+        if kwargs["backend_key"] == "paddle_cuda":
+            raise RuntimeError("gpu validation failed")
+        return {
+            "backend": "cpu",
+            "model_tier": "lite",
+            "cuda_lane": None,
+            "cache_home": cache_home,
+            "python_executable": python_exe,
+            "runtime_plan": [{"spec": "paddlepaddle==3.2.2", "index_url": "https://cpu.example"}],
+            "hardware": {"gpu_env": {"driver_cuda_version": "12.6"}},
+            "model_spec": {
+                "provider": "paddlex_named_models",
+                "det": "PP-OCRv5_mobile_det",
+                "rec": "PP-OCRv5_mobile_rec",
+                "det_version": "PP-OCRv5_mobile_det",
+                "rec_version": "PP-OCRv5_mobile_rec",
+            },
+            "ocr_device": "cpu",
+            "validation_details": {"smoke_test": {"item_count": 1, "texts": ["123456"]}},
+        }
+
+    monkeypatch.setattr(install_runtime, "_configure_paddlex_cache_home", lambda: cache_home)
+    monkeypatch.setattr(install_runtime, "_runtime_dir", lambda: runtime_root)
+    monkeypatch.setattr(install_runtime, "_runtime_state_path", lambda: state_path)
+    monkeypatch.setattr(install_runtime, "_private_runtime_dir", lambda: tmp_path / ".runtime_env")
+    monkeypatch.setattr(install_runtime, "_private_python", lambda: python_exe)
+    monkeypatch.setattr(
+        install_runtime,
+        "_selected_backend",
+        lambda explicit_backend: ("paddle_cuda", {"gpu_env": {"driver_cuda_version": "12.6", "nvcc_version": "12.6"}}),
+    )
+    monkeypatch.setattr(install_runtime, "_choose_cuda_lane", lambda nvcc, driver: ("cu126", "Using cu126"))
+    monkeypatch.setattr(install_runtime, "_install_backend_runtime", fake_install_backend_runtime)
+    monkeypatch.setattr(install_runtime, "_reset_private_runtime_dir", lambda: None)
+    monkeypatch.setattr(install_runtime, "_write_state", lambda payload: writes.append(dict(payload)))
+    monkeypatch.setattr(install_runtime.sys, "argv", ["install_runtime.py"])
+
+    assert install_runtime.main() == 0
+    assert attempts == ["paddle_cuda", "cpu"]
+    assert writes[-1]["backend"] == "cpu"
+    assert writes[-1]["fallback_from"] == "paddle_cuda"
+    assert "gpu validation failed" in str(writes[-1]["fallback_reason"])

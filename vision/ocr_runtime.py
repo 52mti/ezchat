@@ -543,7 +543,31 @@ def suppress_native_output():
 _ENGINE_INIT_LOCK = threading.RLock()
 _ENGINE_PREDICT_LOCK = threading.RLock()
 _DIRECTML_ENGINE_INIT_LOCK = threading.RLock()
+_RUNTIME_FALLBACK_LOCK = threading.RLock()
 _PADDLE_OCR_BY_CACHE_KEY: dict[tuple[str, str, str, str], Any] = {}
+
+
+def _persist_runtime_fallback(backend: str, model_tier: str, fallback_from: str, reason: Exception) -> None:
+    path = _runtime_state_path()
+    payload: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            payload.update(loaded)
+    payload["schema_version"] = max(int(payload.get("schema_version", 0) or 0), 4)
+    payload["status"] = "installed"
+    payload["validation"] = "ok"
+    payload["validation_error"] = ""
+    payload["backend"] = backend
+    payload["model_tier"] = model_tier
+    payload["ocr_device"] = "cpu" if backend == "cpu" else payload.get("ocr_device", "")
+    payload["fallback_from"] = fallback_from
+    payload["fallback_reason"] = str(reason)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 class PaddleOcrRuntimeEngine:
@@ -694,6 +718,47 @@ class OnnxDirectMLOcrRuntimeEngine:
         return _normalize_rapidocr_results(result)
 
 
+class ResilientRuntimeEngine:
+    def __init__(
+        self,
+        primary_engine: Any,
+        *,
+        primary_backend: str,
+        model_tier: str,
+        fallback_factory: Any | None = None,
+    ) -> None:
+        self._primary_engine = primary_engine
+        self._fallback_engine: Any | None = None
+        self._fallback_factory = fallback_factory
+        self._primary_backend = primary_backend
+        self._model_tier = model_tier
+
+    def _activate_fallback(self, exc: Exception) -> Any:
+        if self._fallback_factory is None:
+            raise exc
+        with _RUNTIME_FALLBACK_LOCK:
+            if self._fallback_engine is not None:
+                return self._fallback_engine
+            self._fallback_engine = self._fallback_factory()
+            _persist_runtime_fallback("cpu", self._model_tier, self._primary_backend, exc)
+            return self._fallback_engine
+
+    def preload(self) -> str:
+        try:
+            return str(self._primary_engine.preload() or "")
+        except Exception as exc:
+            fallback = self._activate_fallback(exc)
+            return str(fallback.preload() or "")
+
+    def predict(self, image_array: np.ndarray, **kwargs: Any) -> list[dict[str, Any]]:
+        engine = self._fallback_engine or self._primary_engine
+        try:
+            return engine.predict(image_array, **kwargs)
+        except Exception as exc:
+            fallback = self._activate_fallback(exc)
+            return fallback.predict(image_array, **kwargs)
+
+
 def _effective_backend_config(config: dict[str, Any]) -> tuple[str, str]:
     preferred = config.get("backend", config.get("ocr_backend", "auto"))
     installed_state = load_installed_runtime_state()
@@ -709,14 +774,34 @@ def _effective_backend_config(config: dict[str, Any]) -> tuple[str, str]:
     return backend, model_tier
 
 
-def create_ocr_runtime_engine(config: dict[str, Any]) -> Any:
-    manifest = load_runtime_manifest()
-    backend, model_tier = _effective_backend_config(config)
+def _create_engine_for_backend(
+    backend: str,
+    model_tier: str,
+    manifest: RuntimeManifest,
+    config: dict[str, Any],
+) -> Any:
     if backend == "onnx_directml":
         return OnnxDirectMLOcrRuntimeEngine(model_tier=model_tier, manifest=manifest, config=config)
     if backend in {"paddle_cuda", "cpu"}:
         return PaddleOcrRuntimeEngine(backend=backend, model_tier=model_tier, manifest=manifest, config=config)
     raise RuntimeError(f"Unsupported OCR backend: {backend}")
+
+
+def create_ocr_runtime_engine(config: dict[str, Any]) -> Any:
+    manifest = load_runtime_manifest()
+    backend, model_tier = _effective_backend_config(config)
+    engine = _create_engine_for_backend(backend, model_tier, manifest, config)
+    if backend == "paddle_cuda":
+        fallback_config = dict(config)
+        fallback_config["backend"] = "cpu"
+        fallback_config["ocr_backend"] = "cpu"
+        return ResilientRuntimeEngine(
+            engine,
+            primary_backend=backend,
+            model_tier=model_tier,
+            fallback_factory=lambda: _create_engine_for_backend("cpu", model_tier, manifest, fallback_config),
+        )
+    return engine
 
 
 @lru_cache(maxsize=8)

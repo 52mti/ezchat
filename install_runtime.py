@@ -799,7 +799,8 @@ def _validation_script(package_root: Path, cache_home: Path, backend_key: str, m
         f"os.environ['PADDLE_PDX_CACHE_HOME'] = {str(cache_home)!r}\n"
         f"os.environ['PADDLEX_HOME'] = {str(cache_home)!r}\n"
         f"sys.path.insert(0, {str(package_root)!r})\n"
-        "from pathlib import Path\n"
+        "from PIL import Image, ImageDraw, ImageFont\n"
+        "from vision.ocr import ocr\n"
         "from vision.ocr_runtime import create_ocr_runtime_engine, load_runtime_manifest, resolve_model_spec\n"
         f"manifest = load_runtime_manifest({str(package_root)!r})\n"
         f"backend = {backend_key!r}\n"
@@ -807,8 +808,18 @@ def _validation_script(package_root: Path, cache_home: Path, backend_key: str, m
         "model_spec = resolve_model_spec(manifest, backend, model_tier)\n"
         "engine = create_ocr_runtime_engine({'backend': backend, 'model_tier': model_tier})\n"
         "device = str(engine.preload() or '')\n"
+        "base = Image.new('RGB', (120, 40), 'white')\n"
+        "draw = ImageDraw.Draw(base)\n"
+        "draw.text((8, 10), '123456', fill='black', font=ImageFont.load_default())\n"
+        "sample = base.resize((480, 160), Image.Resampling.NEAREST)\n"
+        "items = ocr(sample, {'engine': engine, 'use_angle_cls': False, 'rotate_to_portrait': False})\n"
+        "texts = [str(item.get('text', '') or '').strip() for item in items if str(item.get('text', '') or '').strip()]\n"
+        "smoke_test = {'item_count': len(items), 'texts': texts[:8]}\n"
+        "if not texts:\n"
+        "    raise RuntimeError('OCR smoke test returned no text')\n"
         "payload = {\n"
         "  'ocr_device': device,\n"
+        "  'smoke_test': smoke_test,\n"
         "  'models': {\n"
         "    'provider': model_spec.provider,\n"
         "    'det': model_spec.det_model_name,\n"
@@ -860,6 +871,129 @@ def _write_state(payload: dict[str, Any]) -> None:
     state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _reset_private_runtime_dir() -> None:
+    runtime_dir = _private_runtime_dir()
+    if runtime_dir.exists():
+        shutil.rmtree(runtime_dir, ignore_errors=True)
+
+
+def _state_payload(
+    *,
+    backend_key: str,
+    model_tier: str,
+    cuda_lane: str | None,
+    cache_home: Path,
+    python_executable: Path,
+    manifest: dict[str, Any],
+    runtime_plan: list[dict[str, str]],
+    hardware: dict[str, Any],
+    model_spec: dict[str, str],
+    status: str,
+    validation: str,
+    validation_error: str,
+    ocr_device: str,
+    validation_details: dict[str, Any] | None = None,
+    fallback_from: str = "",
+    fallback_reason: str = "",
+) -> dict[str, Any]:
+    payload = {
+        "schema_version": 4,
+        "backend": backend_key,
+        "model_tier": model_tier,
+        "cuda_lane": cuda_lane,
+        "cache_home": str(cache_home),
+        "status": status,
+        "python_executable": str(python_executable),
+        "runtime_path": str(_private_runtime_dir()),
+        "common_packages": _common_dependency_specs(manifest),
+        "packages": runtime_plan,
+        "message": _manifest_backend_description(manifest, backend_key),
+        "validation": validation,
+        "validation_error": validation_error,
+        "ocr_device": ocr_device,
+        "hardware": hardware,
+        "models": {
+            "provider": model_spec.get("provider", ""),
+            "det": model_spec.get("det", ""),
+            "rec": model_spec.get("rec", ""),
+            "det_version": model_spec.get("det_version", ""),
+            "rec_version": model_spec.get("rec_version", ""),
+        },
+    }
+    if validation_details:
+        payload["validation_details"] = validation_details
+    if fallback_from:
+        payload["fallback_from"] = fallback_from
+    if fallback_reason:
+        payload["fallback_reason"] = fallback_reason
+    return payload
+
+
+def _install_backend_runtime(
+    *,
+    manifest: dict[str, Any],
+    backend_key: str,
+    model_tier: str,
+    cuda_lane: str | None,
+    cache_home: Path,
+    hardware: dict[str, Any],
+    dry_run: bool,
+) -> dict[str, Any]:
+    runtime_plan = _manifest_backend_package_plan(manifest, backend_key, cuda_lane=cuda_lane)
+    model_spec = _manifest_model_spec(manifest, backend_key, model_tier)
+    python_executable = _private_python()
+
+    python_executable = _create_runtime_venv(dry_run=dry_run)
+    _ensure_pip_tooling(python_exe=python_executable, dry_run=dry_run)
+    _install_common_dependencies(python_exe=python_executable, manifest=manifest, dry_run=dry_run)
+    _install_shared_runtime_dependencies(python_exe=python_executable, manifest=manifest, dry_run=dry_run)
+    _install_package_specs(python_exe=python_executable, package_specs=runtime_plan, dry_run=dry_run)
+
+    ocr_device = ""
+    validation_payload: dict[str, Any] = {}
+    if not dry_run:
+        if backend_key in {"paddle_cuda", "cpu"}:
+            _reset_incomplete_paddlex_models(
+                [
+                    model_spec.get("det", ""),
+                    model_spec.get("rec", ""),
+                ]
+            )
+        validation_payload = _validate_runtime(
+            python_exe=python_executable,
+            cache_home=cache_home,
+            backend_key=backend_key,
+            model_tier=model_tier,
+            dry_run=False,
+        )
+        ocr_device = str(validation_payload.get("ocr_device", "") or "")
+        if backend_key in {"paddle_cuda", "cpu"}:
+            required_model_names = [model_spec.get("det", ""), model_spec.get("rec", "")]
+            missing_models = [
+                model_name
+                for model_name in required_model_names
+                if model_name and not _model_dir_is_complete(_official_models_root() / model_name)
+            ]
+            if missing_models:
+                raise RuntimeError("OCR model download did not complete: " + ", ".join(sorted(set(missing_models))))
+        _prune_installed_docs(_private_site_packages())
+    else:
+        ocr_device = {"paddle_cuda": "gpu:0", "onnx_directml": "dml:0", "cpu": "cpu"}[backend_key]
+
+    return {
+        "backend": backend_key,
+        "model_tier": model_tier,
+        "cuda_lane": cuda_lane,
+        "cache_home": cache_home,
+        "python_executable": python_executable,
+        "runtime_plan": runtime_plan,
+        "hardware": hardware,
+        "model_spec": model_spec,
+        "ocr_device": ocr_device,
+        "validation_details": validation_payload,
+    }
+
+
 _configure_paddlex_cache_home()
 
 
@@ -897,110 +1031,114 @@ def main() -> int:
                     f"nvcc={gpu_env.get('nvcc_version') or 'unknown'}; reason={cuda_lane_reason}"
                 )
 
-    runtime_plan = _manifest_backend_package_plan(manifest, backend_key, cuda_lane=cuda_lane)
     cache_home = _configure_paddlex_cache_home()
     runtime_dir = _runtime_dir()
     runtime_dir.mkdir(parents=True, exist_ok=True)
     python_executable = _private_python()
 
-    status = "dry_run" if args.dry_run else "installed"
-    validation = "skipped"
-    validation_error = ""
-    ocr_device = ""
-
     try:
         if cuda_lane_reason:
             print(cuda_lane_reason)
-        python_executable = _create_runtime_venv(dry_run=args.dry_run)
-        _ensure_pip_tooling(python_exe=python_executable, dry_run=args.dry_run)
-        _install_common_dependencies(python_exe=python_executable, manifest=manifest, dry_run=args.dry_run)
-        _install_shared_runtime_dependencies(python_exe=python_executable, manifest=manifest, dry_run=args.dry_run)
-        _install_package_specs(python_exe=python_executable, package_specs=runtime_plan, dry_run=args.dry_run)
-
-        if not args.dry_run:
-            if backend_key in {"paddle_cuda", "cpu"}:
-                _reset_incomplete_paddlex_models(
-                    [
-                        model_spec.get("det", ""),
-                        model_spec.get("rec", ""),
-                    ]
-                )
-            validation_payload = _validate_runtime(
-                python_exe=python_executable,
-                cache_home=cache_home,
-                backend_key=backend_key,
-                model_tier=model_tier,
-                dry_run=False,
-            )
-            ocr_device = str(validation_payload.get("ocr_device", "") or "")
-            if backend_key in {"paddle_cuda", "cpu"}:
-                required_model_names = [model_spec.get("det", ""), model_spec.get("rec", "")]
-                missing_models = [
-                    model_name
-                    for model_name in required_model_names
-                    if model_name and not _model_dir_is_complete(_official_models_root() / model_name)
-                ]
-                if missing_models:
-                    raise RuntimeError("OCR model download did not complete: " + ", ".join(sorted(set(missing_models))))
-            _prune_installed_docs(_private_site_packages())
-            validation = "ok"
-        else:
-            ocr_device = {"paddle_cuda": "gpu:0", "onnx_directml": "dml:0", "cpu": "cpu"}[backend_key]
+        result = _install_backend_runtime(
+            manifest=manifest,
+            backend_key=backend_key,
+            model_tier=model_tier,
+            cuda_lane=cuda_lane,
+            cache_home=cache_home,
+            hardware=hardware,
+            dry_run=args.dry_run,
+        )
     except Exception as exc:  # pragma: no cover - surfaced to user via CLI
-        status = "invalid"
-        validation = "failed"
-        validation_error = str(exc)
-        payload = {
-            "schema_version": 3,
-            "backend": backend_key,
-            "model_tier": model_tier,
-            "cuda_lane": cuda_lane,
-            "cache_home": str(cache_home),
-            "status": status,
-            "python_executable": str(python_executable),
-            "runtime_path": str(_private_runtime_dir()),
-            "common_packages": _common_dependency_specs(manifest),
-            "packages": runtime_plan,
-            "message": _manifest_backend_description(manifest, backend_key),
-            "validation": validation,
-            "validation_error": validation_error,
-            "ocr_device": ocr_device,
-            "hardware": hardware,
-            "models": {
-                "provider": model_spec.get("provider", ""),
-                "det": model_spec.get("det", ""),
-                "rec": model_spec.get("rec", ""),
-                "det_version": model_spec.get("det_version", ""),
-                "rec_version": model_spec.get("rec_version", ""),
-            },
-        }
+        if not args.dry_run and backend_key == "paddle_cuda":
+            print(f"[warn] GPU OCR validation failed, falling back to CPU: {exc}")
+            fallback_reason = str(exc)
+            _reset_private_runtime_dir()
+            try:
+                result = _install_backend_runtime(
+                    manifest=manifest,
+                    backend_key="cpu",
+                    model_tier=model_tier,
+                    cuda_lane=None,
+                    cache_home=cache_home,
+                    hardware=hardware,
+                    dry_run=False,
+                )
+            except Exception as fallback_exc:
+                payload = _state_payload(
+                    backend_key=backend_key,
+                    model_tier=model_tier,
+                    cuda_lane=cuda_lane,
+                    cache_home=cache_home,
+                    python_executable=python_executable,
+                    manifest=manifest,
+                    runtime_plan=_manifest_backend_package_plan(manifest, backend_key, cuda_lane=cuda_lane),
+                    hardware=hardware,
+                    model_spec=model_spec,
+                    status="invalid",
+                    validation="failed",
+                    validation_error=f"gpu_error={exc}; cpu_fallback_error={fallback_exc}",
+                    ocr_device="",
+                    fallback_from="paddle_cuda",
+                    fallback_reason=fallback_reason,
+                )
+                _write_state(payload)
+                raise
+            payload = _state_payload(
+                backend_key="cpu",
+                model_tier=str(result["model_tier"]),
+                cuda_lane=None,
+                cache_home=cache_home,
+                python_executable=Path(result["python_executable"]),
+                manifest=manifest,
+                runtime_plan=list(result["runtime_plan"]),
+                hardware=hardware,
+                model_spec=dict(result["model_spec"]),
+                status="installed",
+                validation="ok",
+                validation_error="",
+                ocr_device=str(result["ocr_device"]),
+                validation_details=dict(result["validation_details"]),
+                fallback_from="paddle_cuda",
+                fallback_reason=fallback_reason,
+            )
+            _write_state(payload)
+            print("[info] GPU OCR runtime fallback applied: using CPU backend.")
+            print(f"OCR runtime state wrote {_runtime_state_path()}")
+            return 0
+        payload = _state_payload(
+            backend_key=backend_key,
+            model_tier=model_tier,
+            cuda_lane=cuda_lane,
+            cache_home=cache_home,
+            python_executable=python_executable,
+            manifest=manifest,
+            runtime_plan=_manifest_backend_package_plan(manifest, backend_key, cuda_lane=cuda_lane),
+            hardware=hardware,
+            model_spec=model_spec,
+            status="invalid",
+            validation="failed",
+            validation_error=str(exc),
+            ocr_device="",
+        )
         _write_state(payload)
         raise
 
-    payload = {
-        "schema_version": 3,
-        "backend": backend_key,
-        "model_tier": model_tier,
-        "cuda_lane": cuda_lane,
-        "cache_home": str(cache_home),
-        "status": status,
-        "python_executable": str(python_executable),
-        "runtime_path": str(_private_runtime_dir()),
-        "common_packages": _common_dependency_specs(manifest),
-        "packages": runtime_plan,
-        "message": _manifest_backend_description(manifest, backend_key),
-        "validation": validation,
-        "validation_error": validation_error,
-        "ocr_device": ocr_device,
-        "hardware": hardware,
-        "models": {
-            "provider": model_spec.get("provider", ""),
-            "det": model_spec.get("det", ""),
-            "rec": model_spec.get("rec", ""),
-            "det_version": model_spec.get("det_version", ""),
-            "rec_version": model_spec.get("rec_version", ""),
-        },
-    }
+    payload = _state_payload(
+        backend_key=str(result["backend"]),
+        model_tier=str(result["model_tier"]),
+        cuda_lane=result["cuda_lane"] if result["backend"] == "paddle_cuda" else None,
+        cache_home=cache_home,
+        python_executable=Path(result["python_executable"]),
+        manifest=manifest,
+        runtime_plan=list(result["runtime_plan"]),
+        hardware=hardware,
+        model_spec=dict(result["model_spec"]),
+        status="dry_run" if args.dry_run else "installed",
+        validation="skipped" if args.dry_run else "ok",
+        validation_error="",
+        ocr_device=str(result["ocr_device"]),
+        validation_details=dict(result["validation_details"]),
+    )
     _write_state(payload)
     print(f"OCR runtime state wrote {_runtime_state_path()}")
     return 0
