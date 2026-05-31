@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 import importlib
 
 import numpy as np
@@ -183,3 +186,73 @@ def test_ocr_runtime_prefers_auto_backend_entry(monkeypatch):
 
     assert captured["config"]["backend"] == "auto"
     assert result[0]["text"] == "runtime"
+
+
+def test_ocr_predict_calls_are_serialized_across_threads():
+    image = Image.new("RGB", (100, 50), "white")
+
+    class SlowPredictEngine:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def predict(self, image, **kwargs):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.03)
+                return [
+                    {
+                        "dt_polys": [
+                            np.array([[10, 20], [30, 20], [30, 40], [10, 40]], dtype=np.float32),
+                        ],
+                        "rec_texts": ["threadsafe"],
+                        "rec_scores": [0.99],
+                    }
+                ]
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    engine = SlowPredictEngine()
+
+    def run_once():
+        return ocr(image, {"engine": engine})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: run_once(), range(2)))
+
+    assert engine.max_active == 1
+    assert [result[0]["text"] for result in results] == ["threadsafe", "threadsafe"]
+
+
+def test_ocr_engine_initialization_is_serialized_across_threads(monkeypatch):
+    image = Image.new("RGB", (100, 50), "white")
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def fake_cached_engine(cache_key: str):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.03)
+            return FakePredictEngine()
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(ocr_module, "_cached_paddle_engine", fake_cached_engine)
+
+    def run_once():
+        return ocr(image, {"runtime_enabled": True})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: run_once(), range(2)))
+
+    assert max_active == 1
+    assert [result[0]["text"] for result in results] == ["runtime", "runtime"]

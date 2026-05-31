@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import time
 from pathlib import Path
@@ -7,6 +7,7 @@ from typing import Any
 from apps.coordinates import click_image_point
 from apps.photo_capture import capture_transform_image
 from apps.reporting import Reporter, format_point as _format_point, report_step
+from apps.step_timing import exclude_ocr_wait_from_step_timeout, step_deadline
 from apps.utils import tts_input
 from apps.visual_assets import (
     BACK_BUTTON,
@@ -81,6 +82,11 @@ def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> di
 
 def _step_timeout(config: dict[str, Any]) -> float:
     return float(config.get("step_timeout", 10))
+
+
+def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = None) -> dict[str, Any]:
+    with exclude_ocr_wait_from_step_timeout(config):
+        return run_ocr_mode(image, config, mode, region=region)
 
 
 def _region(config: dict[str, Any], key: str) -> Any:
@@ -281,7 +287,7 @@ def find_unread_target(
         return None
 
     _report(reporter, "list_ocr_scan", "列表OCR扫描")
-    ocr_result = run_ocr_mode(image, cfg, "list", region=None)
+    ocr_result = _run_ocr_mode(image, cfg, "list", region=None)
     primary_candidates: list[dict[str, Any]] = []
     fallback_candidates: list[dict[str, Any]] = []
     for row in ocr_result["result"].get("message_list", []):
@@ -318,7 +324,7 @@ def keep_screen_awake(
         raise StepUnavailable("unable to return to chat list for keep-awake flow")
 
     _report(reporter, "keep_awake_scan", "防熄屏扫描底部导航")
-    ocr_result = run_ocr_mode(image, cfg, "list", region=None)
+    ocr_result = _run_ocr_mode(image, cfg, "list", region=None)
     bottom_nav = ocr_result["result"].get("bottom_nav", [])
     home = _bottom_nav_center(bottom_nav, ("微信", "寰俊", "消息", "娑堟伅"))
     if home is None:
@@ -360,7 +366,7 @@ def read_message(
         raise StepUnavailable("chat window screen template did not match")
 
     _report(reporter, "dialogue_ocr_read", "对话OCR读取")
-    ocr_result = run_ocr_mode(image, cfg, "dialogue", region=_region(cfg, CHAT_AREA_REGION))
+    ocr_result = _run_ocr_mode(image, cfg, "dialogue", region=_region(cfg, CHAT_AREA_REGION))
     items = ocr_result["ocr_items"]
     if not items:
         raise StepUnavailable("OCR did not return chat text")
@@ -412,7 +418,7 @@ def play_voice_reply(
     reporter: Reporter | None = None,
 ) -> None:
     cfg = _config(config)
-    deadline = time.monotonic() + _step_timeout(cfg)
+    deadline = step_deadline(cfg, _step_timeout(cfg))
     while True:
         _report(reporter, "microphone_locate", "定位麦克风按钮")
         image = capture_after_popups(robot, cfg, label="microphone", reporter=reporter)
@@ -421,7 +427,7 @@ def play_voice_reply(
             _report(reporter, "microphone_click", "点击麦克风按钮", log_label=f"点击麦克风按钮：{_format_point(*microphone)}")
             click_image_point(robot, *microphone)
             break
-        if time.monotonic() >= deadline:
+        if deadline.expired():
             raise StepUnavailable("microphone button was not found")
         time.sleep(0.4)
 
@@ -447,7 +453,7 @@ def send_reply(
     reporter: Reporter | None = None,
 ) -> None:
     cfg = _config(config)
-    deadline = time.monotonic() + _step_timeout(cfg)
+    deadline = step_deadline(cfg, _step_timeout(cfg))
     clicked = False
     while True:
         _report(reporter, "send_button_check", "检测发送按钮")
@@ -456,7 +462,7 @@ def send_reply(
         if pos is None:
             if clicked:
                 return
-            if time.monotonic() >= deadline:
+            if deadline.expired():
                 raise StepUnavailable("send button was not found")
             time.sleep(0.4)
             continue
@@ -464,7 +470,7 @@ def send_reply(
             _report(reporter, "send_button_click", "点击发送按钮", log_label=f"点击发送按钮：{_format_point(*pos)}")
             click_image_point(robot, *pos)
             clicked = True
-        if time.monotonic() >= deadline:
+        if deadline.expired():
             raise StepUnavailable("send button did not disappear after click")
         time.sleep(0.4)
 
@@ -489,3 +495,4 @@ def go_back(
     _report(reporter, "back_double_click", "连续点击返回两次", log_label=f"连续点击返回两次：{_format_point(0.08, 0.06)}")
     click_image_point(robot, 0.08, 0.06)
     click_image_point(robot, 0.08, 0.06)
+

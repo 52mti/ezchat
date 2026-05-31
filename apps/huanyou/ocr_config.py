@@ -15,6 +15,25 @@ from __future__ import annotations
 # - `content_excluded_keywords`：列表页内容摘要命中时，整行丢掉。
 # 修改这里以后，当前 App 的 OCR 后处理规则会随之改变，不会影响其他 App。
 DIALOGUE_OCR_RESULT_EXCLUDED_KEYWORDS = [
+    "收到搭讪礼物",
+    "收到搭汕礼物",
+    "收到搭训礼物",
+    "汉堡包",
+    "回赠礼物",
+    "+0.19金币",
+    "丘比特发现",
+    "缘分哦",
+    "神秘礼",
+    "小技巧",
+    "您没有及时回复",
+    "被退回",
+    "主动给对方",
+    "金币",
+    "多回复几句",
+    "回复率更高",
+    "爱的",
+    "电话粥",
+    "红包",
     "记录点滴",
     "折扣商店",
     "活动倒计时",
@@ -32,6 +51,7 @@ DIALOGUE_OCR_RESULT_EXCLUDED_KEYWORDS = [
     "点击领取",
     "前往",
     "赠礼物",
+    "礼物",
 ]
 
 DIALOGUE_LINE_EXCLUDED_KEYWORDS = [
@@ -47,6 +67,13 @@ DIALOGUE_LINE_EXCLUDED_KEYWORDS = [
     "开始游戏",
     "你们的共同点",
     "常用语",
+    "收到搭讪礼物",
+    "收到搭汕礼物",
+    "收到搭训礼物",
+    "丘比特发现",
+    "回消息还可收到",
+    "金币礼物",
+    "回复率更高",
 ]
 
 DIALOGUE_LINE_AND_BELOW_KEYWORDS = [
@@ -57,8 +84,16 @@ DIALOGUE_LINE_AND_BELOW_KEYWORDS = [
 
 # 列表页规则会在 run_ocr_mode(..., "list") 之后进入 build_list_result()。
 LIST_SYSTEM_KEYWORDS = [
+    "消息",
+    "关系",
+    "优质用户",
+    "回归奖励",
+    "登录就送现金",
+    "谁偷偷看过你",
+    "快去看看",
     "聊天",
     "群聊",
+    "群聊派对",
     "心动",
     "开启",
     "记录点滴",
@@ -77,6 +112,9 @@ LIST_SYSTEM_KEYWORDS = [
     "服务号合集",
     "聊天广场",
     "家族群聊",
+    "家族狂欢",
+    "人在玩",
+    "人在这里嗨",
     "加入家族",
     "去聊天",
     "免费匹配机会",
@@ -84,6 +122,15 @@ LIST_SYSTEM_KEYWORDS = [
 ]
 
 LIST_EXCLUDED_KEYWORDS = [
+    "Ta",
+    "在线匹配",
+    "在线配对",
+    "优质用户",
+    "回归奖励",
+    "登录就送现金",
+    "谁偷偷看过你",
+    "群聊派对",
+    "家族狂欢",
     "家族群聊",
     "聊天广场",
     "服务号合集",
@@ -93,9 +140,30 @@ LIST_EXCLUDED_KEYWORDS = [
     "免费匹配机会",
     "加入家族",
     "去聊天",
+    "小助手",
+    "温馨提示",
 ]
 
-LIST_CONTENT_EXCLUDED_KEYWORDS = ["推荐灵感"]
+LIST_CONTENT_EXCLUDED_KEYWORDS = [
+    "推荐灵感",
+    "快去看看",
+    "人在这里嗨",
+    "人在玩",
+    "登录就送现金",
+]
+
+LIST_UNREAD_COUNT_EXCLUDED_KEYWORDS = [
+    "温馨提示",
+    "聊天卡",
+]
+
+LIST_BOTTOM_NAV_KEYWORDS = ["交友", "广场", "娱乐", "消息", "我的"]
+
+LIST_TOP_NAV_KEYWORDS = ["消息", "关系"]
+
+LIST_NAME_SUFFIX_KEYWORDS = ["附近"]
+
+POINTS_KEYWORDS = ["我的收益", "收益", "金币"]
 
 
 DIALOGUE_OCR_MODE = {
@@ -110,11 +178,12 @@ DIALOGUE_OCR_MODE = {
         "line_gap": 24,
         "name_gap": 70,
         "sender_detection": {
-            "method": "position",
+            "method": "center_position",
             "sender2_min_x_ratio": 0.52,
             "enable_color_fallback": False,
-            "color_saturation_threshold": 0.65,
+            "color_saturation_threshold": 0.30,
         },
+        "target_sender": "sender1",
         "ocr_result_excluded_keywords": DIALOGUE_OCR_RESULT_EXCLUDED_KEYWORDS,
         "line_excluded_keywords": DIALOGUE_LINE_EXCLUDED_KEYWORDS,
         "line_and_below_keywords": DIALOGUE_LINE_AND_BELOW_KEYWORDS,
@@ -150,9 +219,12 @@ LIST_OCR_MODE = {
         "min_confidence": 0.30,
         "min_box_height_ratio": 0.02,
         "line_gap": 24,
-        "main_top_ratio": 0.12,
-        "main_bottom_ratio": 0.92,
+        "main_top_ratio": 0.10,
+        "main_bottom_ratio": 0.88,
         "max_unread_count": 99,
+        "badge_position": "left",
+        "badge_default_unread_count": 0,
+        "enable_red_badge_detection": False,
         "text_left_min_ratio": 0.16,
         "text_right_max_ratio": 0.78,
         "right_meta_min_ratio": 0.78,
@@ -161,8 +233,26 @@ LIST_OCR_MODE = {
         "content_gap_min": 38,
         "content_gap_max": 62,
         "bottom_nav_top_ratio": 0.88,
+        "bottom_nav_accept_any_text": False,
+        "bottom_nav_keywords": LIST_BOTTOM_NAV_KEYWORDS,
+        "top_nav_keywords": [],
+        "top_nav_top_ratio": 0.0,
+        "top_nav_bottom_ratio": 0.0,
+        "left_badge_min_ratio": 0.02,
+        "left_badge_max_ratio": 0.24,
+        "left_badge_extra_top_ratio": 0.03,
+        "red_badge_saturation_min": 60,
+        "red_badge_value_min": 60,
+        "content_like_name_min_length": 10,
+        "content_like_name_min_width_ratio": 0.24,
         "badge_crop_padding": 6,
         "badge_ocr_scale": 6,
+        "left_badge_ocr_scale": 8,
+        "left_badge_ocr_min_confidence": 0.50,
+        "left_badge_ocr_left_ratio": 0.14,
+        "left_badge_ocr_width_ratio": 0.08,
+        "left_badge_ocr_top_offset_ratio": 0.012,
+        "left_badge_ocr_height_ratio": 0.045,
         "row_badge_ocr_scale": 4,
         "row_badge_min_confidence": 0.80,
         "row_strip_left_min_ratio": 0.84,
@@ -172,14 +262,34 @@ LIST_OCR_MODE = {
         "row_strip_max_height_ratio": 0.12,
         "row_strip_min_height_px": 24,
         "row_strip_bottom_nav_margin": 4,
+        "name_suffix_keywords": LIST_NAME_SUFFIX_KEYWORDS,
         "system_keywords": LIST_SYSTEM_KEYWORDS,
         "excluded_keywords": LIST_EXCLUDED_KEYWORDS,
         "content_excluded_keywords": LIST_CONTENT_EXCLUDED_KEYWORDS,
+        "unread_count_excluded_keywords": LIST_UNREAD_COUNT_EXCLUDED_KEYWORDS,
     },
 }
 
 
-DEFAULT_OCR_MODES = {
+POINTS_OCR_MODE = {
+    "preprocess": {
+        "mode": "original",
+        "scale": 2,
+        "rotate_to_portrait": True,
+    },
+    "rules": {
+        "min_confidence": 0.30,
+        "min_box_height_ratio": 0.01,
+        "line_gap": 24,
+        "keywords": POINTS_KEYWORDS,
+        "neighbor_y_ratio": 0.08,
+        "neighbor_x_ratio": 0.65,
+    },
+}
+
+
+OCR_MODES = {
     "dialogue": DIALOGUE_OCR_MODE,
     "list": LIST_OCR_MODE,
+    "points": POINTS_OCR_MODE,
 }

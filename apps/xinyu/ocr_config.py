@@ -67,6 +67,8 @@ LIST_EXCLUDED_KEYWORDS = []
 
 LIST_CONTENT_EXCLUDED_KEYWORDS = []
 
+LIST_NAME_SUFFIX_KEYWORDS = ["附近"]
+
 
 DIALOGUE_OCR_MODE = {
     "preprocess": {
@@ -138,6 +140,11 @@ LIST_OCR_MODE = {
         "badge_crop_padding": 6,
         "left_badge_min_ratio": 0.02,
         "left_badge_max_ratio": 0.24,
+        "left_badge_extra_top_ratio": 0.03,
+        "red_badge_saturation_min": 60,
+        "red_badge_value_min": 60,
+        "content_like_name_min_length": 10,
+        "content_like_name_min_width_ratio": 0.24,
         "badge_ocr_scale": 6,
         "row_badge_ocr_scale": 4,
         "row_badge_min_confidence": 0.80,
@@ -148,6 +155,7 @@ LIST_OCR_MODE = {
         "row_strip_max_height_ratio": 0.12,
         "row_strip_min_height_px": 24,
         "row_strip_bottom_nav_margin": 4,
+        "name_suffix_keywords": LIST_NAME_SUFFIX_KEYWORDS,
         # 列表页底部导航和顶部“全部消息 / 全部信息”等入口。
         "bottom_nav_keywords": [
             "喜欢",
@@ -171,7 +179,25 @@ LIST_OCR_MODE = {
 }
 
 
-DEFAULT_OCR_MODES = {
+POINTS_OCR_MODE = {
+    "preprocess": {
+        "mode": "original",
+        "scale": 2,
+        "rotate_to_portrait": True,
+    },
+    "rules": {
+        "min_confidence": 0.30,
+        "min_box_height_ratio": 0.01,
+        "line_gap": 24,
+        "keywords": ["我的积分", "积分"],
+        "neighbor_y_ratio": 0.06,
+        "neighbor_x_ratio": 0.45,
+    },
+}
+
+
+OCR_MODES = {
     "dialogue": DIALOGUE_OCR_MODE,
     "list": LIST_OCR_MODE,
+    "points": POINTS_OCR_MODE,
 }

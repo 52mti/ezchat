@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import threading
 from functools import lru_cache
 from typing import Any, Iterable, TypedDict
 
 import numpy as np
 
 from .screen import ImageInput, crop_region, load_image, normalize_box
+
+_OCR_NATIVE_CALL_LOCK = threading.RLock()
+_OCR_ENGINE_INIT_LOCK = threading.RLock()
 
 
 class OcrItem(TypedDict):
@@ -201,12 +205,23 @@ def _cached_paddle_engine(cache_key: str) -> Any:
 
 
 def _get_paddle_engine(config: dict[str, Any]) -> Any:
-    if config.get("backend") or config.get("ocr_backend") or config.get("model_tier") or config.get("modelTier"):
-        from .ocr_runtime import get_ocr_runtime_engine
+    with _OCR_ENGINE_INIT_LOCK:
+        if config.get("backend") or config.get("ocr_backend") or config.get("model_tier") or config.get("modelTier"):
+            from .ocr_runtime import get_ocr_runtime_engine
 
-        return get_ocr_runtime_engine(config)
-    cache_key = json.dumps(_runtime_init_kwargs(config), sort_keys=True)
-    return _cached_paddle_engine(cache_key)
+            return get_ocr_runtime_engine(config)
+        cache_key = json.dumps(_runtime_init_kwargs(config), sort_keys=True)
+        return _cached_paddle_engine(cache_key)
+
+
+def _predict_with_lock(engine: Any, image: np.ndarray, config: dict[str, Any]) -> Any:
+    with _OCR_NATIVE_CALL_LOCK:
+        return engine.predict(image, **_runtime_predict_kwargs(config))
+
+
+def _legacy_ocr_with_lock(engine: Any, image: Any, config: dict[str, Any]) -> Any:
+    with _OCR_NATIVE_CALL_LOCK:
+        return engine.ocr(image, cls=config.get("cls", True))
 
 
 def ocr(image: ImageInput, config: dict[str, Any] | None = None) -> list[OcrItem]:
@@ -218,10 +233,10 @@ def ocr(image: ImageInput, config: dict[str, Any] | None = None) -> list[OcrItem
     if engine is not None:
         if hasattr(engine, "predict"):
             predict_image, transform = _prepare_predict_image(target, config)
-            raw = engine.predict(predict_image, **_runtime_predict_kwargs(config))
+            raw = _predict_with_lock(engine, predict_image, config)
             return _normalize_engine_result(raw, target.size, transform=transform)
         else:
-            raw = engine.ocr(target, cls=config.get("cls", True))
+            raw = _legacy_ocr_with_lock(engine, target, config)
         return _normalize_engine_result(raw, target.size)
 
     if not config.get("runtime_enabled", False):
@@ -232,5 +247,5 @@ def ocr(image: ImageInput, config: dict[str, Any] | None = None) -> list[OcrItem
     except ImportError:
         return []
     predict_image, transform = _prepare_predict_image(target, config)
-    raw = paddle.predict(predict_image, **_runtime_predict_kwargs(config))
+    raw = _predict_with_lock(paddle, predict_image, config)
     return _normalize_engine_result(raw, target.size, transform=transform)

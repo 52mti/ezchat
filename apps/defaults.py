@@ -7,6 +7,12 @@ from typing import Any
 DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "poll_interval": 1,
     "keep_awake_interval_seconds": 200,
+    "exclude_ocr_wait_from_step_timeout": True,
+    "robot_monitor": {
+        "enabled": True,
+        "interval_seconds": 1,
+        "history_size": 8,
+    },
 }
 
 DEFAULT_REQUEST_PERSONA_ID = "REMOVED-BEARER-TOKEN"

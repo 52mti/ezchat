@@ -96,7 +96,30 @@ class RuntimeManifest:
     backends: dict[str, BackendManifest]
     model_default_tier: str
     model_tiers: dict[str, dict[str, TierBackendModelSpec]]
+    shared_packages: list[RuntimePackageSpec] = field(default_factory=list)
     pip_index_url: str = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+
+
+def _runtime_state_path(project_root: str | Path | None = None) -> Path:
+    root = Path(project_root) if project_root is not None else Path(__file__).resolve().parents[1]
+    return root / "runtime" / "install_state.json"
+
+
+def load_installed_runtime_state(project_root: str | Path | None = None) -> dict[str, Any]:
+    path = _runtime_state_path(project_root)
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    status = str(payload.get("status", "") or "").strip().lower()
+    validation = str(payload.get("validation", "") or "").strip().lower()
+    if status != "installed" or validation != "ok":
+        return {}
+    return payload
 
 
 def _resolve_executable(command_name: str) -> str | None:
@@ -334,11 +357,12 @@ def _default_runtime_manifest() -> RuntimeManifest:
     )
     return RuntimeManifest(
         version="2026.05.20",
+        shared_packages=packages_common,
         backends={
             "paddle_cuda": BackendManifest(
                 name="paddle_cuda",
                 device="gpu:0",
-                packages=[RuntimePackageSpec(f"paddlepaddle-gpu=={PADDLE_VERSION}"), *packages_common],
+                packages=[RuntimePackageSpec(f"paddlepaddle-gpu=={PADDLE_VERSION}")],
                 lane_indexes=dict(CUDA_LANE_INDEXES),
                 model_provider="paddlex_named_models",
                 description="NVIDIA CUDA + PaddleOCR PP-OCRv5 mobile",
@@ -351,7 +375,6 @@ def _default_runtime_manifest() -> RuntimeManifest:
                         f"paddlepaddle=={PADDLE_VERSION}",
                         "https://www.paddlepaddle.org.cn/packages/stable/cpu/",
                     ),
-                    *packages_common,
                 ],
                 model_provider="paddlex_named_models",
                 description="CPU + PaddleOCR PP-OCRv5 mobile",
@@ -412,6 +435,8 @@ def load_runtime_manifest(project_root: str | Path | None = None) -> RuntimeMani
     pip_block = payload.get("pip")
     if isinstance(pip_block, dict):
         manifest.pip_index_url = str(pip_block.get("indexUrl", manifest.pip_index_url) or manifest.pip_index_url)
+    shared_packages = payload.get("sharedPackages", payload.get("shared_packages"))
+    manifest.shared_packages = _load_package_specs(shared_packages, manifest.shared_packages)
     backends = payload.get("backends")
     if isinstance(backends, dict):
         for name, backend_payload in backends.items():
@@ -460,6 +485,22 @@ def load_runtime_manifest(project_root: str | Path | None = None) -> RuntimeMani
     return manifest
 
 
+def build_runtime_package_specs(manifest: RuntimeManifest, backend: str) -> list[RuntimePackageSpec]:
+    backend_key = str(backend or "").strip().lower()
+    backend_manifest = manifest.backends.get(backend_key)
+    if backend_manifest is None:
+        raise ValueError(f"Unsupported OCR backend: {backend}")
+    packages: list[RuntimePackageSpec] = []
+    seen: set[tuple[str, str]] = set()
+    for package in [*manifest.shared_packages, *backend_manifest.packages]:
+        marker = (package.spec, package.index_url)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        packages.append(package)
+    return packages
+
+
 def resolve_model_spec(manifest: RuntimeManifest, backend: str, model_tier: object) -> TierBackendModelSpec:
     tier = str(model_tier or "auto").strip().lower()
     if tier == "auto":
@@ -500,6 +541,8 @@ def suppress_native_output():
 
 
 _ENGINE_INIT_LOCK = threading.RLock()
+_ENGINE_PREDICT_LOCK = threading.RLock()
+_DIRECTML_ENGINE_INIT_LOCK = threading.RLock()
 _PADDLE_OCR_BY_CACHE_KEY: dict[tuple[str, str, str, str], Any] = {}
 
 
@@ -569,7 +612,8 @@ class PaddleOcrRuntimeEngine:
 
     def predict(self, image_array: np.ndarray, **_kwargs: Any) -> list[dict[str, Any]]:
         engine, _device = self._get_engine()
-        return engine.predict(image_array)
+        with _ENGINE_PREDICT_LOCK:
+            return engine.predict(image_array)
 
 
 def _normalize_rapidocr_results(raw_result: object) -> list[dict[str, Any]]:
@@ -623,16 +667,19 @@ class OnnxDirectMLOcrRuntimeEngine:
     def _get_engine(self) -> Any:
         if self._engine is not None:
             return self._engine
-        try:
-            import onnxruntime as ort  # type: ignore
-            from rapidocr_onnxruntime import RapidOCR  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError("缺少 DirectML OCR 依赖，请先运行 `python install_runtime.py --backend onnx_directml`。") from exc
-        providers = list(ort.get_available_providers())
-        if "DmlExecutionProvider" not in providers:
-            raise RuntimeError(f"当前 onnxruntime 没有 DirectML Provider，可用 Provider: {providers}")
-        self._engine = self._instantiate_rapidocr(RapidOCR, {"providers": ["DmlExecutionProvider", "CPUExecutionProvider"]})
-        return self._engine
+        with _DIRECTML_ENGINE_INIT_LOCK:
+            if self._engine is not None:
+                return self._engine
+            try:
+                import onnxruntime as ort  # type: ignore
+                from rapidocr_onnxruntime import RapidOCR  # type: ignore
+            except ImportError as exc:
+                raise RuntimeError("缺少 DirectML OCR 依赖，请先运行 `python install_runtime.py --backend onnx_directml`。") from exc
+            providers = list(ort.get_available_providers())
+            if "DmlExecutionProvider" not in providers:
+                raise RuntimeError(f"当前 onnxruntime 没有 DirectML Provider，可用 Provider: {providers}")
+            self._engine = self._instantiate_rapidocr(RapidOCR, {"providers": ["DmlExecutionProvider", "CPUExecutionProvider"]})
+            return self._engine
 
     def preload(self) -> str:
         self._get_engine()
@@ -640,7 +687,8 @@ class OnnxDirectMLOcrRuntimeEngine:
 
     def predict(self, image_array: np.ndarray, **_kwargs: Any) -> list[dict[str, Any]]:
         engine = self._get_engine()
-        result = engine(np.ascontiguousarray(image_array))
+        with _ENGINE_PREDICT_LOCK:
+            result = engine(np.ascontiguousarray(image_array))
         if isinstance(result, tuple):
             result = result[0]
         return _normalize_rapidocr_results(result)
@@ -648,10 +696,16 @@ class OnnxDirectMLOcrRuntimeEngine:
 
 def _effective_backend_config(config: dict[str, Any]) -> tuple[str, str]:
     preferred = config.get("backend", config.get("ocr_backend", "auto"))
-    backend = select_ocr_backend(preferred)
+    installed_state = load_installed_runtime_state()
+    installed_backend = str(installed_state.get("backend", "") or "").strip().lower()
+    if normalize_ocr_backend(preferred) == "auto" and installed_backend in {"paddle_cuda", "onnx_directml", "cpu"}:
+        backend = installed_backend
+    else:
+        backend = select_ocr_backend(preferred)
     model_tier = str(config.get("model_tier", config.get("modelTier", "auto")) or "auto").strip().lower()
     if model_tier == "auto":
-        model_tier = load_runtime_manifest().model_default_tier
+        installed_tier = str(installed_state.get("model_tier", "") or "").strip().lower()
+        model_tier = installed_tier or load_runtime_manifest().model_default_tier
     return backend, model_tier
 
 

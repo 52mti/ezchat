@@ -1,19 +1,22 @@
-from __future__ import annotations
+﻿from __future__ import annotations
+
+from io import BytesIO
 
 from PIL import Image
 from PIL.ImageQt import ImageQt
-from PyQt6.QtCore import QRect
+from PyQt6.QtCore import QPoint, QRect, Qt
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QAbstractSpinBox, QPushButton, QScrollArea
 
-from ui.main_window import AppConfigDialog, PopupCropLabel
+from ui import main_window as main_window_module
+from ui.main_window import AppConfigDialog, DeviceSettingsDialog, PopupCropDialog, PopupCropLabel
 
 
 DEFAULT_PERSONA_ID = "REMOVED-BEARER-TOKEN"
 
 
 def test_app_config_dialog_returns_device_app_template_paths(qtbot, tmp_path):
-    template_root = tmp_path / "runtime" / "templates" / "wechat"
+    template_root = tmp_path / "apps" / "wechat" / "templates"
     dialog = AppConfigDialog(
         {},
         device_ip="192.168.1.108",
@@ -28,6 +31,7 @@ def test_app_config_dialog_returns_device_app_template_paths(qtbot, tmp_path):
     assert values["templates"]["screens"] == str(template_root / "screens")
     assert values["poll_interval"] == 1
     assert values["keep_awake_interval_seconds"] == 200
+    assert values["exclude_ocr_wait_from_step_timeout"] is True
     assert values["persona"]["requestPersona"] == DEFAULT_PERSONA_ID
     values["persona"]["name"] = "test"
     assert "persona" in values
@@ -88,14 +92,14 @@ def test_ocr_dialogue_region_edits_save_chat_area(qtbot, tmp_path):
     assert values["ocr"]["regions"]["chat_area"] == [0.05, 0.12, 0.9, 0.76]
 
 
-def test_ocr_dialogue_keyword_editors_save_rules(qtbot, tmp_path):
+def test_ocr_mode_rules_are_saved_from_app_config_dialog(qtbot, tmp_path):
     dialog = AppConfigDialog(
         {
             "ocr_modes": {
                 "dialogue": {
                     "rules": {
-                        "ocr_result_excluded_keywords": ["记录点滴"],
-                        "line_excluded_keywords": ["已认证"],
+                        "ocr_result_excluded_keywords": ["x"],
+                        "line_excluded_keywords": ["y"],
                     }
                 }
             }
@@ -106,16 +110,18 @@ def test_ocr_dialogue_keyword_editors_save_rules(qtbot, tmp_path):
     )
     qtbot.addWidget(dialog)
 
-    assert dialog.dialogue_ocr_result_excluded_keywords.toPlainText() == "记录点滴"
-    assert dialog.dialogue_line_excluded_keywords.toPlainText() == "已认证"
+    dialog.dialogue_ocr_result_excluded_keywords.setPlainText("foo\nbar")
+    dialog.dialogue_line_excluded_keywords.setPlainText("baz")
+    dialog.ocr_mode_fields["dialogue"]["scale"].setValue(3)
 
-    dialog.dialogue_ocr_result_excluded_keywords.setPlainText("折扣商店\n\n活动倒计时")
-    dialog.dialogue_line_excluded_keywords.setPlainText("真人认证\n常用语")
+    values = dialog.values()
 
-    rules = dialog.values()["ocr_modes"]["dialogue"]["rules"]
-
-    assert rules["ocr_result_excluded_keywords"] == ["折扣商店", "活动倒计时"]
-    assert rules["line_excluded_keywords"] == ["真人认证", "常用语"]
+    assert values["ocr_modes"]["dialogue"]["rules"]["ocr_result_excluded_keywords"] == ["foo", "bar"]
+    assert values["ocr_modes"]["dialogue"]["rules"]["line_excluded_keywords"] == ["baz"]
+    assert values["ocr_modes"]["dialogue"]["preprocess"]["scale"] == 3
+    assert dialog.dialogue_ocr_result_excluded_keywords.isEnabled()
+    assert dialog.dialogue_line_excluded_keywords.isEnabled()
+    assert all(field.isEnabled() for field in dialog.ocr_mode_fields["dialogue"].values())
 
 
 def test_ocr_numeric_inputs_ignore_wheel_events(qtbot, tmp_path):
@@ -165,3 +171,129 @@ def test_popup_crop_label_maps_display_selection_to_source_coordinates(qtbot):
     label.selection = QRect(0, 0, label.display_pixmap.width(), label.display_pixmap.height())
 
     assert label.crop_box() == (0, 0, 200, 100)
+
+
+def test_huanyou_app_config_values_do_not_save_next_message_offsets(qtbot, tmp_path):
+    dialog = AppConfigDialog(
+        {"next_message_click_x_offset": 0.04, "next_message_click_y_offset": -0.01},
+        device_ip="192.168.1.133",
+        app_name="huanyou",
+        template_root=tmp_path / "templates",
+    )
+    qtbot.addWidget(dialog)
+
+    values = dialog.values()
+
+    assert "next_message_click_x_offset" not in values
+    assert "next_message_click_y_offset" not in values
+
+
+def test_device_settings_dialog_persists_huanyou_offsets(qtbot):
+    dialog = DeviceSettingsDialog(
+        {
+            "new_greeting_click_x_offset": 0.03,
+            "new_greeting_click_y_offset": -0.01,
+            "next_message_click_x_offset": 0.04,
+            "next_message_click_y_offset": -0.01,
+        },
+        device_ip="192.168.1.133",
+        app_name="huanyou",
+    )
+    qtbot.addWidget(dialog)
+
+    dialog.new_greeting_click_x_offset.setValue(0.02)
+    dialog.new_greeting_click_y_offset.setValue(-0.03)
+    dialog.next_message_click_x_offset.setValue(0.05)
+    dialog.next_message_click_y_offset.setValue(-0.02)
+    values = dialog.values()
+
+    assert values["new_greeting_click_x_offset"] == 0.02
+    assert values["new_greeting_click_y_offset"] == -0.03
+    assert values["next_message_click_x_offset"] == 0.05
+    assert values["next_message_click_y_offset"] == -0.02
+
+
+def test_device_settings_dialog_can_refresh_screenshot_and_test_click(qtbot, monkeypatch):
+    image = Image.new("RGB", (200, 400), "white")
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG")
+    clicks: list[tuple[float, float]] = []
+
+    class FakeRobot:
+        def __init__(self, ip: str) -> None:
+            self.ip = ip
+
+        def get_transform_image(self, pre_move: bool = True) -> bytes:
+            return buffer.getvalue()
+
+        def move_click(self, x: float, y: float) -> None:
+            clicks.append((x, y))
+
+    monkeypatch.setattr(main_window_module, "RobotInterface", FakeRobot)
+    monkeypatch.setattr(main_window_module.QMessageBox, "information", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main_window_module.QMessageBox, "warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main_window_module.QMessageBox, "critical", lambda *args, **kwargs: None)
+
+    dialog = DeviceSettingsDialog(
+        {
+            "new_greeting_click_x_offset": 0.02,
+            "new_greeting_click_y_offset": -0.03,
+            "next_message_click_x_offset": 0.05,
+            "next_message_click_y_offset": -0.01,
+        },
+        device_ip="192.168.1.133",
+        app_name="huanyou",
+    )
+    qtbot.addWidget(dialog)
+
+    qtbot.mouseClick(dialog.refresh_screenshot_button, Qt.MouseButton.LeftButton)
+    dialog.test_target_combo.setCurrentIndex(0)
+    qtbot.mouseClick(
+        dialog.crop_label,
+        Qt.MouseButton.LeftButton,
+        pos=QPoint(dialog.crop_label.width() // 2, dialog.crop_label.height() // 2),
+    )
+
+    assert dialog.point_x_label.text() == "0.5000"
+    assert dialog.point_y_label.text() == "0.5000"
+    assert dialog.click_x_label.text() == "0.5200"
+    assert dialog.click_y_label.text() == "0.4700"
+
+    dialog.test_target_combo.setCurrentIndex(1)
+    assert dialog.click_x_label.text() == "0.5500"
+    assert dialog.click_y_label.text() == "0.4900"
+
+    qtbot.mouseClick(dialog.test_click_button, Qt.MouseButton.LeftButton)
+
+    assert clicks == [(0.55, 0.49)]
+
+
+def test_device_settings_refresh_screenshot_handles_display_errors(qtbot, monkeypatch):
+    image = Image.new("RGB", (200, 400), "white")
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG")
+    critical_messages: list[str] = []
+
+    class FakeRobot:
+        def __init__(self, ip: str) -> None:
+            self.ip = ip
+
+        def get_transform_image(self, pre_move: bool = True) -> bytes:
+            return buffer.getvalue()
+
+    monkeypatch.setattr(main_window_module, "RobotInterface", FakeRobot)
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "critical",
+        lambda parent, title, message: critical_messages.append(message),
+    )
+
+    dialog = DeviceSettingsDialog({}, device_ip="192.168.1.133", app_name="wechat")
+    qtbot.addWidget(dialog)
+    monkeypatch.setattr(dialog, "_set_screenshot", lambda image: (_ for _ in ()).throw(RuntimeError("display failed")))
+
+    qtbot.mouseClick(dialog.refresh_screenshot_button, Qt.MouseButton.LeftButton)
+
+    assert critical_messages == ["无法从当前设备获取截图：display failed"]
+    assert dialog.refresh_screenshot_button.isEnabled()
+

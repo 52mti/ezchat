@@ -1,9 +1,24 @@
 from __future__ import annotations
 
+import copy
+
 from PIL import Image
 
 import vision.ocr_rules as ocr_rules
+from apps.huanyou.ocr_config import DIALOGUE_OCR_MODE as HUANYOU_DIALOGUE_OCR_MODE
+from apps.wechat.config import DEFAULT_CONFIG as WECHAT_CONFIG
+from apps.wechat.ocr_config import DIALOGUE_OCR_MODE as WECHAT_DIALOGUE_OCR_MODE
 from vision.ocr_rules import build_dialogue_result, run_ocr_mode
+
+
+def _dialogue_rules(**overrides):
+    rules = copy.deepcopy(WECHAT_DIALOGUE_OCR_MODE["rules"])
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(rules.get(key), dict):
+            rules[key].update(value)
+        else:
+            rules[key] = value
+    return rules
 
 
 def test_run_ocr_mode_forces_original_preprocess(monkeypatch):
@@ -65,10 +80,7 @@ def test_run_ocr_mode_returns_portrait_bounds_for_landscape_input(monkeypatch):
 
     result = run_ocr_mode(
         Image.new("RGB", (200, 100), "white"),
-        {
-            "ocr": {"runtime_enabled": True},
-            "ocr_modes": {"list": {"preprocess": {"rotate_to_portrait": True}}},
-        },
+        copy.deepcopy(WECHAT_CONFIG),
         "list",
     )
 
@@ -122,7 +134,7 @@ def test_dialogue_rules_filter_time_and_merge_sender_lines():
         },
     ]
 
-    result = build_dialogue_result(items, (200, 300), {"name_gap": 80})
+    result = build_dialogue_result(items, (200, 300), _dialogue_rules(name_gap=80))
 
     assert result["dialogues"] == [{"sender": "sender1", "content": "你好在吗"}]
 
@@ -162,14 +174,49 @@ def test_dialogue_rules_filter_right_narrow_non_cjk_items():
     result = build_dialogue_result(
         items,
         (200, 300),
-        {
-            "basic_filter": {
+        _dialogue_rules(
+            basic_filter={
                 "enable_right_narrow_non_cjk_filter": True,
                 "right_narrow_min_x_ratio": 0.88,
                 "right_narrow_max_width_ratio": 0.12,
                 "enable_non_cjk_non_emoji_filter": False,
-            },
-        },
+            }
+        ),
     )
 
     assert result["dialogues"] == [{"sender": "sender1", "content": "你好"}]
+
+
+def test_huanyou_dialogue_rules_keep_colored_chat_bubbles_only():
+    def item(text: str, min_x: int, max_x: int, min_y: int, max_y: int, sat: float) -> dict:
+        return {
+            "text": text,
+            "raw_text": text,
+            "confidence": 0.99,
+            "min_x": min_x,
+            "max_x": max_x,
+            "min_y": min_y,
+            "max_y": max_y,
+            "center_x": (min_x + max_x) / 2,
+            "center_y": (min_y + max_y) / 2,
+            "width": max_x - min_x,
+            "height": max_y - min_y,
+            "background_saturation": sat,
+        }
+
+    items = [
+        item("火龙果", 233, 313, 56, 92, 0.1),
+        item("你觉得相处起来什么最重要", 159, 443, 268, 300, 0.61),
+        item("收到搭训礼物", 107, 249, 370, 398, 0.22),
+        item("丘比特发现你俩今天很有缘，千万别错过", 85, 473, 618, 643, 0.09),
+        item("你好", 126, 182, 786, 820, 0.31),
+        item("多回复几句，回复率更高哦~", 82, 406, 1038, 1066, 0.09),
+    ]
+
+    result = build_dialogue_result(items, (564, 1222), HUANYOU_DIALOGUE_OCR_MODE["rules"])
+
+    assert result["user_name"] == "火龙果"
+    assert result["dialogues"] == [
+        {"sender": "sender2", "content": "你觉得相处起来什么最重要"},
+        {"sender": "sender1", "content": "你好"},
+    ]

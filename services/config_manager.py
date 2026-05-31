@@ -36,7 +36,29 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 DEFAULT_OUTBOX: dict[str, Any] = {"schema_version": 1, "messages": []}
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 3
+
+APP_LEVEL_KEYS = {
+    "ocr",
+    "ocr_modes",
+    "templates",
+    "match_threshold",
+}
+DEVICE_LEVEL_KEYS = {
+    "poll_interval",
+    "step_timeout",
+    "keep_awake_interval_seconds",
+    "exclude_ocr_wait_from_step_timeout",
+    "idle_poll_interval_seconds",
+}
+DEVICE_APP_LEVEL_KEYS = {
+    "persona",
+    "new_greeting_click_x_offset",
+    "new_greeting_click_y_offset",
+    "next_message_click_x_offset",
+    "next_message_click_y_offset",
+}
+APP_CONFIG_FILE_NAME = "config.json"
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -77,31 +99,162 @@ def _normalize_devices(devices: list[Any]) -> list[dict[str, Any]]:
     return normalized
 
 
-def _normalize_template_paths(device: dict[str, Any]) -> None:
+def _split_override_scopes(override: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    app_level: dict[str, Any] = {}
+    device_level: dict[str, Any] = {}
+    device_app_level: dict[str, Any] = {}
+    for key, value in override.items():
+        if key in APP_LEVEL_KEYS:
+            app_level[key] = copy.deepcopy(value)
+        elif key in DEVICE_LEVEL_KEYS:
+            device_level[key] = copy.deepcopy(value)
+        elif key in DEVICE_APP_LEVEL_KEYS:
+            device_app_level[key] = copy.deepcopy(value)
+    return app_level, device_level, device_app_level
+
+
+def _normalize_app_templates(app_name: str, app_config: dict[str, Any]) -> None:
+    templates = app_config.get("templates", {})
+    if not isinstance(templates, dict):
+        return
+    for group in ("buttons", "screens"):
+        value = templates.get(group)
+        if not isinstance(value, str) or not value:
+            continue
+        normalized = value.replace("/", "\\")
+        app_template_path = str(Path("apps") / str(app_name) / "templates" / group)
+        if normalized.startswith("runtime\\templates\\") or "\\runtime\\templates\\" in normalized:
+            templates[group] = app_template_path
+            continue
+        if normalized.startswith("apps\\") and f"\\{str(app_name)}\\templates\\{group}" in normalized:
+            templates[group] = app_template_path
+
+
+def _normalize_app_configs(app_configs: dict[str, Any]) -> None:
+    if not isinstance(app_configs, dict):
+        return
+    for app_name, app_config in app_configs.items():
+        if isinstance(app_config, dict):
+            _normalize_app_templates(str(app_name), app_config)
+
+
+def _load_json_dict(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return copy.deepcopy(data) if isinstance(data, dict) else {}
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        dir=path.parent,
+        delete=False,
+        suffix=".tmp",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        tmp_name = handle.name
+    os.replace(tmp_name, path)
+
+
+def _app_config_path(app_config_root: Path, app_name: str) -> Path:
+    return app_config_root / str(app_name) / APP_CONFIG_FILE_NAME
+
+
+def _load_app_override_file(app_config_root: Path, app_name: str) -> dict[str, Any]:
+    payload = _load_json_dict(_app_config_path(app_config_root, app_name))
+    app_level, _, _ = _split_override_scopes(payload)
+    _normalize_app_templates(app_name, app_level)
+    return app_level
+
+
+def _extract_legacy_app_level_offsets(app_config: dict[str, Any]) -> dict[str, Any]:
+    offsets: dict[str, Any] = {}
+    for key in (
+        "new_greeting_click_x_offset",
+        "new_greeting_click_y_offset",
+        "next_message_click_x_offset",
+        "next_message_click_y_offset",
+    ):
+        if key in app_config:
+            offsets[key] = copy.deepcopy(app_config.pop(key))
+    return offsets
+
+
+def _normalize_device_scopes(device: dict[str, Any]) -> None:
+    runtime_overrides = device.get("runtime_overrides", {})
+    if not isinstance(runtime_overrides, dict):
+        runtime_overrides = {}
+    device["runtime_overrides"] = {
+        key: copy.deepcopy(value)
+        for key, value in runtime_overrides.items()
+        if key in DEVICE_LEVEL_KEYS
+    }
+
     app_overrides = device.get("app_overrides", {})
     if not isinstance(app_overrides, dict):
+        device["app_overrides"] = {}
         return
+    normalized: dict[str, dict[str, Any]] = {}
     for app_name, override in app_overrides.items():
         if not isinstance(override, dict):
             continue
-        templates = override.get("templates", {})
-        if not isinstance(templates, dict):
+        _, _, device_app_level = _split_override_scopes(override)
+        if device_app_level:
+            normalized[str(app_name)] = device_app_level
+    device["app_overrides"] = normalized
+
+
+def _merge_app_level_config(app_config_root: Path, app_name: str, updates: dict[str, Any]) -> None:
+    if not updates:
+        return
+    existing = _load_app_override_file(app_config_root, app_name)
+    merged = _deep_merge(existing, updates)
+    _normalize_app_templates(app_name, merged)
+    _atomic_write_json(_app_config_path(app_config_root, app_name), merged)
+
+
+def _merge_runtime_overrides(device: dict[str, Any], updates: dict[str, Any]) -> None:
+    if not updates:
+        return
+    runtime_overrides = device.get("runtime_overrides", {})
+    runtime_overrides = runtime_overrides if isinstance(runtime_overrides, dict) else {}
+    runtime_overrides = _deep_merge(runtime_overrides, updates)
+    device["runtime_overrides"] = runtime_overrides
+
+
+def _merge_device_app_overrides(device: dict[str, Any], app_name: str, updates: dict[str, Any]) -> None:
+    if not updates:
+        return
+    app_overrides = device.get("app_overrides", {})
+    app_overrides = app_overrides if isinstance(app_overrides, dict) else {}
+    existing = app_overrides.get(app_name, {})
+    existing = existing if isinstance(existing, dict) else {}
+    app_overrides[str(app_name)] = _deep_merge(existing, updates)
+    device["app_overrides"] = app_overrides
+
+
+def _apply_scoped_app_overrides(
+    app_config_root: Path,
+    device: dict[str, Any],
+    app_overrides: dict[str, Any],
+) -> None:
+    if not isinstance(app_overrides, dict):
+        return
+    for raw_app_name, raw_override in app_overrides.items():
+        if not isinstance(raw_override, dict):
             continue
-        for group in ("buttons", "screens"):
-            value = templates.get(group)
-            if not isinstance(value, str) or not value:
-                continue
-            normalized = value.replace("/", "\\")
-            marker = "\\runtime\\templates\\"
-            if normalized.startswith("runtime\\templates\\"):
-                parts = normalized.split("\\")
-                if len(parts) >= 5 and parts[2] != str(app_name):
-                    templates[group] = str(Path("runtime") / "templates" / str(app_name) / group)
-            elif marker in normalized:
-                before, after = normalized.split(marker, 1)
-                parts = after.split("\\")
-                if len(parts) >= 3 and parts[0] != str(app_name):
-                    templates[group] = str(Path(before) / "runtime" / "templates" / str(app_name) / group)
+        app_name = str(raw_app_name)
+        app_level, device_level, device_app_level = _split_override_scopes(raw_override)
+        _merge_app_level_config(app_config_root, app_name, app_level)
+        _merge_runtime_overrides(device, device_level)
+        _merge_device_app_overrides(device, app_name, device_app_level)
+    _normalize_device_scopes(device)
 
 
 class ConfigManager:
@@ -114,10 +267,11 @@ class ConfigManager:
     ) -> None:
         self.config_path = Path(config_path)
         self.outbox_path = Path(outbox_path)
+        self.app_config_root = self.config_path.parent / "apps"
         self._config = self._load_json(self.config_path, DEFAULT_CONFIG)
         self._outbox = self._load_json(self.outbox_path, DEFAULT_OUTBOX)
         self._migrate_if_needed()
-        self._normalize_loaded_template_paths()
+        self._normalize_loaded_device_scopes()
         self._apply_environment_overrides()
 
     def _load_json(self, path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -132,17 +286,7 @@ class ConfigManager:
         return _deep_merge(default, data)
 
     def _atomic_write(self, path: Path, data: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w",
-            dir=path.parent,
-            delete=False,
-            suffix=".tmp",
-            encoding="utf-8",
-        ) as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
-            tmp_name = handle.name
-        os.replace(tmp_name, path)
+        _atomic_write_json(path, data)
 
     def _backup_file(self, path: Path) -> Path | None:
         if not path.exists():
@@ -154,7 +298,8 @@ class ConfigManager:
     def _migrate_if_needed(self) -> None:
         config_version = int(self._config.get("schema_version", 0) or 0)
         outbox_version = int(self._outbox.get("schema_version", 0) or 0)
-        if config_version < CURRENT_SCHEMA_VERSION:
+        legacy_apps_present = "apps" in self._config
+        if config_version < CURRENT_SCHEMA_VERSION or legacy_apps_present:
             self._backup_file(self.config_path)
             self._config = self._migrate_config(self._config, config_version, CURRENT_SCHEMA_VERSION)
             self._atomic_write(self.config_path, self._config)
@@ -163,7 +308,7 @@ class ConfigManager:
             self._outbox = self._migrate_outbox(self._outbox, outbox_version, CURRENT_SCHEMA_VERSION)
             self._atomic_write(self.outbox_path, self._outbox)
 
-    def _normalize_loaded_template_paths(self) -> None:
+    def _normalize_loaded_device_scopes(self) -> None:
         devices = self._config.get("devices", [])
         if not isinstance(devices, list):
             return
@@ -171,9 +316,17 @@ class ConfigManager:
         for device in devices:
             if not isinstance(device, dict):
                 continue
-            before = copy.deepcopy(device.get("app_overrides", {}))
-            _normalize_template_paths(device)
-            if before != device.get("app_overrides", {}):
+            before = copy.deepcopy(
+                {
+                    "runtime_overrides": device.get("runtime_overrides", {}),
+                    "app_overrides": device.get("app_overrides", {}),
+                }
+            )
+            _normalize_device_scopes(device)
+            if before != {
+                "runtime_overrides": device.get("runtime_overrides", {}),
+                "app_overrides": device.get("app_overrides", {}),
+            }:
                 changed = True
         if changed:
             self._atomic_write(self.config_path, self._config)
@@ -186,7 +339,20 @@ class ConfigManager:
     ) -> dict[str, Any]:
         migrated = _deep_merge(DEFAULT_CONFIG, data)
         migrated["schema_version"] = to_version
+        legacy_app_configs = migrated.pop("apps", {})
+        if not isinstance(legacy_app_configs, dict):
+            legacy_app_configs = {}
         devices = migrated.get("devices", [])
+        legacy_app_offsets: dict[str, dict[str, Any]] = {}
+        for app_name, app_config in list(legacy_app_configs.items()):
+            if not isinstance(app_config, dict):
+                continue
+            normalized_app_config = copy.deepcopy(app_config)
+            offsets = _extract_legacy_app_level_offsets(normalized_app_config)
+            if offsets:
+                legacy_app_offsets[str(app_name)] = offsets
+            app_level, _, _ = _split_override_scopes(normalized_app_config)
+            _merge_app_level_config(self.app_config_root, str(app_name), app_level)
         if isinstance(devices, list):
             migrated["devices"] = _normalize_devices(devices)
             for device in migrated["devices"]:
@@ -195,8 +361,19 @@ class ConfigManager:
                 device.setdefault("selected_app", "wechat")
                 device.setdefault("persona", {})
                 device.setdefault("contact_personas", {})
-                device.setdefault("app_overrides", {"wechat": {}})
-                _normalize_template_paths(device)
+                runtime_overrides = device.get("runtime_overrides", {})
+                runtime_overrides = runtime_overrides if isinstance(runtime_overrides, dict) else {}
+                old_app_overrides = device.get("app_overrides", {})
+                old_app_overrides = old_app_overrides if isinstance(old_app_overrides, dict) else {}
+                device["runtime_overrides"] = runtime_overrides
+                device["app_overrides"] = {}
+                _apply_scoped_app_overrides(self.app_config_root, device, old_app_overrides)
+                for app_name, offsets in legacy_app_offsets.items():
+                    if str(device.get("selected_app", "")) == app_name or (
+                        isinstance(old_app_overrides, dict) and app_name in old_app_overrides
+                    ):
+                        _merge_device_app_overrides(device, app_name, offsets)
+                _normalize_device_scopes(device)
         return migrated
 
     def _migrate_outbox(
@@ -253,13 +430,26 @@ class ConfigManager:
             devices = self._config.setdefault("devices", [])
             if not isinstance(devices, list):
                 raise ValueError("devices must be a list")
+            raw_updates = copy.deepcopy(updates)
+            scoped_app_overrides = raw_updates.pop("app_overrides", None)
+            runtime_updates = raw_updates.pop("runtime_overrides", None)
             for device in devices:
                 if isinstance(device, dict) and str(device.get("ip", "")) == device_ip:
-                    device.update(copy.deepcopy(updates))
+                    device.update(raw_updates)
+                    if isinstance(runtime_updates, dict):
+                        _merge_runtime_overrides(device, runtime_updates)
+                    if isinstance(scoped_app_overrides, dict):
+                        _apply_scoped_app_overrides(self.app_config_root, device, scoped_app_overrides)
+                    _normalize_device_scopes(device)
                     self._config["devices"] = _normalize_devices(devices)
                     self._atomic_write(self.config_path, self._config)
                     return
-            new_device = {"ip": device_ip, **copy.deepcopy(updates)}
+            new_device = {"ip": device_ip, **raw_updates}
+            if isinstance(runtime_updates, dict):
+                _merge_runtime_overrides(new_device, runtime_updates)
+            if isinstance(scoped_app_overrides, dict):
+                _apply_scoped_app_overrides(self.app_config_root, new_device, scoped_app_overrides)
+            _normalize_device_scopes(new_device)
             devices.append(new_device)
             self._config["devices"] = _normalize_devices(devices)
             self._atomic_write(self.config_path, self._config)
@@ -274,7 +464,10 @@ class ConfigManager:
                 raise ValueError("devices must be a list")
             if any(isinstance(existing, dict) and str(existing.get("ip", "")).strip() == device_ip for existing in devices):
                 return False
-            devices.append(copy.deepcopy(device))
+            new_device = copy.deepcopy(device)
+            _apply_scoped_app_overrides(self.app_config_root, new_device, new_device.get("app_overrides", {}))
+            _normalize_device_scopes(new_device)
+            devices.append(new_device)
             self._config["devices"] = _normalize_devices(devices)
             self._atomic_write(self.config_path, self._config)
             return True
@@ -305,12 +498,59 @@ class ConfigManager:
         default_config: dict[str, Any],
     ) -> dict[str, Any]:
         device = self.find_device(device_ip) or {}
-        overrides = (
-            device.get("app_overrides", {}).get(app_name, {})
-            if isinstance(device.get("app_overrides", {}), dict)
+        app_level = self.get_app_overrides(app_name)
+        runtime_overrides = (
+            copy.deepcopy(device.get("runtime_overrides", {}))
+            if isinstance(device.get("runtime_overrides", {}), dict)
             else {}
         )
-        return _deep_merge(default_config, overrides if isinstance(overrides, dict) else {})
+        device_app_overrides = (
+            copy.deepcopy(device.get("app_overrides", {}).get(app_name, {}))
+            if isinstance(device.get("app_overrides", {}), dict)
+            and isinstance(device.get("app_overrides", {}).get(app_name, {}), dict)
+            else {}
+        )
+        merged = _deep_merge(default_config, app_level)
+        merged = _deep_merge(merged, runtime_overrides)
+        return _deep_merge(merged, device_app_overrides)
+
+    def get_app_overrides(self, app_name: str) -> dict[str, Any]:
+        with self._lock:
+            return _load_app_override_file(self.app_config_root, str(app_name))
+
+    def update_app_config(self, app_name: str, updates: dict[str, Any]) -> None:
+        scoped_updates, _, _ = _split_override_scopes(copy.deepcopy(updates))
+        if not scoped_updates:
+            return
+        with self._lock:
+            _merge_app_level_config(self.app_config_root, str(app_name), scoped_updates)
+
+    def get_device_runtime_overrides(self, device_ip: str) -> dict[str, Any]:
+        device = self.find_device(device_ip) or {}
+        runtime_overrides = device.get("runtime_overrides", {})
+        return copy.deepcopy(runtime_overrides if isinstance(runtime_overrides, dict) else {})
+
+    def update_device_runtime(self, device_ip: str, updates: dict[str, Any]) -> None:
+        runtime_updates = {
+            key: copy.deepcopy(value)
+            for key, value in updates.items()
+            if key in DEVICE_LEVEL_KEYS
+        }
+        if runtime_updates:
+            self.update_device(device_ip, {"runtime_overrides": runtime_updates})
+
+    def get_device_app_overrides(self, device_ip: str, app_name: str) -> dict[str, Any]:
+        device = self.find_device(device_ip) or {}
+        app_overrides = device.get("app_overrides", {})
+        if not isinstance(app_overrides, dict):
+            return {}
+        override = app_overrides.get(app_name, {})
+        return copy.deepcopy(override if isinstance(override, dict) else {})
+
+    def update_device_app_overrides(self, device_ip: str, app_name: str, updates: dict[str, Any]) -> None:
+        _, _, device_app_updates = _split_override_scopes(copy.deepcopy(updates))
+        if device_app_updates:
+            self.update_device(device_ip, {"app_overrides": {app_name: device_app_updates}})
 
     def get(self, *keys: str, default: Any = None) -> Any:
         with self._lock:

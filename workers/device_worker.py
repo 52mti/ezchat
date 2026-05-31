@@ -19,6 +19,7 @@ from services import (
     setup_runtime_logging,
 )
 from services.license_client import _is_future_time
+from services.robot_monitor import MonitoredRobot, RobotArmMonitor
 
 
 @dataclass(frozen=True)
@@ -53,7 +54,18 @@ class DeviceWorker(threading.Thread):
             runtime_context["device_ip"] = str(device["ip"])
             runtime_context["app_name"] = app_name
             runtime_context["should_stop"] = self._stop_event.is_set
-        self.robot = robot or RobotInterface(str(device["ip"]))
+        raw_robot = robot or RobotInterface(str(device["ip"]))
+        monitor_config = self.app_config.get("robot_monitor", {})
+        monitor_config = monitor_config if isinstance(monitor_config, dict) else {}
+        self.robot_monitor = RobotArmMonitor(
+            raw_robot,
+            device_ip=str(device["ip"]),
+            emit=self._emit,
+            interval_seconds=float(monitor_config.get("interval_seconds", 1.0) or 1.0),
+            history_size=int(monitor_config.get("history_size", 8) or 8),
+            enabled=bool(monitor_config.get("enabled", True)),
+        )
+        self.robot = MonitoredRobot(raw_robot, self.robot_monitor)
         try:
             setattr(self.robot, "_codex_should_stop", self._stop_event.is_set)
         except Exception:
@@ -163,23 +175,27 @@ class DeviceWorker(threading.Thread):
 
     def run(self) -> None:
         poll_interval = float(self.app_config.get("poll_interval", 1))
+        self.robot_monitor.start()
         self._emit("info", "started")
-        while not self._stop_event.is_set():
-            self._pause_event.wait()
-            if self._stop_event.is_set():
-                break
-            if not self._license_allows_run():
-                continue
-            self.app.run_once()
-            if self._stop_event.is_set():
-                break
-            status = self.app.get_status()
-            status["checked_at"] = datetime.now().isoformat(timespec="seconds")
-            self._emit("status", "tick", status)
-            if status.get("is_circuit_open"):
-                self._emit("error", "circuit open", status)
-                self.pause(str(status.get("current_step_label", "") or status.get("current_step", "") or ""))
-            wait_interval = self._poll_interval_for_status(status, poll_interval)
-            if self._stop_event.wait(wait_interval):
-                break
-        self._emit("info", "stopped")
+        try:
+            while not self._stop_event.is_set():
+                self._pause_event.wait()
+                if self._stop_event.is_set():
+                    break
+                if not self._license_allows_run():
+                    continue
+                self.app.run_once()
+                if self._stop_event.is_set():
+                    break
+                status = self.app.get_status()
+                status["checked_at"] = datetime.now().isoformat(timespec="seconds")
+                self._emit("status", "tick", status)
+                if status.get("is_circuit_open"):
+                    self._emit("error", "circuit open", status)
+                    self.pause(str(status.get("current_step_label", "") or status.get("current_step", "") or ""))
+                wait_interval = self._poll_interval_for_status(status, poll_interval)
+                if self._stop_event.wait(wait_interval):
+                    break
+        finally:
+            self.robot_monitor.stop()
+            self._emit("info", "stopped")

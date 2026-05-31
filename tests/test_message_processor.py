@@ -132,6 +132,49 @@ def test_message_processor_uses_app_scoped_persona(tmp_path):
     assert ai.last_persona["requestPersona"] == DEFAULT_PERSONA_ID
 
 
+def test_message_processor_prefers_app_persona_over_device_persona(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "global": {"apikey": "key", "persona": {"name": "global-name"}},
+                "devices": [
+                    {
+                        "ip": "1.1.1.1",
+                        "selected_app": "wechat",
+                        "persona": {"name": "device-name"},
+                        "app_overrides": {
+                            "wechat": {
+                                "persona": {
+                                    "name": "app-name",
+                                    "renshe": "app-renshe",
+                                }
+                            }
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    config = ConfigManager(config_path, tmp_path / "outbox.json")
+    ai = FakeAI()
+    device = config.find_device("1.1.1.1") or {"ip": "1.1.1.1"}
+    processor = MessageProcessor(
+        device=device,
+        app_name="wechat",
+        config_manager=config,
+        ai_client=ai,  # type: ignore[arg-type]
+        memory_store=MemoryStore(tmp_path / "memory"),
+    )
+
+    processor.prepare_reply({"contact": "寮犱笁", "content": "浣犲ソ", "message_time": "12:00"})
+
+    assert ai.last_persona["name"] == "app-name"
+    assert ai.last_persona["renshe"] == "app-renshe"
+
+
 def test_message_processor_degrades_when_memory_store_fails(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(

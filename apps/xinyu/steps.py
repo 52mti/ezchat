@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import time
 from pathlib import Path
@@ -10,6 +10,7 @@ from apps.cancellation import OperationCancelled
 from apps.coordinates import click_image_point
 from apps.photo_capture import capture_transform_image
 from apps.reporting import Reporter, format_point, report_step
+from apps.step_timing import exclude_ocr_wait_from_step_timeout, step_deadline
 from apps.utils import tts_input
 from apps.visual_assets import (
     BACK_BUTTON,
@@ -38,12 +39,20 @@ class BlackScreenError(RuntimeError):
     pass
 
 
+class NoPhoneScreenError(RuntimeError):
+    pass
+
+
 BLACK_SCREEN = "screen.black_screen"
+NO_PHONE_SCREEN = "screen.no_phone"
+MY_SCREEN = "screen.my"
 INPUT_BOX_BUTTON = "button.input_box"
 MICROPHONE_BUTTON = "button.microphone"
 UNREAD_BUTTON = "button.unread"
 UNREAD_BUTTON_NO_RED = "button.unread.no_red"
 SEND_BUTTON_KEY = "button.send"
+MY_BUTTON = "button.my"
+MESSAGE_BUTTON = "button.message"
 TTS_POST_DELAY_SECONDS = 3.0
 POPUP_MAX_X = 0.9
 
@@ -51,6 +60,8 @@ SCREEN_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
     CHAT_LIST_SCREEN: ("screen_聊天列表.jpg", "chat_list.jpg", "screen_message_list.jpg"),
     CHAT_WINDOW_SCREEN: ("screen_聊天界面.jpg", "chat_window.jpg"),
     BLACK_SCREEN: ("screen_黑屏异常.jpg",),
+    NO_PHONE_SCREEN: ("screen_无手机界面.jpg",),
+    MY_SCREEN: ("screen_我的界面.jpg",),
 }
 
 BUTTON_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
@@ -60,6 +71,8 @@ BUTTON_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
     INPUT_BOX_BUTTON: ("btn_输入框.jpg", "btn_input_box.jpg"),
     MICROPHONE_BUTTON: ("btn_麦克风按钮.jpg", "btn_voice_input.jpg"),
     SEND_BUTTON_KEY: ("btn_发送按钮.jpg", "btn_send.jpg"),
+    MY_BUTTON: ("btn_我的按钮.jpg",),
+    MESSAGE_BUTTON: ("btn_消息按钮.jpg",),
 }
 
 
@@ -93,6 +106,11 @@ def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> di
 
 def _step_timeout(config: dict[str, Any]) -> float:
     return float(config.get("step_timeout", 10))
+
+
+def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = None) -> dict[str, Any]:
+    with exclude_ocr_wait_from_step_timeout(config):
+        return run_ocr_mode(image, config, mode, region=region)
 
 
 def _region(config: dict[str, Any], key: str) -> Any:
@@ -178,6 +196,8 @@ def _looks_like_black_screen(image: Any, config: dict[str, Any]) -> bool:
 
 
 def _raise_if_black_screen(image: Any, config: dict[str, Any]) -> None:
+    if _matches_screen(image, config, NO_PHONE_SCREEN):
+        raise NoPhoneScreenError("no phone detected; device is not visible")
     if _matches_screen(image, config, BLACK_SCREEN) or _looks_like_black_screen(image, config):
         raise BlackScreenError("black screen detected; device may be powered off")
 
@@ -337,6 +357,22 @@ def _click_back_once(
     return True
 
 
+def _click_message_button(
+    robot: Any,
+    config: dict[str, Any],
+    image: Any | None = None,
+    reporter: Reporter | None = None,
+) -> bool:
+    current_image = image if image is not None else capture_after_popups(robot, config, label="message_button", reporter=reporter)
+    pos = _template_center(current_image, config, MESSAGE_BUTTON, group="buttons")
+    if pos is None:
+        _report(reporter, "message_button_click", "消息按钮未找到")
+        return False
+    _report(reporter, "message_button_click", "点击消息按钮", log_label=f"点击消息按钮：{format_point(*pos)}")
+    click_image_point(robot, *pos)
+    return True
+
+
 def ensure_list_screen(robot: Any, config: dict[str, Any] | None = None, reporter: Reporter | None = None) -> Any | None:
     cfg = _config(config)
     _report(reporter, "confirm_xinyu_list", "确认心遇见聊天列表")
@@ -349,6 +385,14 @@ def ensure_list_screen(robot: Any, config: dict[str, Any] | None = None, reporte
             return None
         time.sleep(0.4)
         image = capture_after_popups(robot, cfg, label="after_return_from_chat", reporter=reporter)
+        _raise_if_black_screen(image, cfg)
+        if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
+            return image
+    if _matches_screen(image, cfg, MY_SCREEN):
+        if not _click_message_button(robot, cfg, image, reporter=reporter):
+            return None
+        time.sleep(0.4)
+        image = capture_after_popups(robot, cfg, label="after_message_button", reporter=reporter)
         _raise_if_black_screen(image, cfg)
         if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
             return image
@@ -373,7 +417,7 @@ def check_unread_button(
     current_image = image if image is not None else capture_after_popups(robot, cfg, label="unread_button", reporter=reporter)
     if ocr_result is None:
         _report(reporter, "list_ocr_scan", "列表 OCR 扫描")
-        ocr_result = run_ocr_mode(current_image, cfg, "list", region=None)
+        ocr_result = _run_ocr_mode(current_image, cfg, "list", region=None)
     bottom_nav = ocr_result["result"].get("bottom_nav", [])
     unread_item = _bottom_nav_item(bottom_nav, ("未回复",))
     if unread_item is None:
@@ -400,7 +444,7 @@ def check_unread_button(
     time.sleep(0.4)
     current_image = capture_after_popups(robot, cfg, label="after_unread_button", reporter=reporter)
     _report(reporter, "list_ocr_scan", "列表 OCR 扫描")
-    ocr_result = run_ocr_mode(current_image, cfg, "list", region=None)
+    ocr_result = _run_ocr_mode(current_image, cfg, "list", region=None)
     return current_image, ocr_result
 
 
@@ -414,7 +458,7 @@ def find_unread_target(
     if image is None:
         return None
     _report(reporter, "list_ocr_scan", "列表 OCR 扫描")
-    ocr_result = run_ocr_mode(image, cfg, "list", region=None)
+    ocr_result = _run_ocr_mode(image, cfg, "list", region=None)
     image, ocr_result = check_unread_button(robot, cfg, image, reporter=reporter, ocr_result=ocr_result)
     rows = ocr_result["result"].get("message_list", [])
     candidates: list[tuple[int, int, dict[str, Any]]] = []
@@ -469,7 +513,7 @@ def keep_screen_awake(
         return False
 
     _report(reporter, "keep_awake_scan", "防熄屏扫描底部导航")
-    ocr_result = run_ocr_mode(image, cfg, "list", region=None)
+    ocr_result = _run_ocr_mode(image, cfg, "list", region=None)
     bottom_nav = ocr_result["result"].get("bottom_nav", [])
     message = _bottom_nav_center(bottom_nav, ("消息",), min_center_y=0.5)
     if message is None:
@@ -484,6 +528,49 @@ def keep_screen_awake(
     click_image_point(robot, *message)
     time.sleep(0.6)
     return True
+
+
+def read_my_points(
+    robot: Any,
+    config: dict[str, Any] | None = None,
+    reporter: Reporter | None = None,
+) -> str | None:
+    cfg = _config(config)
+    image = ensure_list_screen(robot, cfg, reporter=reporter)
+    if image is None:
+        return None
+
+    pos = _template_center(image, cfg, MY_BUTTON, group="buttons")
+    if pos is None:
+        raise StepUnavailable("my button was not found")
+    _report(reporter, "points_open_my", "打开我的界面", log_label=f"打开我的界面：{format_point(*pos)}")
+    click_image_point(robot, *pos)
+    time.sleep(0.6)
+
+    image = capture_after_popups(robot, cfg, label="my_screen", reporter=reporter)
+    _raise_if_black_screen(image, cfg)
+    if not _matches_screen(image, cfg, MY_SCREEN):
+        raise StepUnavailable("my screen template did not match")
+
+    _report(reporter, "points_ocr_read", "积分 OCR 读取")
+    ocr_result = _run_ocr_mode(image, cfg, "points", region=None)
+    result = ocr_result.get("result", {}) if isinstance(ocr_result.get("result", {}), dict) else {}
+    points = str(result.get("points") or result.get("balance") or "").strip()
+    _report(
+        reporter,
+        "points_ocr_read",
+        "积分读取完成" if points else "积分未识别",
+        log_label=f"积分读取完成：{points}" if points else "积分未识别",
+    )
+
+    if not _click_message_button(robot, cfg, image, reporter=reporter):
+        raise StepUnavailable("message button was not found")
+    time.sleep(0.6)
+    image = capture_after_popups(robot, cfg, label="after_points_message", reporter=reporter)
+    _raise_if_black_screen(image, cfg)
+    if not _matches_screen(image, cfg, CHAT_LIST_SCREEN):
+        raise StepUnavailable("failed to return to chat list after points read")
+    return points or None
 
 
 def enter_chat(robot: Any, x: float, y: float) -> None:
@@ -514,7 +601,7 @@ def read_message(
     cfg = _config(config)
     current_image = image if image is not None else confirm_chat_window(robot, cfg, reporter=reporter)
     _report(reporter, "dialogue_ocr_read", "聊天详情 OCR")
-    ocr_result = run_ocr_mode(current_image, cfg, "dialogue", region=_region(cfg, CHAT_AREA_REGION))
+    ocr_result = _run_ocr_mode(current_image, cfg, "dialogue", region=_region(cfg, CHAT_AREA_REGION))
     items = ocr_result["ocr_items"]
     if not items:
         raise StepUnavailable("OCR did not return chat text")
@@ -578,7 +665,7 @@ def play_voice_reply(
     retry_count = max(0, int(cfg.get("tts_retry_attempts", 1) or 0))
     last_error: Exception | None = None
     for attempt in range(retry_count + 1):
-        deadline = time.monotonic() + _step_timeout(cfg)
+        deadline = step_deadline(cfg, _step_timeout(cfg))
         while True:
             image = capture_after_popups(robot, cfg, label="microphone", reporter=reporter)
             microphone = _template_center(image, cfg, MICROPHONE_BUTTON, group="buttons")
@@ -587,7 +674,7 @@ def play_voice_reply(
                 _report(reporter, "microphone_click", label, log_label=f"{label}：{format_point(*microphone)}")
                 click_image_point(robot, *microphone)
                 break
-            if time.monotonic() >= deadline:
+            if deadline.expired():
                 raise StepUnavailable("microphone button was not found")
             time.sleep(0.4)
 
@@ -628,7 +715,7 @@ def send_reply(
     reporter: Reporter | None = None,
 ) -> int:
     cfg = _config(config)
-    deadline = time.monotonic() + _step_timeout(cfg)
+    deadline = step_deadline(cfg, _step_timeout(cfg))
     clicked = 0
     while True:
         image = capture_after_popups(robot, cfg, label="send_button", reporter=reporter)
@@ -636,14 +723,14 @@ def send_reply(
         if pos is None:
             if clicked > 0:
                 return clicked
-            if time.monotonic() >= deadline:
+            if deadline.expired():
                 raise StepUnavailable("send button was not found")
             time.sleep(0.4)
             continue
         _report(reporter, "send_button_click", "点击发送按钮", log_label=f"点击发送按钮：{format_point(*pos)}")
         click_image_point(robot, *pos)
         clicked += 1
-        if time.monotonic() >= deadline:
+        if deadline.expired():
             raise StepUnavailable("send button did not disappear after click")
         time.sleep(0.4)
 
@@ -717,3 +804,4 @@ def go_back(
     image = capture_after_popups(robot, cfg, label="after_go_back", reporter=reporter)
     if not _matches_screen(image, cfg, CHAT_LIST_SCREEN):
         raise StepUnavailable("failed to return to chat list")
+

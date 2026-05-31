@@ -24,10 +24,37 @@ def test_each_app_uses_shared_runtime_defaults():
         assert config["persona"]["requestPersona"] == DEFAULT_PERSONA_ID
 
 
+def test_huanyou_runtime_ocr_is_enabled_by_default():
+    assert HUANYOU_CONFIG["ocr"]["runtime_enabled"] is True
+
+
 def test_app_ocr_modes_are_not_shared_between_apps():
     assert WECHAT_CONFIG["ocr_modes"] is not XINYU_CONFIG["ocr_modes"]
     assert WECHAT_CONFIG["ocr_modes"] is not HUANYOU_CONFIG["ocr_modes"]
     assert XINYU_CONFIG["ocr_modes"] is not HUANYOU_CONFIG["ocr_modes"]
+
+
+def test_huanyou_dialogue_sender_anchor_is_app_specific():
+    huanyou_sender = HUANYOU_CONFIG["ocr_modes"]["dialogue"]["rules"]["sender_detection"]
+    wechat_sender = WECHAT_CONFIG["ocr_modes"]["dialogue"]["rules"]["sender_detection"]
+    xinyu_sender = XINYU_CONFIG["ocr_modes"]["dialogue"]["rules"]["sender_detection"]
+
+    assert huanyou_sender["method"] == "center_position"
+    assert wechat_sender["method"] == "position"
+    assert xinyu_sender["method"] == "position"
+
+
+def test_huanyou_list_rules_are_conservative_for_default_unread_and_marketing_rows():
+    rules = HUANYOU_CONFIG["ocr_modes"]["list"]["rules"]
+
+    assert rules["badge_default_unread_count"] == 0
+    assert rules["enable_red_badge_detection"] is False
+    assert "在线匹配" in rules["excluded_keywords"]
+    assert "在线配对" in rules["excluded_keywords"]
+    assert "小助手" in rules["excluded_keywords"]
+    assert "对方回复5条消息" not in rules["content_excluded_keywords"]
+    assert "对方回复5条消息" not in rules["unread_count_excluded_keywords"]
+    assert "温馨提示" in rules["unread_count_excluded_keywords"]
 
 
 def test_wechat_owns_wechat_list_layout_rules():
@@ -48,6 +75,20 @@ def test_xinyu_owns_xinyu_list_layout_rules():
     assert "全部消息" in rules["bottom_nav_keywords"]
     assert "全部消息" in rules["top_nav_keywords"]
     assert "全部消息" in rules["system_keywords"]
+
+
+def test_huanyou_owns_points_ocr_mode():
+    points_mode = HUANYOU_CONFIG["ocr_modes"]["points"]
+
+    assert points_mode["preprocess"]["mode"] == "original"
+    assert "我的收益" in points_mode["rules"]["keywords"]
+    assert "收益" in points_mode["rules"]["keywords"]
+    assert "金币" in points_mode["rules"]["keywords"]
+
+
+def test_huanyou_moves_next_message_click_offset_config_out_of_app_scope():
+    assert "next_message_click_x_offset" not in HUANYOU_CONFIG
+    assert "next_message_click_y_offset" not in HUANYOU_CONFIG
 
 
 def test_each_app_owns_unread_fallback_rules():

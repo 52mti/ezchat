@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal, InvalidOperation
 import random
 import re
 import time
@@ -39,9 +40,45 @@ class XinyuApp(BaseApp):
         self.reply_provider = reply_provider or (lambda message: "")
         self.sent_callback = sent_callback
         self.last_activity_at = time.monotonic()
+        self.idle_points_checked = False
 
     def _mark_activity(self) -> None:
         self.last_activity_at = time.monotonic()
+
+    @staticmethod
+    def _balance_from_points(points: Any) -> str:
+        try:
+            value = Decimal(str(points).strip()) / Decimal("10")
+        except (InvalidOperation, ValueError):
+            return ""
+        return str(int(value))
+
+    def _run_idle_maintenance(self, reporter: Callable[..., None]) -> None:
+        now = time.monotonic()
+        keep_awake_interval = float(self.config.get("keep_awake_interval_seconds", 0) or 0)
+        if keep_awake_interval > 0 and now - self.last_activity_at >= keep_awake_interval:
+            reporter("keep_awake_due", "执行防熄屏跳转")
+            try:
+                did_keep_awake = steps.keep_screen_awake(self.robot, self.config, reporter=reporter)
+            except Exception as keep_awake_exc:
+                self.emit_runtime_log("warning", "keep_awake_failed", {"error": str(keep_awake_exc)})
+            else:
+                if did_keep_awake:
+                    self._mark_activity()
+
+        if self.idle_points_checked:
+            return
+        self.idle_points_checked = True
+        reporter("points_check_due", "首次防熄屏读取余额")
+        try:
+            points = steps.read_my_points(self.robot, self.config, reporter=reporter)
+        except Exception as points_exc:
+            self.emit_runtime_log("warning", "xinyu_balance_failed", {"error": str(points_exc)})
+            return
+        if points:
+            balance = self._balance_from_points(points)
+            self.emit_runtime_log("info", "xinyu_balance", {"balance": balance, "points": points})
+            self._mark_activity()
 
     def _greeting_path(self) -> Path:
         runtime = self.config.get("runtime", {})
@@ -85,20 +122,11 @@ class XinyuApp(BaseApp):
             return
         try:
             reporter = self.set_runtime_step
-            keep_awake_interval = float(self.config.get("keep_awake_interval_seconds", 0) or 0)
-            if keep_awake_interval > 0 and time.monotonic() - self.last_activity_at >= keep_awake_interval:
-                reporter("keep_awake_due", "执行防熄屏跳转")
-                try:
-                    did_keep_awake = steps.keep_screen_awake(self.robot, self.config, reporter=reporter)
-                except Exception as keep_awake_exc:
-                    self.emit_runtime_log("warning", "keep_awake_failed", {"error": str(keep_awake_exc)})
-                else:
-                    if did_keep_awake:
-                        self._mark_activity()
-
             reporter("popup_check", "检查并关闭弹窗")
             target = steps.find_unread_target(self.robot, self.config, reporter=reporter)
             if not target:
+                reporter("empty_list_target", "暂无消息，进入防熄屏等待")
+                self._run_idle_maintenance(reporter)
                 return
 
             round_started_at = time.monotonic()
@@ -114,8 +142,10 @@ class XinyuApp(BaseApp):
             )
             if self._is_empty_list_target(target):
                 reporter("empty_list_target", "暂无消息，本轮不进入聊天")
+                self._run_idle_maintenance(reporter)
                 self.mark_success()
                 return
+            self.idle_points_checked = False
 
             list_content = self._clean_content(target.get("content", ""))
             use_list_content = self._can_reply_from_list(list_content)
@@ -210,12 +240,17 @@ class XinyuApp(BaseApp):
             reporter("wait_next_round", "等待下一轮扫描")
             self.record_reply_round(time.monotonic() - round_started_at)
             self.mark_success()
-        except steps.BlackScreenError as exc:
-            self.set_runtime_step("black_screen_circuit_open", "黑屏熔断")
-            self.status.error_count += 1
+        except steps.NoPhoneScreenError as exc:
+            self.set_runtime_step("no_phone_waiting", "无手机异常，等待用户放回手机")
             self.status.last_error = str(exc)
-            self.status.is_circuit_open = True
-            self.emit_runtime_log("error", "black_screen_detected", {"error": str(exc)})
-            self._save_error_capture()
+            self.status.is_circuit_open = False
+            self.recover_error_count = 0
+            self.emit_runtime_log("warning", "no_phone_detected", {"error": str(exc)})
+        except steps.BlackScreenError as exc:
+            self.set_runtime_step("black_screen_waiting", "黑屏异常，等待用户亮屏")
+            self.status.last_error = str(exc)
+            self.status.is_circuit_open = False
+            self.recover_error_count = 0
+            self.emit_runtime_log("warning", "black_screen_detected", {"error": str(exc)})
         except Exception as exc:
             self.on_error(exc)

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "global": {
     "apikey": "",
     "license_api_url": "",
@@ -16,70 +16,12 @@
       "license_key": "",
       "license_expires": "",
       "selected_app": "wechat",
+      "runtime_overrides": {
+        "poll_interval": 1,
+        "keep_awake_interval_seconds": 200
+      },
       "app_overrides": {
         "wechat": {
-          "poll_interval": 1,
-          "keep_awake_interval_seconds": 200,
-          "ocr": {
-            "lang": "ch",
-            "runtime_enabled": false,
-            "backend": "auto",
-            "model_tier": "lite",
-            "use_gpu": false,
-            "det_db_thresh": 0.3,
-            "rec_thresh": 0.5,
-            "regions": {
-              "message_list": [0.0, 0.1, 1.0, 0.9],
-              "chat_area": [0.0, 0.1, 1.0, 0.8]
-            }
-          },
-          "ocr_modes": {
-            "dialogue": {
-              "preprocess": {
-                "mode": "original",
-                "scale": 2,
-                "rotate_to_portrait": true
-              },
-              "rules": {
-                "min_confidence": 0.3,
-                "min_box_height_ratio": 0.02,
-                "line_gap": 24,
-                "name_gap": 70,
-                "ocr_result_excluded_keywords": [],
-                "line_excluded_keywords": [],
-                "line_and_below_keywords": [],
-                "sender_detection": {
-                  "method": "position",
-                  "sender2_min_x_ratio": 0.52,
-                  "enable_color_fallback": false,
-                  "color_saturation_threshold": 0.65
-                },
-                "basic_filter": {
-                  "enable_time_text_filter": true,
-                  "enable_center_y_region_filter": true,
-                  "center_y_min_ratio": 0.18,
-                  "center_y_max_ratio": 0.92
-                }
-              }
-            },
-            "list": {
-              "preprocess": {
-                "mode": "original",
-                "scale": 2,
-                "rotate_to_portrait": true
-              },
-              "rules": {
-                "min_confidence": 0.3,
-                "min_box_height_ratio": 0.02,
-                "line_gap": 24,
-                "main_top_ratio": 0.12,
-                "main_bottom_ratio": 0.92,
-                "system_keywords": [],
-                "excluded_keywords": [],
-                "content_excluded_keywords": []
-              }
-            }
-          },
           "persona": {
             "requestPersona": "REMOVED-BEARER-TOKEN",
             "name": "",

@@ -40,10 +40,14 @@ def _config(tmp_path: Path) -> dict[str, object]:
         buttons_dir / "btn_输入框.jpg",
         buttons_dir / "btn_麦克风按钮.jpg",
         buttons_dir / "btn_发送按钮.jpg",
+        buttons_dir / "btn_我的按钮.jpg",
+        buttons_dir / "btn_消息按钮.jpg",
         buttons_dir / "popup_custom_1.jpg",
         screens_dir / "screen_聊天列表.jpg",
         screens_dir / "screen_聊天界面.jpg",
+        screens_dir / "screen_我的界面.jpg",
         screens_dir / "screen_黑屏异常.jpg",
+        screens_dir / "screen_无手机界面.jpg",
     ]:
         _touch(path)
     return {
@@ -112,7 +116,23 @@ def test_xinyu_ensure_list_screen_raises_on_pixel_black_screen(monkeypatch, tmp_
     assert robot.clicks == []
 
 
-def test_xinyu_app_black_screen_opens_circuit_without_recovery(monkeypatch, tmp_path):
+def test_xinyu_ensure_list_screen_raises_on_no_phone_screen(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["no_phone"])
+
+    def fake_match(image, template, threshold=0.85):
+        if image == "no_phone" and Path(template).name == "screen_无手机界面.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+
+    with pytest.raises(steps.NoPhoneScreenError):
+        steps.ensure_list_screen(robot, config)
+    assert robot.clicks == []
+
+
+def test_xinyu_app_black_screen_reports_waiting_without_circuit(monkeypatch, tmp_path):
     config = _config(tmp_path)
     robot = FakeRobot(["black"])
     logs: list[tuple[str, str, dict | None]] = []
@@ -127,11 +147,39 @@ def test_xinyu_app_black_screen_opens_circuit_without_recovery(monkeypatch, tmp_
     app.set_log_callback(lambda level, message, payload=None: logs.append((level, message, payload)))
     app.run_once()
 
-    assert app.status.is_circuit_open is True
+    assert app.status.is_circuit_open is False
+    assert app.status.error_count == 0
     assert "black screen" in app.status.last_error
-    assert app.status.current_step == "black_screen_circuit_open"
-    assert app.status.current_step_label == "黑屏熔断"
+    assert app.status.current_step == "black_screen_waiting"
+    assert app.status.current_step_label == "黑屏异常，等待用户亮屏"
+    assert logs[-1][0] == "warning"
     assert logs[-1][1] == "black_screen_detected"
+
+
+def test_xinyu_app_no_phone_reports_waiting_without_circuit(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["no_phone"])
+    logs: list[tuple[str, str, dict | None]] = []
+
+    monkeypatch.setattr(
+        xinyu_app.steps,
+        "find_unread_target",
+        lambda robot, config, reporter=None: (_ for _ in ()).throw(
+            steps.NoPhoneScreenError("no phone detected")
+        ),
+    )
+
+    app = xinyu_app.XinyuApp(robot, config, reply_provider=lambda message: "AI回复")
+    app.set_log_callback(lambda level, message, payload=None: logs.append((level, message, payload)))
+    app.run_once()
+
+    assert app.status.is_circuit_open is False
+    assert app.status.error_count == 0
+    assert "no phone" in app.status.last_error
+    assert app.status.current_step == "no_phone_waiting"
+    assert app.status.current_step_label == "无手机异常，等待用户放回手机"
+    assert logs[-1][0] == "warning"
+    assert logs[-1][1] == "no_phone_detected"
 
 
 def test_xinyu_unread_red_pixel_detection_accepts_pink_red_badge():

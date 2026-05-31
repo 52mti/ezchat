@@ -1,6 +1,6 @@
 from apps.defaults import DEFAULT_PERSONA_CONFIG, DEFAULT_RUNTIME_CONFIG
 
-from .ocr_config import DEFAULT_OCR_MODES
+from .ocr_config import OCR_MODES
 
 
 DEFAULT_CONFIG = {
@@ -19,10 +19,10 @@ DEFAULT_CONFIG = {
             "chat_area": [0.0, 0.1, 1.0, 0.8],
         },
     },
-    "ocr_modes": DEFAULT_OCR_MODES,
+    "ocr_modes": OCR_MODES,
     "templates": {
-        "buttons": "runtime/templates/xinyu/buttons",
-        "screens": "runtime/templates/xinyu/screens",
+        "buttons": "apps/xinyu/templates/buttons",
+        "screens": "apps/xinyu/templates/screens",
     },
     "match_threshold": 0.85,
     **DEFAULT_RUNTIME_CONFIG,

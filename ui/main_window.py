@@ -7,6 +7,7 @@ import re
 import signal
 import sys
 import time
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
+    QCheckBox,
     QFormLayout,
     QFrame,
     QHeaderView,
@@ -43,7 +45,6 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from PIL import Image
-from PIL.ImageQt import ImageQt
 
 from apps import get_registered_apps
 from apps.defaults import DEFAULT_RUNTIME_CONFIG, with_app_defaults
@@ -52,6 +53,18 @@ from lgb.lgb import RobotInterface, scan_devices
 from services import ConfigManager, LicenseClient
 from vision.screen import ensure_portrait_image
 from workers import DeviceWorker, WorkerEvent
+
+
+def _pixmap_from_pil_image(image: Image.Image) -> QPixmap:
+    buffer = BytesIO()
+    image.convert("RGB").save(buffer, format="PNG")
+    qimage = QImage()
+    if not qimage.loadFromData(buffer.getvalue(), "PNG"):
+        raise ValueError("截图数据无法转换为 Qt 图像")
+    pixmap = QPixmap.fromImage(qimage)
+    if pixmap.isNull():
+        raise ValueError("截图数据无法转换为 Qt 画面")
+    return pixmap
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -244,8 +257,10 @@ COL_STATUS = 4
 COL_AVG_REPLY_SECONDS = 5
 COL_UNATTENDED_SECONDS = 6
 COL_RUNNING_APP = 7
+COL_BALANCE = 8
 STATUS_COLUMN_WIDTH = 150
 UNATTENDED_COLUMN_WIDTH = 112
+BALANCE_COLUMN_WIDTH = 86
 
 STATUS_COORDINATE_RE = re.compile(r"\s*[：:,-]?\s*\(?\s*-?\d+(?:\.\d+)?\s*[,，]\s*-?\d+(?:\.\d+)?\s*\)?\s*$")
 
@@ -317,6 +332,7 @@ class MainWindow(QMainWindow):
         self.config_manager = config_manager or ConfigManager()
         self.events: "queue.Queue[WorkerEvent]" = queue.Queue()
         self.workers: dict[str, DeviceWorker] = {}
+        self.log_events: list[WorkerEvent] = []
         self.unattended_started_at: dict[str, float] = {}
         self.unattended_elapsed_seconds: dict[str, float] = {}
         self.setWindowTitle("机械臂视觉控制系统")
@@ -372,8 +388,8 @@ class MainWindow(QMainWindow):
         summary.addStretch(1)
         layout.addWidget(summary_panel)
 
-        self.table = QTableWidget(0, 8)
-        self.table.setHorizontalHeaderLabels(["\u9009\u62e9", "\u5f53\u524d\u5361\u5bc6", "\u5230\u671f\u65f6\u95f4", "\u8bbe\u5907IP", "\u8fd0\u884c\u72b6\u6001", "\u5e73\u5747\u7528\u65f6", "\u65e0\u5e72\u9884\u65f6\u957f", "\u8fd0\u884cApp"])
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels(["\u9009\u62e9", "\u5f53\u524d\u5361\u5bc6", "\u5230\u671f\u65f6\u95f4", "\u8bbe\u5907IP", "\u8fd0\u884c\u72b6\u6001", "\u5e73\u5747\u7528\u65f6", "\u65e0\u5e72\u9884\u65f6\u957f", "\u8fd0\u884cApp", "\u4f59\u989d"])
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -392,6 +408,8 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(COL_UNATTENDED_SECONDS, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(COL_UNATTENDED_SECONDS, UNATTENDED_COLUMN_WIDTH)
         header.setSectionResizeMode(COL_RUNNING_APP, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(COL_BALANCE, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(COL_BALANCE, BALANCE_COLUMN_WIDTH)
         layout.addWidget(self.table)
 
         action_panel = QFrame()
@@ -399,6 +417,10 @@ class MainWindow(QMainWindow):
         action_bar = QHBoxLayout(action_panel)
         action_bar.setContentsMargins(12, 10, 12, 10)
         action_bar.setSpacing(8)
+        action_bar.addWidget(QLabel("\u65e5\u5fd7\u8bbe\u5907"))
+        self.log_device_filter = QComboBox()
+        self.log_device_filter.currentIndexChanged.connect(self._render_logs)
+        action_bar.addWidget(self.log_device_filter)
         self.log_toggle = self._button("运行日志")
         self.log_toggle.setCheckable(True)
         self.log_toggle.setChecked(False)
@@ -481,6 +503,8 @@ class MainWindow(QMainWindow):
             if index >= 0:
                 app_select.setCurrentIndex(index)
             self.table.setCellWidget(row, COL_RUNNING_APP, app_select)
+            self.table.setItem(row, COL_BALANCE, QTableWidgetItem("--"))
+        self._refresh_log_device_filter(devices)
         self._refresh_summary()
 
     def _show_device_context_menu(self, position) -> None:
@@ -495,7 +519,8 @@ class MainWindow(QMainWindow):
         menu.addAction("停止", lambda: self._stop_worker(row))
         menu.addSeparator()
         menu.addAction("卡密绑定", lambda: self._bind_license(row))
-        menu.addAction("配置", lambda: self._edit_app_config(row))
+        menu.addAction("app设置", lambda: self._edit_app_config(row))
+        menu.addAction("设备设置", lambda: self._edit_device_settings(row))
         menu.addSeparator()
         menu.addAction("删除当前设备", lambda: self._delete_device(row))
         menu.exec(self.table.viewport().mapToGlobal(position))
@@ -517,6 +542,14 @@ class MainWindow(QMainWindow):
                 self._refresh_summary()
                 return
 
+    def _set_row_balance(self, device_ip: str, balance: str) -> None:
+        for row in range(self.table.rowCount()):
+            if self._device_ip_for_row(row) == device_ip:
+                item = QTableWidgetItem(str(balance or "--"))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(row, COL_BALANCE, item)
+                return
+
     def _row_status_for_device(self, device_ip: str) -> str:
         for row in range(self.table.rowCount()):
             if self._device_ip_for_row(row) == device_ip:
@@ -532,11 +565,13 @@ class MainWindow(QMainWindow):
 
     def _status_item(self, status: str, detail: str = "") -> QTableWidgetItem:
         label, background, foreground = STATUS_COLORS.get(status, (status, "#f1f5f9", "#475569"))
+        if status == "abnormal":
+            label, background, foreground = "异常", "#fee2e2", "#991b1b"
         detail_text = strip_status_coordinates(detail)
         text = label
         if detail_text and status == "running":
             text = detail_text
-        elif detail_text and status == "paused":
+        elif detail_text and status in {"paused", "abnormal"}:
             text = f"{label}-{detail_text}"
         item = QTableWidgetItem(text)
         item.setData(256, status)
@@ -616,7 +651,7 @@ class MainWindow(QMainWindow):
             status = str(item.data(256)) if item else ""
             if status == "running":
                 running += 1
-            if status in {"circuit_open", "license_error"}:
+            if status in {"circuit_open", "abnormal", "license_error"}:
                 alerts += 1
         self.total_devices_value.setText(str(total))
         self.running_devices_value.setText(str(running))
@@ -826,19 +861,10 @@ class MainWindow(QMainWindow):
             return
         device_ip = str(device.get("ip", ""))
         app_name = self._selected_app_for_row(row)
-        overrides: dict[str, Any] = {}
-        app_overrides = device.get("app_overrides", {})
-        if isinstance(app_overrides, dict):
-            overrides = app_overrides.get(app_name, {}) or {}
-        template_root = Path("runtime/templates") / app_name
-        if not isinstance(overrides, dict):
-            overrides = {}
-        dialog_config = _deep_merge(_app_default_config(app_name), overrides)
-        override_templates = overrides.get("templates", {}) if isinstance(overrides.get("templates", {}), dict) else {}
-        dialog_config["templates"] = {
-            "buttons": str(override_templates.get("buttons") or template_root / "buttons"),
-            "screens": str(override_templates.get("screens") or template_root / "screens"),
-        }
+        template_root = Path("apps") / app_name / "templates"
+        dialog_config = _deep_merge(_app_default_config(app_name), self.config_manager.get_app_overrides(app_name))
+        dialog_config = _deep_merge(dialog_config, self.config_manager.get_device_runtime_overrides(device_ip))
+        dialog_config = _deep_merge(dialog_config, self.config_manager.get_device_app_overrides(device_ip, app_name))
         dialog = AppConfigDialog(
             dialog_config,
             device_ip=device_ip,
@@ -848,13 +874,83 @@ class MainWindow(QMainWindow):
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        app_overrides = device.get("app_overrides", {}) if isinstance(device.get("app_overrides", {}), dict) else {}
-        app_overrides[app_name] = dialog.values()
-        self.config_manager.update_device(device_ip, {"app_overrides": app_overrides})
+        values = dialog.values()
+        app_updates = {
+            key: copy.deepcopy(values[key])
+            for key in (
+                "ocr",
+                "ocr_modes",
+                "templates",
+                "match_threshold",
+            )
+            if key in values
+        }
+        runtime_updates = {
+            key: copy.deepcopy(values[key])
+            for key in ("poll_interval", "step_timeout", "keep_awake_interval_seconds", "exclude_ocr_wait_from_step_timeout")
+            if key in values
+        }
+        persona = values.get("persona", {})
+        device_app_updates = {"persona": copy.deepcopy(persona)} if isinstance(persona, dict) else {}
+
+        self.config_manager.update_app_config(app_name, app_updates)
+        self.config_manager.update_device_runtime(device_ip, runtime_updates)
+        self.config_manager.update_device_app_overrides(device_ip, app_name, device_app_updates)
         QMessageBox.information(self, "配置", f"{device_ip} / {app_name} 配置已保存")
+
+    def _edit_device_settings(self, row: int) -> None:
+        device = self._device_for_row(row)
+        if not device:
+            return
+        device_ip = str(device.get("ip", ""))
+        app_name = self._selected_app_for_row(row)
+        dialog_config = _deep_merge(_app_default_config(app_name), self.config_manager.get_app_overrides(app_name))
+        dialog_config = _deep_merge(dialog_config, self.config_manager.get_device_app_overrides(device_ip, app_name))
+        dialog = DeviceSettingsDialog(
+            dialog_config,
+            device_ip=device_ip,
+            app_name=app_name,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.config_manager.update_device_app_overrides(device_ip, app_name, dialog.values())
+        QMessageBox.information(self, "设备设置", f"{device_ip} / {app_name} 设备设置已保存")
 
     def _toggle_logs(self) -> None:
         self.logs.setVisible(self.log_toggle.isChecked())
+        if self.log_toggle.isChecked():
+            self._render_logs()
+
+    def _refresh_log_device_filter(self, devices: list[dict[str, Any]]) -> None:
+        if not hasattr(self, "log_device_filter"):
+            return
+        current = self.log_device_filter.currentData()
+        self.log_device_filter.blockSignals(True)
+        self.log_device_filter.clear()
+        self.log_device_filter.addItem("全部设备", "")
+        for device in devices:
+            if not isinstance(device, dict):
+                continue
+            device_ip = str(device.get("ip", "") or "").strip()
+            if device_ip:
+                self.log_device_filter.addItem(device_ip, device_ip)
+        index = self.log_device_filter.findData(current)
+        self.log_device_filter.setCurrentIndex(index if index >= 0 else 0)
+        self.log_device_filter.blockSignals(False)
+        self._render_logs()
+
+    def _render_logs(self, *_args: Any) -> None:
+        if not hasattr(self, "logs"):
+            return
+        selected_ip = ""
+        if hasattr(self, "log_device_filter"):
+            selected_ip = str(self.log_device_filter.currentData() or "")
+        self.logs.clear()
+        for event in self.log_events:
+            if selected_ip and event.device_ip != selected_ip:
+                continue
+            self.logs.append(self._format_log_event(event))
 
     def _format_log_event(self, event: WorkerEvent) -> str:
         payload = event.payload or {}
@@ -892,6 +988,29 @@ class MainWindow(QMainWindow):
             return f"[{event.level}] {event.device_ip}: 心遇回复 [{contact}] {reply_text}"
         if event.message == "xinyu_send_clicks":
             return f"[{event.level}] {event.device_ip}: 心遇发送点击次数 {payload.get('clicks', '')}"
+        if event.message == "xinyu_balance":
+            return f"[{event.level}] {event.device_ip}: 心遇余额 {payload.get('balance', '')}"
+        if event.message == "xinyu_balance_failed":
+            return f"[{event.level}] {event.device_ip}: 心遇余额读取失败 {payload.get('error', '')}"
+        if event.message == "huanyou_balance":
+            return f"[{event.level}] {event.device_ip}: 欢友余额 {payload.get('balance', '')}"
+        if event.message == "huanyou_balance_failed":
+            return f"[{event.level}] {event.device_ip}: 欢友余额读取失败 {payload.get('error', '')}"
+        if event.message == "robot_monitor_before_operation":
+            operation = str(payload.get("operation", "") or "")
+            recent_count = len(payload.get("recent_statuses", []) or [])
+            current_status = payload.get("current_status", {}) if isinstance(payload.get("current_status", {}), dict) else {}
+            ok = current_status.get("ok")
+            error = str(current_status.get("error", "") or "")
+            suffix = "状态正常" if ok else f"状态异常 {error}".strip()
+            return f"[{event.level}] {event.device_ip}: 机械臂监控 {operation} 前，最近 {recent_count} 步，{suffix}"
+        if event.message == "robot_monitor_after_operation":
+            operation = str(payload.get("operation", "") or "")
+            ok_text = "成功" if bool(payload.get("ok")) else "失败"
+            elapsed = payload.get("elapsed_seconds", "")
+            error = str(payload.get("error", "") or "")
+            suffix = f"，{error}" if error else ""
+            return f"[{event.level}] {event.device_ip}: 机械臂监控 {operation} {ok_text}，用时 {elapsed}s{suffix}"
         if event.message in {"memory hit", "memory miss", "memory updated", "memory lookup failed", "memory update failed"}:
             contact = str(payload.get("contact", "") or "")
             conversation_id = str(payload.get("conversation_id", "") or "")
@@ -916,21 +1035,35 @@ class MainWindow(QMainWindow):
                 event = self.events.get_nowait()
             except queue.Empty:
                 break
-            self.logs.append(self._format_log_event(event))
+            self.log_events.append(event)
+            selected_ip = ""
+            if hasattr(self, "log_device_filter"):
+                selected_ip = str(self.log_device_filter.currentData() or "")
+            if not selected_ip or event.device_ip == selected_ip:
+                self.logs.append(self._format_log_event(event))
             if event.level == "status":
                 if self._row_status_for_device(event.device_ip) in {"stopping", "stopped"}:
                     continue
                 is_open = bool((event.payload or {}).get("is_circuit_open"))
+                current_step = str((event.payload or {}).get("current_step", "") or "")
                 detail = strip_status_coordinates(str((event.payload or {}).get("current_step_label", "") or ""))
                 reply_round_count = int((event.payload or {}).get("reply_round_count") or 0)
                 average_reply_seconds = (event.payload or {}).get("average_reply_seconds")
                 self._set_row_average_reply_time(event.device_ip, average_reply_seconds, reply_round_count)
-                self._set_row_status(event.device_ip, "circuit_open" if is_open else "running", detail)
+                if is_open:
+                    row_status = "circuit_open"
+                elif current_step.startswith(("black_screen", "no_phone")):
+                    row_status = "abnormal"
+                else:
+                    row_status = "running"
+                self._set_row_status(event.device_ip, row_status, detail)
             elif event.message in {"paused", "stopped", "stopping"}:
                 if event.message == "stopped":
                     self._finalize_unattended_timer(event.device_ip)
                 detail = str((event.payload or {}).get("detail", "") or "")
                 self._set_row_status(event.device_ip, event.message, detail)
+            elif event.message in {"xinyu_balance", "huanyou_balance"}:
+                self._set_row_balance(event.device_ip, str((event.payload or {}).get("balance", "") or ""))
         self._refresh_unattended_durations()
 
 
@@ -1027,7 +1160,7 @@ class _LegacyAppConfigDialog(QDialog):
 
         ocr_modes = overrides.get("ocr_modes", {}) if isinstance(overrides.get("ocr_modes", {}), dict) else {}
         self.ocr_mode_fields: dict[str, dict[str, Any]] = {}
-        for mode_key, mode_label in [("dialogue", "对话模式"), ("list", "列表模式")]:
+        for mode_key, mode_label in [("dialogue", "\u5bf9\u8bdd\u6a21\u5f0f"), ("list", "\u5217\u8868\u6a21\u5f0f"), ("points", "\u79ef\u5206\u6a21\u5f0f")]:
             mode_config = ocr_modes.get(mode_key, {}) if isinstance(ocr_modes.get(mode_key, {}), dict) else {}
             preprocess = mode_config.get("preprocess", {}) if isinstance(mode_config.get("preprocess", {}), dict) else {}
             rules = mode_config.get("rules", {}) if isinstance(mode_config.get("rules", {}), dict) else {}
@@ -1076,7 +1209,14 @@ class _LegacyAppConfigDialog(QDialog):
         template_page = QWidget()
         template_layout = QVBoxLayout(template_page)
         template_layout.setContentsMargins(0, 0, 0, 0)
-        self.template_manager = TemplateManagerWidget(template_root, template_page)
+        self.template_manager = TemplateManagerWidget(
+            template_root,
+            self.device_ip,
+            self.app_name,
+            self.overrides,
+            show_offset_controls=False,
+            parent=template_page,
+        )
         template_layout.addWidget(self.template_manager)
         tabs.addTab(template_page, "模板管理")
 
@@ -1169,6 +1309,9 @@ class _LegacyAppConfigDialog(QDialog):
             },
             "persona": {key: field.text().strip() for key, field in self.persona_inputs.items()},
         })
+        if self.app_name == "huanyou":
+            values["next_message_click_x_offset"] = self.template_manager.next_message_click_x_offset
+            values["next_message_click_y_offset"] = self.template_manager.next_message_click_y_offset
         return values
 
 
@@ -1280,6 +1423,14 @@ class _LegacyTemplateManagerWidget(QWidget):
 class PopupCropLabel(QWidget):
     def __init__(self, pixmap: QPixmap, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.origin = QPoint()
+        self.selection = QRect()
+        self.on_point_selected: Any | None = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setMouseTracking(True)
+        self.set_pixmap(pixmap)
+
+    def set_pixmap(self, pixmap: QPixmap) -> None:
         self.source_pixmap = pixmap
         self.display_pixmap = pixmap.scaled(
             760,
@@ -1287,17 +1438,25 @@ class PopupCropLabel(QWidget):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        self.setFixedSize(self.display_pixmap.size())
-        self.setMouseTracking(True)
         self.origin = QPoint()
         self.selection = QRect()
-        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setFixedSize(self.display_pixmap.size())
+        self.update()
+
+    def _display_point_to_source_ratio(self, point: QPoint) -> tuple[float, float]:
+        width = max(1, self.display_pixmap.width())
+        height = max(1, self.display_pixmap.height())
+        x = max(0.0, min(1.0, point.x() / width))
+        y = max(0.0, min(1.0, point.y() / height))
+        return round(x, 4), round(y, 4)
 
     def mousePressEvent(self, event: Any) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
             return
         self.origin = self._clamp_point(event.position().toPoint())
         self.selection = QRect(self.origin, self.origin)
+        if callable(self.on_point_selected):
+            self.on_point_selected(*self._display_point_to_source_ratio(self.origin))
 
     def mouseMoveEvent(self, event: Any) -> None:
         if not event.buttons() & Qt.MouseButton.LeftButton:
@@ -1309,6 +1468,8 @@ class PopupCropLabel(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         self.selection = QRect(self.origin, self._clamp_point(event.position().toPoint())).normalized()
+        if callable(self.on_point_selected):
+            self.on_point_selected(*self._display_point_to_source_ratio(self.selection.center()))
         self.update()
 
     def paintEvent(self, event: Any) -> None:
@@ -1339,23 +1500,26 @@ class PopupCropLabel(QWidget):
 
 
 class PopupCropDialog(QDialog):
-    def __init__(self, image: Image.Image, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        image: Image.Image,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.source_image = image.convert("RGB")
         self.cropped_image: Image.Image | None = None
-        self.setWindowTitle("选择弹窗区域")
-        self.resize(860, 720)
+        self.setWindowTitle("??????")
+        self.resize(880, 720)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        help_label = QLabel("拖拽框选弹窗区域，然后点击“保存弹窗”。")
+        help_label = QLabel("??????????????")
         help_label.setObjectName("HelperLabel")
         root.addWidget(help_label)
 
-        qimage = ImageQt(self.source_image)
-        self.crop_label = PopupCropLabel(QPixmap.fromImage(qimage))
+        self.crop_label = PopupCropLabel(_pixmap_from_pil_image(self.source_image))
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
@@ -1368,10 +1532,10 @@ class PopupCropDialog(QDialog):
         ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
         cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
         if ok_button:
-            ok_button.setText("保存弹窗")
+            ok_button.setText("????")
             ok_button.setObjectName("PrimaryButton")
         if cancel_button:
-            cancel_button.setText("取消")
+            cancel_button.setText("??")
         buttons.accepted.connect(self._accept_crop)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
@@ -1379,21 +1543,34 @@ class PopupCropDialog(QDialog):
     def _accept_crop(self) -> None:
         box = self.crop_label.crop_box()
         if box is None:
-            QMessageBox.warning(self, "未选择区域", "请先拖拽选择弹窗区域。")
+            QMessageBox.warning(self, "?????", "???????????")
             return
         self.cropped_image = self.source_image.crop(box)
         self.accept()
 
 
 class TemplateManagerWidget(QWidget):
-    def __init__(self, template_root: Path, device_ip: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        template_root: Path,
+        device_ip: str,
+        app_name: str,
+        overrides: dict[str, Any] | None = None,
+        show_offset_controls: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.template_root = template_root
         self.device_ip = device_ip
+        self.app_name = app_name
+        self.show_offset_controls = show_offset_controls
+        overrides = overrides if isinstance(overrides, dict) else {}
         self.buttons_dir = template_root / "buttons"
         self.screens_dir = template_root / "screens"
         self.buttons_dir.mkdir(parents=True, exist_ok=True)
         self.screens_dir.mkdir(parents=True, exist_ok=True)
+        self.next_message_click_x_offset = float(overrides.get("next_message_click_x_offset", 0.0) or 0.0)
+        self.next_message_click_y_offset = float(overrides.get("next_message_click_y_offset", 0.0) or 0.0)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1459,7 +1636,8 @@ class TemplateManagerWidget(QWidget):
 
     def _capture_popup_template(self) -> None:
         try:
-            image_bytes = RobotInterface(self.device_ip).get_transform_image(pre_move=True)
+            robot = RobotInterface(self.device_ip)
+            image_bytes = robot.get_transform_image(pre_move=True)
             image = ensure_portrait_image(image_bytes)
         except Exception as exc:
             QMessageBox.critical(self, "截图失败", f"无法从机械臂获取截图：{exc}")
@@ -1483,7 +1661,211 @@ class TemplateManagerWidget(QWidget):
         self.reload()
 
 
+class DeviceSettingsDialog(QDialog):
+    def __init__(
+        self,
+        overrides: dict[str, Any],
+        device_ip: str,
+        app_name: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.overrides = copy.deepcopy(overrides if isinstance(overrides, dict) else {})
+        self.device_ip = device_ip
+        self.app_name = app_name
+        self.setWindowTitle(f"设备设置 - {device_ip} / {app_name}")
+        self.resize(520, 300)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        header_panel = QFrame()
+        header_panel.setObjectName("DialogPanel")
+        header_layout = QVBoxLayout(header_panel)
+        header_layout.setContentsMargins(14, 12, 14, 12)
+        header_layout.setSpacing(4)
+        title = QLabel(f"设备设置 / {device_ip} / {app_name}")
+        title.setObjectName("DialogTitle")
+        header_layout.addWidget(title)
+        scope = QLabel("这里保存当前设备当前 App 的设备级补充配置。模板相关偏移会保存到 设备-App 级别。")
+        scope.setObjectName("HelperLabel")
+        scope.setWordWrap(True)
+        header_layout.addWidget(scope)
+        root.addWidget(header_panel)
+
+        panel = QFrame()
+        panel.setObjectName("InsetPanel")
+        panel_root = QVBoxLayout(panel)
+        panel_root.setContentsMargins(14, 12, 14, 12)
+        panel_root.setSpacing(8)
+        section_title = QLabel("模板点击偏移")
+        section_title.setObjectName("SectionLabel")
+        panel_root.addWidget(section_title)
+        section_help = QLabel("用于模板相关点击坐标的额外偏移。当前主要给欢友“下一条未读”点击使用。")
+        section_help.setObjectName("HelperLabel")
+        section_help.setWordWrap(True)
+        panel_root.addWidget(section_help)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setSpacing(10)
+        panel_root.addLayout(form)
+
+        self.next_message_click_x_offset = NoWheelDoubleSpinBox()
+        self.next_message_click_x_offset.setRange(-0.2, 0.2)
+        self.next_message_click_x_offset.setDecimals(3)
+        self.next_message_click_x_offset.setSingleStep(0.001)
+        self.next_message_click_x_offset.setValue(float(self.overrides.get("next_message_click_x_offset", 0.02) or 0.02))
+        form.addRow("点击 X 偏移", self.next_message_click_x_offset)
+
+        self.next_message_click_y_offset = NoWheelDoubleSpinBox()
+        self.next_message_click_y_offset.setRange(-0.2, 0.2)
+        self.next_message_click_y_offset.setDecimals(3)
+        self.next_message_click_y_offset.setSingleStep(0.001)
+        self.next_message_click_y_offset.setValue(float(self.overrides.get("next_message_click_y_offset", 0.0) or 0.0))
+        form.addRow("点击 Y 偏移", self.next_message_click_y_offset)
+
+        root.addWidget(panel)
+        root.addStretch(1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if ok_button:
+            ok_button.setText("保存")
+            ok_button.setObjectName("PrimaryButton")
+        if cancel_button:
+            cancel_button.setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def values(self) -> dict[str, Any]:
+        return {
+            "next_message_click_x_offset": self.next_message_click_x_offset.value(),
+            "next_message_click_y_offset": self.next_message_click_y_offset.value(),
+        }
+
+
 class AppConfigDialog(QDialog):
+    def __init__(
+        self,
+        overrides: dict[str, Any],
+        device_ip: str,
+        app_name: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.overrides = copy.deepcopy(overrides if isinstance(overrides, dict) else {})
+        self.device_ip = device_ip
+        self.app_name = app_name
+        self.setWindowTitle(f"设备设置 - {device_ip} / {app_name}")
+        self.resize(620, 360)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        header_panel = QFrame()
+        header_panel.setObjectName("DialogPanel")
+        header_layout = QVBoxLayout(header_panel)
+        header_layout.setContentsMargins(14, 12, 14, 12)
+        header_layout.setSpacing(4)
+        title = QLabel(f"设备设置 / {device_ip} / {app_name}")
+        title.setObjectName("DialogTitle")
+        header_layout.addWidget(title)
+        scope = QLabel("这里保存当前设备当前 App 的补充配置，不同 App 会显示不同内容。")
+        scope.setObjectName("HelperLabel")
+        scope.setWordWrap(True)
+        header_layout.addWidget(scope)
+        root.addWidget(header_panel)
+
+        body = QFrame()
+        body.setObjectName("InsetPanel")
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(14, 12, 14, 12)
+        body_layout.setSpacing(10)
+        root.addWidget(body)
+
+        if self.app_name == "huanyou":
+            self._build_huanyou_offset_panel(body_layout)
+        else:
+            empty_label = QLabel("当前 App 暂无可配置的设备级补充项。")
+            empty_label.setObjectName("HelperLabel")
+            empty_label.setWordWrap(True)
+            body_layout.addWidget(empty_label)
+
+        root.addStretch(1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if ok_button:
+            ok_button.setText("保存")
+            ok_button.setObjectName("PrimaryButton")
+        if cancel_button:
+            cancel_button.setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _build_huanyou_offset_panel(self, root: QVBoxLayout) -> None:
+        title = QLabel("欢友偏移")
+        title.setObjectName("SectionLabel")
+        root.addWidget(title)
+        help_label = QLabel("这里分别保存“新招呼”和“下一条”的点击偏移。")
+        help_label.setObjectName("HelperLabel")
+        help_label.setWordWrap(True)
+        root.addWidget(help_label)
+
+        new_greeting_form = QFormLayout()
+        new_greeting_form.setContentsMargins(0, 4, 0, 0)
+        new_greeting_form.setSpacing(10)
+        root.addLayout(new_greeting_form)
+        self.new_greeting_click_x_offset = self._offset_spin(self.overrides.get("new_greeting_click_x_offset", 0.0))
+        self.new_greeting_click_y_offset = self._offset_spin(self.overrides.get("new_greeting_click_y_offset", 0.0))
+        new_greeting_form.addRow("新招呼 X 偏移", self.new_greeting_click_x_offset)
+        new_greeting_form.addRow("新招呼 Y 偏移", self.new_greeting_click_y_offset)
+
+        next_message_title = QLabel("下一条偏移")
+        next_message_title.setObjectName("SectionLabel")
+        root.addWidget(next_message_title)
+        next_message_help = QLabel("用于点击“下一条”按钮时的额外偏移。")
+        next_message_help.setObjectName("HelperLabel")
+        next_message_help.setWordWrap(True)
+        root.addWidget(next_message_help)
+
+        next_message_form = QFormLayout()
+        next_message_form.setContentsMargins(0, 4, 0, 0)
+        next_message_form.setSpacing(10)
+        root.addLayout(next_message_form)
+        self.next_message_click_x_offset = self._offset_spin(self.overrides.get("next_message_click_x_offset", 0.0))
+        self.next_message_click_y_offset = self._offset_spin(self.overrides.get("next_message_click_y_offset", 0.0))
+        next_message_form.addRow("下一条 X 偏移", self.next_message_click_x_offset)
+        next_message_form.addRow("下一条 Y 偏移", self.next_message_click_y_offset)
+
+    def _offset_spin(self, value: Any) -> QDoubleSpinBox:
+        spin = NoWheelDoubleSpinBox()
+        spin.setRange(-0.2, 0.2)
+        spin.setDecimals(3)
+        spin.setSingleStep(0.001)
+        spin.setValue(float(value or 0.0))
+        return spin
+
+    def values(self) -> dict[str, Any]:
+        if self.app_name != "huanyou":
+            return {}
+        return {
+            "new_greeting_click_x_offset": self.new_greeting_click_x_offset.value(),
+            "new_greeting_click_y_offset": self.new_greeting_click_y_offset.value(),
+            "next_message_click_x_offset": self.next_message_click_x_offset.value(),
+            "next_message_click_y_offset": self.next_message_click_y_offset.value(),
+        }
     def __init__(
         self,
         overrides: dict[str, Any],
@@ -1512,8 +1894,9 @@ class AppConfigDialog(QDialog):
         title = QLabel(f"设备配置 / {device_ip} / {app_name}")
         title.setObjectName("DialogTitle")
         header_layout.addWidget(title)
-        scope = QLabel("当前设置只作用于这台设备当前选中的 App。")
+        scope = QLabel("运行设置保存到设备级别；OCR设置和模板管理保存到 App 级别；人设保存到 设备-App 级别；模板偏移请在设备设置里改。")
         scope.setObjectName("HelperLabel")
+        scope.setWordWrap(True)
         header_layout.addWidget(scope)
         root.addWidget(header_panel)
 
@@ -1574,6 +1957,12 @@ class AppConfigDialog(QDialog):
         self.step_timeout.setRange(1, 300)
         self.step_timeout.setValue(int(overrides.get("step_timeout", 10)))
         form.addRow("单步超时（秒）", self.step_timeout)
+
+        self.exclude_ocr_wait_from_step_timeout = QCheckBox("OCR等待不计入单步超时")
+        self.exclude_ocr_wait_from_step_timeout.setChecked(
+            bool(overrides.get("exclude_ocr_wait_from_step_timeout", True))
+        )
+        form.addRow("", self.exclude_ocr_wait_from_step_timeout)
 
         self.keep_awake_interval_seconds = QSpinBox()
         self.keep_awake_interval_seconds.setRange(0, 86400)
@@ -1695,7 +2084,7 @@ class AppConfigDialog(QDialog):
         keyword_form.addRow("整条对话命中即丢弃", self.dialogue_line_excluded_keywords)
 
         self.ocr_mode_fields: dict[str, dict[str, Any]] = {}
-        for mode_key, mode_label in [("dialogue", "对话模式"), ("list", "列表模式")]:
+        for mode_key, mode_label in [("dialogue", "\u5bf9\u8bdd\u6a21\u5f0f"), ("list", "\u5217\u8868\u6a21\u5f0f"), ("points", "\u79ef\u5206\u6a21\u5f0f")]:
             mode_config = ocr_modes.get(mode_key, {}) if isinstance(ocr_modes.get(mode_key, {}), dict) else {}
             preprocess = mode_config.get("preprocess", {}) if isinstance(mode_config.get("preprocess", {}), dict) else {}
             rules = mode_config.get("rules", {}) if isinstance(mode_config.get("rules", {}), dict) else {}
@@ -1777,7 +2166,14 @@ class AppConfigDialog(QDialog):
         page = QWidget()
         page_root = QVBoxLayout(page)
         page_root.setContentsMargins(0, 0, 0, 0)
-        self.template_manager = TemplateManagerWidget(template_root, self.device_ip, page)
+        self.template_manager = TemplateManagerWidget(
+            template_root,
+            self.device_ip,
+            self.app_name,
+            self.overrides,
+            show_offset_controls=False,
+            parent=page,
+        )
         page_root.addWidget(self.template_manager)
         self.tabs.addTab(page, "模板管理")
 
@@ -1829,6 +2225,10 @@ class AppConfigDialog(QDialog):
 
     def values(self) -> dict[str, Any]:
         values = dict(self.overrides)
+        values.pop("new_greeting_click_x_offset", None)
+        values.pop("new_greeting_click_y_offset", None)
+        values.pop("next_message_click_x_offset", None)
+        values.pop("next_message_click_y_offset", None)
         ocr = dict(values.get("ocr", {}) if isinstance(values.get("ocr", {}), dict) else {})
         ocr["det_db_thresh"] = self.det_db_thresh.value()
         ocr["rec_thresh"] = self.rec_thresh.value()
@@ -1844,7 +2244,6 @@ class AppConfigDialog(QDialog):
             round(chat_bottom - chat_top, 3),
         ]
         ocr["regions"] = regions
-
         ocr_modes = dict(values.get("ocr_modes", {}) if isinstance(values.get("ocr_modes", {}), dict) else {})
         for mode_key, fields in self.ocr_mode_fields.items():
             mode_config = dict(ocr_modes.get(mode_key, {}) if isinstance(ocr_modes.get(mode_key, {}), dict) else {})
@@ -1870,6 +2269,7 @@ class AppConfigDialog(QDialog):
             "poll_interval": self.poll_interval.value(),
             "step_timeout": self.step_timeout.value(),
             "keep_awake_interval_seconds": self.keep_awake_interval_seconds.value(),
+            "exclude_ocr_wait_from_step_timeout": self.exclude_ocr_wait_from_step_timeout.isChecked(),
             "match_threshold": self.match_threshold.value(),
             "ocr": ocr,
             "ocr_modes": ocr_modes,
@@ -1880,6 +2280,398 @@ class AppConfigDialog(QDialog):
             "persona": {key: field.text().strip() for key, field in self.persona_inputs.items()},
         })
         return values
+
+
+class DeviceSettingsDialogFixed(QDialog):
+    def __init__(
+        self,
+        overrides: dict[str, Any],
+        device_ip: str,
+        app_name: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.overrides = copy.deepcopy(overrides if isinstance(overrides, dict) else {})
+        self.device_ip = device_ip
+        self.app_name = app_name
+        self.setWindowTitle(f"设备设置 - {device_ip} / {app_name}")
+        self.resize(620, 360)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        header_panel = QFrame()
+        header_panel.setObjectName("DialogPanel")
+        header_layout = QVBoxLayout(header_panel)
+        header_layout.setContentsMargins(14, 12, 14, 12)
+        header_layout.setSpacing(4)
+        title = QLabel(f"设备设置 / {device_ip} / {app_name}")
+        title.setObjectName("DialogTitle")
+        header_layout.addWidget(title)
+        scope = QLabel("这里保存当前设备当前 App 的补充配置，不同 App 会显示不同内容。")
+        scope.setObjectName("HelperLabel")
+        scope.setWordWrap(True)
+        header_layout.addWidget(scope)
+        root.addWidget(header_panel)
+
+        panel = QFrame()
+        panel.setObjectName("InsetPanel")
+        panel_root = QVBoxLayout(panel)
+        panel_root.setContentsMargins(14, 12, 14, 12)
+        panel_root.setSpacing(10)
+        root.addWidget(panel)
+
+        if self.app_name == "huanyou":
+            self._build_huanyou_offset_panel(panel_root)
+        else:
+            empty_label = QLabel("当前 App 暂无可配置的设备级补充项。")
+            empty_label.setObjectName("HelperLabel")
+            empty_label.setWordWrap(True)
+            panel_root.addWidget(empty_label)
+
+        root.addStretch(1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if ok_button:
+            ok_button.setText("保存")
+            ok_button.setObjectName("PrimaryButton")
+        if cancel_button:
+            cancel_button.setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _offset_spin(self, value: Any) -> QDoubleSpinBox:
+        spin = NoWheelDoubleSpinBox()
+        spin.setRange(-0.2, 0.2)
+        spin.setDecimals(3)
+        spin.setSingleStep(0.001)
+        spin.setValue(float(value or 0.0))
+        return spin
+
+    def _build_huanyou_offset_panel(self, root: QVBoxLayout) -> None:
+        new_greeting_title = QLabel("欢友：新招呼偏移")
+        new_greeting_title.setObjectName("SectionLabel")
+        root.addWidget(new_greeting_title)
+        new_greeting_help = QLabel("用于点击“新招呼”按钮时的额外偏移。")
+        new_greeting_help.setObjectName("HelperLabel")
+        new_greeting_help.setWordWrap(True)
+        root.addWidget(new_greeting_help)
+
+        new_greeting_form = QFormLayout()
+        new_greeting_form.setContentsMargins(0, 4, 0, 0)
+        new_greeting_form.setSpacing(10)
+        self.new_greeting_click_x_offset = self._offset_spin(self.overrides.get("new_greeting_click_x_offset", 0.0))
+        self.new_greeting_click_y_offset = self._offset_spin(self.overrides.get("new_greeting_click_y_offset", 0.0))
+        new_greeting_form.addRow("新招呼 X 偏移", self.new_greeting_click_x_offset)
+        new_greeting_form.addRow("新招呼 Y 偏移", self.new_greeting_click_y_offset)
+        root.addLayout(new_greeting_form)
+
+        next_message_title = QLabel("欢友：下一条偏移")
+        next_message_title.setObjectName("SectionLabel")
+        root.addWidget(next_message_title)
+        next_message_help = QLabel("用于点击“下一条”按钮时的额外偏移。")
+        next_message_help.setObjectName("HelperLabel")
+        next_message_help.setWordWrap(True)
+        root.addWidget(next_message_help)
+
+        next_message_form = QFormLayout()
+        next_message_form.setContentsMargins(0, 4, 0, 0)
+        next_message_form.setSpacing(10)
+        self.next_message_click_x_offset = self._offset_spin(self.overrides.get("next_message_click_x_offset", 0.0))
+        self.next_message_click_y_offset = self._offset_spin(self.overrides.get("next_message_click_y_offset", 0.0))
+        next_message_form.addRow("下一条 X 偏移", self.next_message_click_x_offset)
+        next_message_form.addRow("下一条 Y 偏移", self.next_message_click_y_offset)
+        root.addLayout(next_message_form)
+
+    def values(self) -> dict[str, Any]:
+        if self.app_name != "huanyou":
+            return {}
+        return {
+            "new_greeting_click_x_offset": self.new_greeting_click_x_offset.value(),
+            "new_greeting_click_y_offset": self.new_greeting_click_y_offset.value(),
+            "next_message_click_x_offset": self.next_message_click_x_offset.value(),
+            "next_message_click_y_offset": self.next_message_click_y_offset.value(),
+        }
+
+
+class DeviceSettingsDialogInteractive(QDialog):
+    def __init__(
+        self,
+        overrides: dict[str, Any],
+        device_ip: str,
+        app_name: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.overrides = copy.deepcopy(overrides if isinstance(overrides, dict) else {})
+        self.device_ip = device_ip
+        self.app_name = app_name
+        self.selected_point: tuple[float, float] | None = None
+        self.offset_spin_boxes: dict[str, tuple[QDoubleSpinBox, QDoubleSpinBox]] = {}
+        self.test_target_combo: QComboBox | None = None
+        self.setWindowTitle(f"设备设置 - {device_ip} / {app_name}")
+        self.resize(1180, 760)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        header_panel = QFrame()
+        header_panel.setObjectName("DialogPanel")
+        header_layout = QVBoxLayout(header_panel)
+        header_layout.setContentsMargins(14, 12, 14, 12)
+        header_layout.setSpacing(4)
+        title = QLabel(f"设备设置 / {device_ip} / {app_name}")
+        title.setObjectName("DialogTitle")
+        header_layout.addWidget(title)
+        scope = QLabel("这里保存当前设备当前 App 的设备级补充配置。截图取点、偏移设置和测试点击都在这里完成，保存级别为设备-App。")
+        scope.setObjectName("HelperLabel")
+        scope.setWordWrap(True)
+        header_layout.addWidget(scope)
+        root.addWidget(header_panel)
+
+        content = QHBoxLayout()
+        content.setContentsMargins(0, 0, 0, 0)
+        content.setSpacing(12)
+        root.addLayout(content, 1)
+
+        screenshot_panel = QFrame()
+        screenshot_panel.setObjectName("InsetPanel")
+        screenshot_layout = QVBoxLayout(screenshot_panel)
+        screenshot_layout.setContentsMargins(14, 12, 14, 12)
+        screenshot_layout.setSpacing(8)
+        screenshot_title = QLabel("当前设备截图")
+        screenshot_title.setObjectName("SectionLabel")
+        screenshot_layout.addWidget(screenshot_title)
+        screenshot_help = QLabel("点击“刷新截图”后，可在图片上点一个基点坐标。右侧会自动叠加当前偏移，方便直接测试点击。")
+        screenshot_help.setObjectName("HelperLabel")
+        screenshot_help.setWordWrap(True)
+        screenshot_layout.addWidget(screenshot_help)
+        self.refresh_screenshot_button = QPushButton("刷新截图")
+        self.refresh_screenshot_button.setObjectName("PrimaryButton")
+        self.refresh_screenshot_button.clicked.connect(self._refresh_screenshot)
+        screenshot_layout.addWidget(self.refresh_screenshot_button, 0, Qt.AlignmentFlag.AlignLeft)
+
+        placeholder = QPixmap(720, 1280)
+        placeholder.fill(QColor("#f8fafc"))
+        self.crop_label = PopupCropLabel(placeholder)
+        self.crop_label.on_point_selected = self._update_selected_point
+
+        self.screenshot_scroll = QScrollArea()
+        self.screenshot_scroll.setWidgetResizable(False)
+        self.screenshot_scroll.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.screenshot_scroll.setWidget(self.crop_label)
+        screenshot_layout.addWidget(self.screenshot_scroll, 1)
+        content.addWidget(screenshot_panel, 1)
+
+        control_panel = QFrame()
+        control_panel.setObjectName("InsetPanel")
+        control_layout = QVBoxLayout(control_panel)
+        control_layout.setContentsMargins(14, 12, 14, 12)
+        control_layout.setSpacing(10)
+        content.addWidget(control_panel)
+
+        control_title = QLabel("偏移与测试")
+        control_title.setObjectName("SectionLabel")
+        control_layout.addWidget(control_title)
+        control_help = QLabel("你可以先设置偏移，再选图上的基点直接测试点击。后续新增动态字段时，也按当前 App 的设备级字段继续扩展。")
+        control_help.setObjectName("HelperLabel")
+        control_help.setWordWrap(True)
+        control_layout.addWidget(control_help)
+
+        field_specs = self._field_specs()
+        if field_specs:
+            target_form = QFormLayout()
+            target_form.setContentsMargins(0, 0, 0, 0)
+            target_form.setSpacing(8)
+            self.test_target_combo = QComboBox()
+            for field_key, field_label in field_specs:
+                self.test_target_combo.addItem(field_label, field_key)
+            self.test_target_combo.currentIndexChanged.connect(self._update_click_labels)
+            target_form.addRow("测试字段", self.test_target_combo)
+            control_layout.addLayout(target_form)
+        else:
+            no_fields_label = QLabel("当前 App 暂无设备级偏移字段。你仍然可以截图取点并测试原始点击坐标。")
+            no_fields_label.setObjectName("HelperLabel")
+            no_fields_label.setWordWrap(True)
+            control_layout.addWidget(no_fields_label)
+
+        coord_form = QFormLayout()
+        coord_form.setContentsMargins(0, 0, 0, 0)
+        coord_form.setSpacing(8)
+        self.point_x_label = QLabel("--")
+        self.point_y_label = QLabel("--")
+        self.click_x_label = QLabel("--")
+        self.click_y_label = QLabel("--")
+        coord_form.addRow("基点 X", self.point_x_label)
+        coord_form.addRow("基点 Y", self.point_y_label)
+        coord_form.addRow("点击 X", self.click_x_label)
+        coord_form.addRow("点击 Y", self.click_y_label)
+        control_layout.addLayout(coord_form)
+
+        for field_key, field_label in field_specs:
+            section_title = QLabel(f"{field_label} 偏移")
+            section_title.setObjectName("SectionLabel")
+            control_layout.addWidget(section_title)
+            section_help = QLabel(f"这里设置“{field_label}”相关内容的点击偏移，保存后立即写入当前设备当前 App。")
+            section_help.setObjectName("HelperLabel")
+            section_help.setWordWrap(True)
+            control_layout.addWidget(section_help)
+
+            section_form = QFormLayout()
+            section_form.setContentsMargins(0, 0, 0, 0)
+            section_form.setSpacing(8)
+            x_spin = self._offset_spin(self.overrides.get(f"{field_key}_click_x_offset", 0.0))
+            y_spin = self._offset_spin(self.overrides.get(f"{field_key}_click_y_offset", 0.0))
+            x_spin.valueChanged.connect(self._update_click_labels)
+            y_spin.valueChanged.connect(self._update_click_labels)
+            section_form.addRow("X 偏移", x_spin)
+            section_form.addRow("Y 偏移", y_spin)
+            control_layout.addLayout(section_form)
+            self.offset_spin_boxes[field_key] = (x_spin, y_spin)
+
+            if field_key == "new_greeting":
+                self.new_greeting_click_x_offset = x_spin
+                self.new_greeting_click_y_offset = y_spin
+            elif field_key == "next_message":
+                self.next_message_click_x_offset = x_spin
+                self.next_message_click_y_offset = y_spin
+
+        self.test_click_button = QPushButton("测试点击机械臂")
+        self.test_click_button.clicked.connect(self._test_click_point)
+        control_layout.addWidget(self.test_click_button, 0, Qt.AlignmentFlag.AlignLeft)
+        control_layout.addStretch(1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if ok_button:
+            ok_button.setText("保存")
+            ok_button.setObjectName("PrimaryButton")
+        if cancel_button:
+            cancel_button.setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _field_specs(self) -> list[tuple[str, str]]:
+        if self.app_name == "huanyou":
+            return [
+                ("new_greeting", "新招呼"),
+                ("next_message", "下一条"),
+            ]
+        return []
+
+    def _offset_spin(self, value: Any) -> QDoubleSpinBox:
+        spin = NoWheelDoubleSpinBox()
+        spin.setRange(-0.2, 0.2)
+        spin.setDecimals(3)
+        spin.setSingleStep(0.001)
+        spin.setValue(float(value or 0.0))
+        return spin
+
+    def _refresh_screenshot(self) -> None:
+        self.refresh_screenshot_button.setEnabled(False)
+        original_text = self.refresh_screenshot_button.text()
+        self.refresh_screenshot_button.setText("刷新中...")
+        try:
+            image_bytes = RobotInterface(self.device_ip).get_transform_image(pre_move=True)
+            image = ensure_portrait_image(image_bytes)
+            self._set_screenshot(image)
+        except Exception as exc:
+            QMessageBox.critical(self, "截图失败", f"无法从当前设备获取截图：{exc}")
+            return
+        finally:
+            self.refresh_screenshot_button.setEnabled(True)
+            self.refresh_screenshot_button.setText(original_text)
+
+    def _set_screenshot(self, image: Image.Image) -> None:
+        self.crop_label.set_pixmap(_pixmap_from_pil_image(image))
+        self.selected_point = None
+        self.point_x_label.setText("--")
+        self.point_y_label.setText("--")
+        self._update_click_labels()
+
+    def _selected_field_key(self) -> str | None:
+        if self.test_target_combo is not None and self.test_target_combo.count() > 0:
+            current = self.test_target_combo.currentData()
+            return str(current) if current is not None else None
+        if self.offset_spin_boxes:
+            return next(iter(self.offset_spin_boxes))
+        return None
+
+    def _field_offsets(self, field_key: str | None) -> tuple[float, float]:
+        if field_key is None:
+            return 0.0, 0.0
+        spins = self.offset_spin_boxes.get(field_key)
+        if spins is None:
+            return 0.0, 0.0
+        return spins[0].value(), spins[1].value()
+
+    def _apply_offset(self, field_key: str | None, point: tuple[float, float]) -> tuple[float, float]:
+        x, y = point
+        offset_x, offset_y = self._field_offsets(field_key)
+        if field_key == "new_greeting":
+            return (
+                round(min(0.98, max(0.02, x + offset_x)), 4),
+                round(min(0.98, max(0.02, y + offset_y)), 4),
+            )
+        if field_key == "next_message":
+            return (
+                round(min(0.98, x + offset_x), 4),
+                round(min(0.98, max(0.02, y + offset_y)), 4),
+            )
+        return round(x, 4), round(y, 4)
+
+    def _update_selected_point(self, x: float, y: float) -> None:
+        self.selected_point = (float(x), float(y))
+        self.point_x_label.setText(f"{x:.4f}")
+        self.point_y_label.setText(f"{y:.4f}")
+        self._update_click_labels()
+
+    def _current_click_point(self) -> tuple[float, float] | None:
+        if self.selected_point is None:
+            return None
+        return self._apply_offset(self._selected_field_key(), self.selected_point)
+
+    def _update_click_labels(self, *_args: Any) -> None:
+        point = self._current_click_point()
+        if point is None:
+            self.click_x_label.setText("--")
+            self.click_y_label.setText("--")
+            return
+        self.click_x_label.setText(f"{point[0]:.4f}")
+        self.click_y_label.setText(f"{point[1]:.4f}")
+
+    def _test_click_point(self) -> None:
+        point = self._current_click_point()
+        if point is None:
+            QMessageBox.warning(self, "未选择坐标", "请先刷新截图，并在图片上点击一个基点位置。")
+            return
+        try:
+            RobotInterface(self.device_ip).move_click(*point)
+        except Exception as exc:
+            QMessageBox.critical(self, "测试点击失败", f"机械臂点击失败：{exc}")
+            return
+        QMessageBox.information(self, "测试点击完成", f"已点击坐标：({point[0]:.4f}, {point[1]:.4f})")
+
+    def values(self) -> dict[str, Any]:
+        values: dict[str, Any] = {}
+        for field_key, (x_spin, y_spin) in self.offset_spin_boxes.items():
+            values[f"{field_key}_click_x_offset"] = x_spin.value()
+            values[f"{field_key}_click_y_offset"] = y_spin.value()
+        return values
+
+
+DeviceSettingsDialog = DeviceSettingsDialogInteractive
 
 
 def run_app(argv: list[str] | None = None) -> int:

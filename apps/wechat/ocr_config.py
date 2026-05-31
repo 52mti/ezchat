@@ -98,6 +98,8 @@ LIST_EXCLUDED_KEYWORDS = [
 
 LIST_CONTENT_EXCLUDED_KEYWORDS = ["推荐灵感"]
 
+LIST_NAME_SUFFIX_KEYWORDS = []
+
 
 # 对话模式配置，结构参考 zhaopiaochuli/dialogue_config.ini。
 # 这里的 rules 会在 run_ocr_mode(..., "dialogue") 时进入 build_dialogue_result()。
@@ -165,6 +167,8 @@ LIST_OCR_MODE = {
         "main_top_ratio": 0.12,
         "main_bottom_ratio": 0.92,
         "max_unread_count": 99,
+        "badge_position": "right",
+        "badge_default_unread_count": 1,
         # 微信列表：头像在左，名字/摘要在中间，未读数通常在右侧。
         "text_left_min_ratio": 0.16,
         "text_right_max_ratio": 0.78,
@@ -174,8 +178,14 @@ LIST_OCR_MODE = {
         "content_gap_min": 38,
         "content_gap_max": 62,
         "bottom_nav_top_ratio": 0.88,
+        "bottom_nav_accept_any_text": False,
         # 未读角标识别失败时，会按行右侧小区域再单独 OCR 一次。
         "badge_crop_padding": 6,
+        "right_badge_min_ratio": 0.82,
+        "red_badge_saturation_min": 80,
+        "red_badge_value_min": 80,
+        "content_like_name_min_length": 10,
+        "content_like_name_min_width_ratio": 0.24,
         "badge_ocr_scale": 6,
         "row_badge_ocr_scale": 4,
         "row_badge_min_confidence": 0.80,
@@ -188,6 +198,10 @@ LIST_OCR_MODE = {
         "row_strip_bottom_nav_margin": 4,
         # 底部导航只用于识别页面和防熄屏跳转，不会进入 message_list。
         "bottom_nav_keywords": ["消息", "通讯录", "发现", "视频号", "我"],
+        "top_nav_keywords": [],
+        "top_nav_top_ratio": 0.0,
+        "top_nav_bottom_ratio": 0.0,
+        "name_suffix_keywords": LIST_NAME_SUFFIX_KEYWORDS,
         # system_keywords：用于排除搜索框、底部导航、系统入口等非联系人行。
         "system_keywords": LIST_SYSTEM_KEYWORDS,
         # excluded_keywords：名字命中这些词时，这一整行不会作为联系人。
@@ -198,7 +212,7 @@ LIST_OCR_MODE = {
 }
 
 
-DEFAULT_OCR_MODES = {
+OCR_MODES = {
     "dialogue": DIALOGUE_OCR_MODE,
     "list": LIST_OCR_MODE,
 }

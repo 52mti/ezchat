@@ -6,6 +6,7 @@ from typing import Any
 from apps.coordinates import click_image_point
 from apps.photo_capture import capture_transform_image
 from apps.reporting import Reporter, format_point, report_step
+from apps.step_timing import exclude_ocr_wait_from_step_timeout
 from apps.utils import tts_input
 from vision import match, run_ocr_mode
 
@@ -36,6 +37,11 @@ def _report(reporter: Reporter | None, step: str, label: str, log_label: str | N
 
 def _threshold(config: dict[str, Any]) -> float:
     return float(config.get("match_threshold", 0.85))
+
+
+def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = None) -> dict[str, Any]:
+    with exclude_ocr_wait_from_step_timeout(config):
+        return run_ocr_mode(image, config, mode, region=region)
 
 
 def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> dict[str, float] | None:
@@ -142,7 +148,7 @@ def find_unread(
         return pos
 
     message_list_region = _region(cfg, "region.message_list")
-    ocr_result = run_ocr_mode(image, cfg, "list", region=message_list_region)
+    ocr_result = _run_ocr_mode(image, cfg, "list", region=message_list_region)
     for row in ocr_result["result"].get("message_list", []):
         if row.get("unread_count"):
             left, top, right, bottom = row["bounds"]
@@ -168,7 +174,7 @@ def read_message(
     image = capture_after_popups(robot, cfg, reporter=reporter)
     if template_path(cfg, CHAT_WINDOW_SCREEN) is not None and not is_screen(image, cfg, CHAT_WINDOW_SCREEN):
         raise StepUnavailable("chat window screen template did not match")
-    ocr_result = run_ocr_mode(image, cfg, "dialogue", region=_region(cfg, CHAT_AREA_REGION))
+    ocr_result = _run_ocr_mode(image, cfg, "dialogue", region=_region(cfg, CHAT_AREA_REGION))
     items = ocr_result["ocr_items"]
     if not items:
         raise StepUnavailable("OCR did not return chat text")

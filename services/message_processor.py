@@ -50,8 +50,8 @@ class MessageProcessor:
         contact_persona = {}
         if isinstance(contact_personas, dict):
             contact_persona = contact_personas.get(contact_name, {}) or {}
-        persona = _deep_merge(global_persona if isinstance(global_persona, dict) else {}, app_persona)
-        persona = _deep_merge(persona, device_persona)
+        persona = _deep_merge(global_persona if isinstance(global_persona, dict) else {}, device_persona)
+        persona = _deep_merge(persona, app_persona)
         return _deep_merge(persona, contact_persona if isinstance(contact_persona, dict) else {})
 
     def prepare_reply(self, message: dict[str, str]) -> ReplyAction:
