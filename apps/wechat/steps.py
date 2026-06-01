@@ -15,6 +15,7 @@ from apps.visual_assets import (
     CHAT_LIST_SCREEN,
     CHAT_WINDOW_SCREEN,
     all_screen_states,
+    back_button_template_paths,
     popup_template_paths,
     region_rule,
     screen_state_path,
@@ -112,24 +113,26 @@ def _unique_paths(paths: list[Path]) -> list[Path]:
 
 def _template_candidates(config: dict[str, Any], key: str, *, group: str) -> list[Path]:
     candidates: list[Path] = []
-    try:
-        if key in {CHAT_LIST_SCREEN, CHAT_WINDOW_SCREEN, BACK_BUTTON}:
-            existing = screen_state_path(config, key) if group == "screens" else template_path(config, key)
-            if existing is not None:
-                candidates.append(existing)
-        else:
-            existing = template_path(config, key)
-            if existing is not None:
-                candidates.append(existing)
-    except KeyError:
-        pass
-
-    aliases = SCREEN_TEMPLATE_ALIASES.get(key, ()) if group == "screens" else BUTTON_TEMPLATE_ALIASES.get(key, ())
-    root = template_root(config, "screens" if group == "screens" else "buttons")
-    for filename in aliases:
-        path = root / filename
-        if path.exists():
-            candidates.append(path)
+    if group == "buttons" and key == BACK_BUTTON:
+        candidates.extend(back_button_template_paths(config))
+    else:
+        try:
+            if key in {CHAT_LIST_SCREEN, CHAT_WINDOW_SCREEN, BACK_BUTTON}:
+                existing = screen_state_path(config, key) if group == "screens" else template_path(config, key)
+                if existing is not None:
+                    candidates.append(existing)
+            else:
+                existing = template_path(config, key)
+                if existing is not None:
+                    candidates.append(existing)
+        except KeyError:
+            pass
+        aliases = SCREEN_TEMPLATE_ALIASES.get(key, ()) if group == "screens" else BUTTON_TEMPLATE_ALIASES.get(key, ())
+        root = template_root(config, "screens" if group == "screens" else "buttons")
+        for filename in aliases:
+            path = root / filename
+            if path.exists():
+                candidates.append(path)
     return _unique_paths(candidates)
 
 

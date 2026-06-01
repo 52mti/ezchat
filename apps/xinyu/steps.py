@@ -14,13 +14,11 @@ from apps.step_timing import exclude_ocr_wait_from_step_timeout, step_deadline
 from apps.utils import tts_input
 from apps.visual_assets import (
     BACK_BUTTON,
-    CHAT_AREA_REGION,
     CHAT_LIST_SCREEN,
     CHAT_WINDOW_SCREEN,
-    MESSAGE_LIST_REGION,
     all_screen_states,
+    back_button_template_paths,
     popup_template_paths,
-    region_rule,
     screen_state_path,
     template_path,
     template_root,
@@ -81,7 +79,25 @@ BUTTON_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
 
 
 def _config(config: dict[str, Any] | None) -> dict[str, Any]:
-    return _deep_merge(DEFAULT_CONFIG, config or {})
+    cfg = _deep_merge(DEFAULT_CONFIG, config or {})
+    _disable_dialogue_region_filter(cfg)
+    return cfg
+
+
+def _disable_dialogue_region_filter(config: dict[str, Any]) -> None:
+    ocr_modes = config.get("ocr_modes")
+    if not isinstance(ocr_modes, dict):
+        return
+    dialogue = ocr_modes.get("dialogue")
+    if not isinstance(dialogue, dict):
+        return
+    rules = dialogue.get("rules")
+    if not isinstance(rules, dict):
+        return
+    basic_filter = rules.get("basic_filter")
+    if not isinstance(basic_filter, dict):
+        return
+    basic_filter["enable_center_y_region_filter"] = False
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -117,15 +133,6 @@ def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = N
         return run_ocr_mode(image, config, mode, region=region)
 
 
-def _region(config: dict[str, Any], key: str) -> Any:
-    current: Any = config
-    for part in region_rule(key).config_path:
-        if not isinstance(current, dict):
-            return None
-        current = current.get(part)
-    return current
-
-
 def _report(reporter: Reporter | None, step: str, label: str, log_label: str | None = None) -> None:
     report_step(reporter, step, label, log_label)
 
@@ -144,19 +151,21 @@ def _unique_paths(paths: list[Path]) -> list[Path]:
 
 def _template_candidates(config: dict[str, Any], key: str, *, group: str) -> list[Path]:
     candidates: list[Path] = []
-    try:
-        existing = screen_state_path(config, key) if group == "screens" else template_path(config, key)
-        if existing is not None:
-            candidates.append(existing)
-    except KeyError:
-        pass
-
-    aliases = SCREEN_TEMPLATE_ALIASES.get(key, ()) if group == "screens" else BUTTON_TEMPLATE_ALIASES.get(key, ())
-    root = template_root(config, "screens" if group == "screens" else "buttons")
-    for filename in aliases:
-        path = root / filename
-        if path.exists():
-            candidates.append(path)
+    if group == "buttons" and key in {BACK_BUTTON, BACK_BUTTON_2}:
+        candidates.extend(back_button_template_paths(config))
+    else:
+        try:
+            existing = screen_state_path(config, key) if group == "screens" else template_path(config, key)
+            if existing is not None:
+                candidates.append(existing)
+        except KeyError:
+            pass
+        aliases = SCREEN_TEMPLATE_ALIASES.get(key, ()) if group == "screens" else BUTTON_TEMPLATE_ALIASES.get(key, ())
+        root = template_root(config, "screens" if group == "screens" else "buttons")
+        for filename in aliases:
+            path = root / filename
+            if path.exists():
+                candidates.append(path)
     return _unique_paths(candidates)
 
 
@@ -654,7 +663,7 @@ def read_message(
     cfg = _config(config)
     current_image = image if image is not None else confirm_chat_window(robot, cfg, reporter=reporter)
     _report(reporter, "dialogue_ocr_read", "聊天详情 OCR")
-    ocr_result = _run_ocr_mode(current_image, cfg, "dialogue", region=_region(cfg, CHAT_AREA_REGION))
+    ocr_result = _run_ocr_mode(current_image, cfg, "dialogue", region=None)
     items = ocr_result["ocr_items"]
     if not items:
         raise StepUnavailable("OCR did not return chat text")
@@ -807,6 +816,8 @@ def ensure_send_cleared(
 def go_back(
     robot: Any,
     config: dict[str, Any] | None = None,
+    *,
+    double_click_on_first_attempt: bool = False,
     reporter: Reporter | None = None,
 ) -> None:
     cfg = _config(config)
@@ -816,45 +827,30 @@ def go_back(
     if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
         return
 
-    for _ in range(2):
+    for attempt in range(2):
         image = capture_after_popups(robot, cfg, label="go_back_button", reporter=reporter)
         pos = _template_center(image, cfg, BACK_BUTTON, group="buttons")
         if pos is None:
-            _report(reporter, "back_double_click", "返回按钮未找到")
+            _report(reporter, "back_click", "返回按钮未找到")
             raise StepUnavailable("back button was not found")
         click_point = pos
-        _report(reporter, "back_double_click", "点击返回", log_label=f"点击返回：{format_point(*click_point)}")
-        click_image_point(robot, *click_point)
+        click_times = 2 if attempt == 0 and double_click_on_first_attempt else 1
+        if click_times == 2:
+            _report(
+                reporter,
+                "back_click",
+                "发送后连续点击返回两次",
+                log_label=f"发送后连续点击返回两次：{format_point(*click_point)}",
+            )
+            click_image_point(robot, *click_point)
+            click_image_point(robot, *click_point)
+        else:
+            _report(reporter, "back_click", "点击返回", log_label=f"点击返回：{format_point(*click_point)}")
+            click_image_point(robot, *click_point)
         time.sleep(0.4)
+        image = capture_after_popups(robot, cfg, label="after_go_back", reporter=reporter)
+        if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
+            return
 
-    image = capture_after_popups(robot, cfg, label="after_go_back", reporter=reporter)
-    if not _matches_screen(image, cfg, CHAT_LIST_SCREEN):
-        raise StepUnavailable("failed to return to chat list")
-
-
-def go_back(
-    robot: Any,
-    config: dict[str, Any] | None = None,
-    reporter: Reporter | None = None,
-) -> None:
-    cfg = _config(config)
-    _report(reporter, "return_to_list", "返回聊天列表")
-    ensure_send_cleared(robot, cfg, reporter=reporter)
-    image = capture_after_popups(robot, cfg, label="go_back", reporter=reporter)
-    if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
-        return
-
-    pos = _template_center(image, cfg, BACK_BUTTON, group="buttons")
-    if pos is None:
-        _report(reporter, "back_double_click", "返回按钮未找到")
-        raise StepUnavailable("back button was not found")
-    click_point = pos
-    _report(reporter, "back_double_click", "连续点击返回两次", log_label=f"连续点击返回两次：{format_point(*click_point)}")
-    click_image_point(robot, *click_point)
-    click_image_point(robot, *click_point)
-    time.sleep(0.4)
-
-    image = capture_after_popups(robot, cfg, label="after_go_back", reporter=reporter)
-    if not _matches_screen(image, cfg, CHAT_LIST_SCREEN):
-        raise StepUnavailable("failed to return to chat list")
+    raise StepUnavailable("failed to return to chat list")
 

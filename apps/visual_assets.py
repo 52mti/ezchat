@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -48,6 +49,7 @@ NEXT_MESSAGE_BUTTON = "button.next_message"
 VOICE_INPUT_BUTTON = "button.voice_input"
 SEND_BUTTON = "button.send"
 BACK_BUTTON = "button.back"
+CUSTOM_BACK_BUTTON = "button.back.custom"
 CUSTOM_POPUP = "popup.custom"
 CHAT_AREA_REGION = "region.chat_area"
 MESSAGE_LIST_REGION = "region.message_list"
@@ -124,6 +126,18 @@ POPUP_TEMPLATE_RULE = PopupTemplateRule(
     match_pattern="popup_*.jpg",
     phase="recovery",
     description="用于识别多种弹窗形态，匹配和点击坐标统一使用竖屏归一化坐标。",
+)
+
+
+BACK_BUTTON_TEMPLATE_RULE = PopupTemplateRule(
+    key=CUSTOM_BACK_BUTTON,
+    label="返回按钮模板",
+    group="buttons",
+    filename_prefix="btn_返回按钮",
+    filename_pattern="btn_返回按钮.jpg / btn_返回按钮_{index}.jpg",
+    match_pattern="btn_返回按钮*.jpg",
+    phase="recovery",
+    description="用于识别当前 App 的返回按钮，文件名按 btn_返回按钮.jpg、btn_返回按钮_2.jpg 递增。",
 )
 
 
@@ -250,6 +264,27 @@ def popup_template_paths(config: dict[str, Any]) -> list[Path]:
     return sorted(root.glob(POPUP_TEMPLATE_RULE.match_pattern))
 
 
+def _back_button_sort_key(path: Path) -> tuple[int, str]:
+    name = path.name
+    if name == "btn_返回按钮.jpg":
+        return (1, name)
+    match = re.fullmatch(r"btn_返回按钮_(\d+)\.jpg", name)
+    if match:
+        return (int(match.group(1)), name)
+    return (9999, name)
+
+
+def back_button_template_paths(config: dict[str, Any]) -> list[Path]:
+    root = template_root(config, BACK_BUTTON_TEMPLATE_RULE.group)
+    if not root.exists():
+        return []
+    paths = [path for path in root.glob(BACK_BUTTON_TEMPLATE_RULE.match_pattern) if is_back_button_template_name(path.name)]
+    legacy_path = root / "btn_back.jpg"
+    if legacy_path.exists():
+        paths.append(legacy_path)
+    return sorted(paths, key=_back_button_sort_key)
+
+
 def next_popup_template_path(buttons_dir: Path) -> Path:
     index = 1
     while True:
@@ -259,17 +294,35 @@ def next_popup_template_path(buttons_dir: Path) -> Path:
         index += 1
 
 
+def next_back_button_template_path(buttons_dir: Path) -> Path:
+    first = buttons_dir / "btn_返回按钮.jpg"
+    if not first.exists():
+        return first
+    index = 2
+    while True:
+        target = buttons_dir / f"btn_返回按钮_{index}.jpg"
+        if not target.exists():
+            return target
+        index += 1
+
+
 def is_popup_template_name(filename: str) -> bool:
     return Path(filename).match(POPUP_TEMPLATE_RULE.match_pattern)
 
 
+def is_back_button_template_name(filename: str) -> bool:
+    return filename == "btn_返回按钮.jpg" or re.fullmatch(r"btn_返回按钮_\d+\.jpg", filename) is not None
+
+
 def import_template_rules() -> tuple[TemplateRule | PopupTemplateRule, ...]:
-    return (*FIXED_TEMPLATE_RULES, POPUP_TEMPLATE_RULE)
+    return (*FIXED_TEMPLATE_RULES, POPUP_TEMPLATE_RULE, BACK_BUTTON_TEMPLATE_RULE)
 
 
 def import_target_path(key: str, buttons_dir: Path, screens_dir: Path) -> Path:
     if key == POPUP_TEMPLATE_RULE.key:
         return next_popup_template_path(buttons_dir)
+    if key == BACK_BUTTON_TEMPLATE_RULE.key:
+        return next_back_button_template_path(buttons_dir)
     rule = template_rule(key)
     root = buttons_dir if rule.group == "buttons" else screens_dir
     return root / rule.filename

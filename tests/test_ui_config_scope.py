@@ -148,7 +148,7 @@ def test_ocr_numeric_inputs_ignore_wheel_events(qtbot, tmp_path):
     assert dialog.match_threshold.buttonSymbols() == QAbstractSpinBox.ButtonSymbols.NoButtons
 
 
-def test_template_manager_only_exposes_add_popup_action(qtbot, tmp_path):
+def test_template_manager_exposes_popup_and_back_button_actions(qtbot, tmp_path):
     dialog = AppConfigDialog(
         {},
         device_ip="192.168.1.108",
@@ -160,6 +160,7 @@ def test_template_manager_only_exposes_add_popup_action(qtbot, tmp_path):
     button_texts = [button.text() for button in dialog.template_manager.findChildren(QPushButton)]
 
     assert "添加弹窗" in button_texts
+    assert "添加返回按钮" in button_texts
     assert not any(text.startswith("导入") for text in button_texts)
 
 

@@ -46,6 +46,7 @@ def test_template_names_align_main_program_and_helper_tool_contract(tmp_path):
     assert targets[visual_assets.VOICE_INPUT_BUTTON] == "btn_voice_input.jpg"
     assert targets[visual_assets.SEND_BUTTON] == "btn_send.jpg"
     assert targets[visual_assets.BACK_BUTTON] == "btn_back.jpg"
+    assert targets[visual_assets.CUSTOM_BACK_BUTTON] == "btn_返回按钮.jpg"
     assert targets[visual_assets.CUSTOM_POPUP] == "popup_custom_1.jpg"
     assert tool_filenames[visual_assets.SEND_BUTTON] == targets[visual_assets.SEND_BUTTON]
     assert popup_rule["key"] == visual_assets.CUSTOM_POPUP
@@ -75,6 +76,34 @@ def test_next_popup_template_path_keeps_popup_pattern(tmp_path):
     assert target.name == "popup_custom_2.jpg"
     assert target.match("popup_*.jpg")
     assert visual_assets.is_popup_template_name(target.name)
+
+
+def test_next_back_button_template_path_keeps_app_button_pattern(tmp_path):
+    buttons_dir = tmp_path / "buttons"
+    buttons_dir.mkdir()
+    (buttons_dir / "btn_返回按钮.jpg").write_bytes(b"existing")
+    (buttons_dir / "btn_返回按钮_2.jpg").write_bytes(b"existing")
+
+    target = visual_assets.import_target_path(visual_assets.CUSTOM_BACK_BUTTON, buttons_dir, Path())
+
+    assert target.name == "btn_返回按钮_3.jpg"
+    assert visual_assets.is_back_button_template_name(target.name)
+
+
+def test_runtime_loads_multiple_back_button_templates(tmp_path):
+    buttons_dir = tmp_path / "buttons"
+    buttons_dir.mkdir()
+    for name in ["btn_返回按钮_10.jpg", "btn_back.jpg", "btn_返回按钮_2.jpg", "btn_返回按钮.jpg"]:
+        (buttons_dir / name).write_bytes(b"template")
+
+    paths = visual_assets.back_button_template_paths({"templates": {"buttons": str(buttons_dir)}})
+
+    assert [path.name for path in paths] == [
+        "btn_返回按钮.jpg",
+        "btn_返回按钮_2.jpg",
+        "btn_返回按钮_10.jpg",
+        "btn_back.jpg",
+    ]
 
 
 def test_runtime_loads_multiple_popup_templates(tmp_path):

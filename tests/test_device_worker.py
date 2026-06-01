@@ -32,6 +32,15 @@ class DummyApp:
         return None
 
 
+class StartupCheckApp(DummyApp):
+    def set_runtime_step(self, step, label, log_label=None):
+        if hasattr(self, "status_callback"):
+            payload = {"current_step": step, "current_step_label": label}
+            if log_label is not None:
+                payload["current_step_log_label"] = log_label
+            self.status_callback(payload)
+
+
 def test_worker_suppresses_app_status_after_stop(tmp_path, monkeypatch):
     monkeypatch.setattr(device_worker_module, "get_registered_apps", lambda: {"dummy": DummyApp})
     events: "queue.Queue" = queue.Queue()
@@ -120,3 +129,57 @@ def test_worker_pause_can_emit_detail(tmp_path, monkeypatch):
 
     assert event.message == "paused"
     assert event.payload == {"detail": "黑屏熔断"}
+
+
+def test_worker_stops_on_startup_when_back_button_template_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(device_worker_module, "get_registered_apps", lambda: {"dummy": StartupCheckApp})
+    events: "queue.Queue" = queue.Queue()
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    buttons_dir = tmp_path / "buttons"
+    screens_dir = tmp_path / "screens"
+    buttons_dir.mkdir()
+    screens_dir.mkdir()
+    worker = DeviceWorker(
+        {"ip": "192.168.1.108", "selected_app": "dummy"},
+        app_config={
+            "poll_interval": 1,
+            "robot_monitor": {"enabled": False},
+            "templates": {"buttons": str(buttons_dir), "screens": str(screens_dir)},
+        },
+        events=events,
+        config_manager=manager,
+        robot=object(),
+    )
+
+    worker.run()
+
+    emitted = []
+    while not events.empty():
+        emitted.append(events.get_nowait())
+
+    assert any(event.message == "没有返回按钮" and event.level == "error" for event in emitted)
+    assert any(event.message == "progress: 没有返回按钮" for event in emitted)
+    assert emitted[-1].message == "stopped"
+
+
+def test_worker_startup_back_button_check_accepts_app_template(tmp_path, monkeypatch):
+    monkeypatch.setattr(device_worker_module, "get_registered_apps", lambda: {"dummy": DummyApp})
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    buttons_dir = tmp_path / "buttons"
+    screens_dir = tmp_path / "screens"
+    buttons_dir.mkdir()
+    screens_dir.mkdir()
+    (buttons_dir / "btn_返回按钮.jpg").write_bytes(b"template")
+    worker = DeviceWorker(
+        {"ip": "192.168.1.108", "selected_app": "dummy"},
+        app_config={
+            "poll_interval": 1,
+            "robot_monitor": {"enabled": False},
+            "templates": {"buttons": str(buttons_dir), "screens": str(screens_dir)},
+        },
+        events=queue.Queue(),
+        config_manager=manager,
+        robot=object(),
+    )
+
+    assert worker._required_back_button_templates_available() is True

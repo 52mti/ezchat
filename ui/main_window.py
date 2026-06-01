@@ -48,7 +48,14 @@ from PIL import Image
 
 from apps import get_registered_apps
 from apps.defaults import DEFAULT_RUNTIME_CONFIG, with_app_defaults
-from apps.visual_assets import CUSTOM_POPUP, import_target_path
+from apps.visual_assets import (
+    CUSTOM_BACK_BUTTON,
+    CUSTOM_POPUP,
+    back_button_template_paths,
+    import_target_path,
+    is_back_button_template_name,
+    is_popup_template_name,
+)
 from lgb.lgb import RobotInterface, scan_devices
 from services import ConfigManager, LicenseClient
 from vision.screen import ensure_portrait_image
@@ -1503,19 +1510,20 @@ class PopupCropDialog(QDialog):
     def __init__(
         self,
         image: Image.Image,
+        template_label: str = "模板",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.source_image = image.convert("RGB")
         self.cropped_image: Image.Image | None = None
-        self.setWindowTitle("??????")
+        self.setWindowTitle(f"框选{template_label}")
         self.resize(880, 720)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        help_label = QLabel("??????????????")
+        help_label = QLabel(f"在截图中拖拽框选要保存的{template_label}区域。")
         help_label.setObjectName("HelperLabel")
         root.addWidget(help_label)
 
@@ -1598,10 +1606,18 @@ class TemplateManagerWidget(QWidget):
         action_layout = QVBoxLayout(action_panel)
         action_layout.setContentsMargins(14, 12, 14, 12)
         action_layout.setSpacing(8)
+        template_actions = QHBoxLayout()
+        template_actions.setSpacing(8)
         add_popup = QPushButton("添加弹窗")
         add_popup.setObjectName("PrimaryButton")
         add_popup.clicked.connect(self._capture_popup_template)
-        action_layout.addWidget(add_popup, 0, Qt.AlignmentFlag.AlignLeft)
+        template_actions.addWidget(add_popup)
+        add_back_button = QPushButton("添加返回按钮")
+        add_back_button.setObjectName("PrimaryButton")
+        add_back_button.clicked.connect(self._capture_back_button_template)
+        template_actions.addWidget(add_back_button)
+        template_actions.addStretch(1)
+        action_layout.addLayout(template_actions)
         layout.addWidget(action_panel)
 
         list_panel = QFrame()
@@ -1609,7 +1625,7 @@ class TemplateManagerWidget(QWidget):
         list_layout = QVBoxLayout(list_panel)
         list_layout.setContentsMargins(14, 12, 14, 12)
         list_layout.setSpacing(8)
-        list_title = QLabel("当前弹窗模板")
+        list_title = QLabel("当前纠错模板")
         list_title.setObjectName("SectionLabel")
         list_layout.addWidget(list_title)
         self.table = QTableWidget(0, 3)
@@ -1625,16 +1641,31 @@ class TemplateManagerWidget(QWidget):
         self.reload()
 
     def reload(self) -> None:
-        files = sorted(self.buttons_dir.glob("popup_*.jpg"))
+        files: list[tuple[str, Path]] = [
+            ("弹窗", path)
+            for path in sorted(self.buttons_dir.glob("popup_*.jpg"))
+            if is_popup_template_name(path.name)
+        ]
+        files.extend(
+            ("返回按钮", path)
+            for path in back_button_template_paths({"templates": {"buttons": str(self.buttons_dir)}})
+            if is_back_button_template_name(path.name)
+        )
         self.table.setRowCount(len(files))
-        for row, path in enumerate(files):
-            self.table.setItem(row, 0, QTableWidgetItem("弹窗"))
+        for row, (kind, path) in enumerate(files):
+            self.table.setItem(row, 0, QTableWidgetItem(kind))
             self.table.setItem(row, 1, QTableWidgetItem(path.name))
             delete_button = QPushButton("删除")
             delete_button.clicked.connect(lambda checked=False, p=path: self._delete_template(p))
             self.table.setCellWidget(row, 2, delete_button)
 
     def _capture_popup_template(self) -> None:
+        self._capture_template(CUSTOM_POPUP, "弹窗模板")
+
+    def _capture_back_button_template(self) -> None:
+        self._capture_template(CUSTOM_BACK_BUTTON, "返回按钮模板")
+
+    def _capture_template(self, target_key: str, label: str) -> None:
         try:
             robot = RobotInterface(self.device_ip)
             image_bytes = robot.get_transform_image(pre_move=True)
@@ -1643,18 +1674,18 @@ class TemplateManagerWidget(QWidget):
             QMessageBox.critical(self, "截图失败", f"无法从机械臂获取截图：{exc}")
             return
 
-        dialog = PopupCropDialog(image, self)
+        dialog = PopupCropDialog(image, label, self)
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.cropped_image is None:
             return
 
-        target = import_target_path(CUSTOM_POPUP, self.buttons_dir, self.screens_dir)
+        target = import_target_path(target_key, self.buttons_dir, self.screens_dir)
         try:
             dialog.cropped_image.convert("RGB").save(target, format="JPEG", quality=95)
         except Exception as exc:
-            QMessageBox.critical(self, "保存失败", f"无法保存弹窗模板：{exc}")
+            QMessageBox.critical(self, "保存失败", f"无法保存{label}：{exc}")
             return
         self.reload()
-        QMessageBox.information(self, "已保存", f"弹窗模板已保存：{target.name}")
+        QMessageBox.information(self, "已保存", f"{label}已保存：{target.name}")
 
     def _delete_template(self, path: Path) -> None:
         path.unlink(missing_ok=True)

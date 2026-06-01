@@ -9,6 +9,7 @@ from typing import Any
 
 from apps import get_registered_apps
 from apps.defaults import with_app_defaults
+from apps.visual_assets import back_button_template_paths
 from lgb.lgb import RobotInterface
 from services import (
     AIClient,
@@ -173,11 +174,28 @@ class DeviceWorker(threading.Thread):
         idle_interval = float(self.app_config.get("idle_poll_interval_seconds", 5) or 5)
         return max(default_interval, idle_interval)
 
+    def _required_back_button_templates_available(self) -> bool:
+        return bool(back_button_template_paths(getattr(self.app, "config", self.app_config)))
+
+    def _ensure_startup_templates(self) -> bool:
+        if self._required_back_button_templates_available():
+            return True
+        detail = "没有返回按钮"
+        if hasattr(self.app, "status"):
+            self.app.status.last_error = detail
+            self.app.status.is_circuit_open = True
+        if hasattr(self.app, "set_runtime_step"):
+            self.app.set_runtime_step("missing_back_button_template", detail)
+        self._emit("error", detail, {"app_name": self.app_name})
+        return False
+
     def run(self) -> None:
         poll_interval = float(self.app_config.get("poll_interval", 1))
         self.robot_monitor.start()
         self._emit("info", "started")
         try:
+            if not self._ensure_startup_templates():
+                return
             while not self._stop_event.is_set():
                 self._pause_event.wait()
                 if self._stop_event.is_set():

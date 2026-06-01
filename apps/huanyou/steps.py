@@ -22,6 +22,7 @@ from apps.visual_assets import (
     NEXT_MESSAGE_BUTTON,
     SEND_BUTTON,
     all_screen_states,
+    back_button_template_paths,
     popup_template_paths,
     region_rule,
     screen_state_path,
@@ -49,8 +50,6 @@ CHAT_WINDOW_SCROLL_DISTANCE_Y = 0.6
 CHAT_WINDOW_SCROLL_JITTER_MIN = 0.0
 CHAT_WINDOW_SCROLL_JITTER_MAX = 0.0
 CHAT_WINDOW_SCROLL_REPEAT = 1
-BACK_BUTTON_DOUBLE_CLICK_NAME = "btn_返回按钮.jpg"
-BACK_BUTTON_SINGLE_CLICK_NAME = "btn_返回按钮_2.jpg"
 INPUT_BOX_RETRACT_CENTER = (0.5, 0.3)
 INPUT_BOX_RETRACT_JITTER = 0.02
 INPUT_BOX_RETRACT_DELAY_SECONDS = 0.3
@@ -145,19 +144,21 @@ def _unique_paths(paths: list[Path]) -> list[Path]:
 
 def _template_candidates(config: dict[str, Any], key: str, *, group: str) -> list[Path]:
     candidates: list[Path] = []
-    try:
-        existing = screen_state_path(config, key) if group == "screens" else template_path(config, key)
-        if existing is not None:
-            candidates.append(existing)
-    except KeyError:
-        pass
-
-    aliases = SCREEN_TEMPLATE_ALIASES.get(key, ()) if group == "screens" else BUTTON_TEMPLATE_ALIASES.get(key, ())
-    root = template_root(config, "screens" if group == "screens" else "buttons")
-    for filename in aliases:
-        path = root / filename
-        if path.exists():
-            candidates.append(path)
+    if group == "buttons" and key == BACK_BUTTON:
+        candidates.extend(back_button_template_paths(config))
+    else:
+        try:
+            existing = screen_state_path(config, key) if group == "screens" else template_path(config, key)
+            if existing is not None:
+                candidates.append(existing)
+        except KeyError:
+            pass
+        aliases = SCREEN_TEMPLATE_ALIASES.get(key, ()) if group == "screens" else BUTTON_TEMPLATE_ALIASES.get(key, ())
+        root = template_root(config, "screens" if group == "screens" else "buttons")
+        for filename in aliases:
+            path = root / filename
+            if path.exists():
+                candidates.append(path)
     return _unique_paths(candidates)
 
 
@@ -304,27 +305,21 @@ def _click_bottom_nav_item(
     return True
 
 
-def _back_button_click_count(path: Path) -> int:
-    if path.name == BACK_BUTTON_SINGLE_CLICK_NAME:
-        return 1
-    if path.name == BACK_BUTTON_DOUBLE_CLICK_NAME:
-        return 2
-    return 2
-
-
 def _click_back_match(
     robot: Any,
     matched: tuple[float, float, Path],
+    *,
+    click_count: int = 1,
     reporter: Reporter | None = None,
 ) -> None:
     x, y, path = matched
-    click_count = _back_button_click_count(path)
-    for index in range(click_count):
+    total_clicks = max(1, int(click_count or 1))
+    for index in range(total_clicks):
         _report(
             reporter,
             "return_to_list",
             "点击返回",
-            log_label=f"点击返回{index + 1}/{click_count}：{format_point(x, y)} [{path.name}]",
+            log_label=f"点击返回{index + 1}/{total_clicks}：{format_point(x, y)} [{path.name}]",
         )
         click_image_point(robot, x, y)
         time.sleep(0.4)
@@ -421,7 +416,7 @@ def _click_back_once(
     if matched is None:
         _report(reporter, "return_to_list", "返回按钮未找到")
         return False
-    _click_back_match(robot, matched, reporter=reporter)
+    _click_back_match(robot, matched, click_count=1, reporter=reporter)
     return True
 
 
@@ -1012,6 +1007,8 @@ def go_back(
     robot: Any,
     config: dict[str, Any] | None = None,
     reporter: Reporter | None = None,
+    *,
+    click_count: int = 1,
 ) -> None:
     cfg = _config(config)
     _report(reporter, "return_to_list", "返回聊天列表")
@@ -1025,7 +1022,7 @@ def go_back(
     if matched is None:
         _report(reporter, "return_to_list", "返回按钮未找到")
         raise StepUnavailable("back button was not found")
-    _click_back_match(robot, matched, reporter=reporter)
+    _click_back_match(robot, matched, click_count=click_count, reporter=reporter)
 
     image = capture_after_popups(robot, cfg, label="after_go_back", reporter=reporter)
     if not _matches_screen(image, cfg, CHAT_LIST_SCREEN):

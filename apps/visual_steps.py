@@ -18,6 +18,7 @@ from .visual_assets import (
     NEXT_MESSAGE_BUTTON,
     SEND_BUTTON,
     VOICE_INPUT_BUTTON,
+    back_button_template_paths,
     popup_template_paths,
     region_rule,
     template_path,
@@ -64,13 +65,18 @@ def _region(config: dict[str, Any], key: str) -> Any:
 
 
 def _template_center(image: Any, config: dict[str, Any], key: str) -> tuple[float, float] | None:
-    template = template_path(config, key)
-    if template is None:
+    templates = back_button_template_paths(config) if key == BACK_BUTTON else []
+    if not templates:
+        template = template_path(config, key)
+        if template is not None:
+            templates.append(template)
+    if not templates:
         return None
-    result = match(image, template, threshold=_threshold(config))
-    if not result:
-        return None
-    return result["x"] + result["w"] / 2, result["y"] + result["h"] / 2
+    for template in templates:
+        result = match(image, template, threshold=_threshold(config))
+        if result:
+            return result["x"] + result["w"] / 2, result["y"] + result["h"] / 2
+    return None
 
 
 def is_screen(image: Any, config: dict[str, Any], key: str) -> bool:
