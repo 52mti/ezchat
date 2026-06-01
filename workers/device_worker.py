@@ -72,7 +72,7 @@ class DeviceWorker(threading.Thread):
             pass
         global_config = self.config_manager.get("global", default={})
         self.ai_client = AIClient(
-            api_base=str(global_config.get("chat_api_base", "http://150.158.173.140")),
+            api_base=str(global_config.get("chat_api_base", "http://liaotianbao.icu")),
             chat_bearer=str(global_config.get("chat_bearer", "")),
             credits_bearer=str(global_config.get("credits_bearer", "")),
         )

@@ -18,7 +18,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "license_api_url": "",
         "project_uuid": "",
         "project_secret": "",
-        "chat_api_base": "http://150.158.173.140",
+        "chat_api_base": "http://liaotianbao.icu",
         "chat_bearer": "",
         "credits_bearer": "",
         "greetings_dir": "runtime/greetings",

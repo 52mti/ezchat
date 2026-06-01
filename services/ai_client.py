@@ -27,7 +27,7 @@ INSUFFICIENT_CREDIT_HINTS = ("次数不足", "请充值", "余额不足", "剩�
 class AIClient:
     def __init__(
         self,
-        api_base: str = "http://150.158.173.140",
+        api_base: str = "http://liaotianbao.icu",
         chat_bearer: str = "",
         credits_bearer: str = "",
         timeout: float = 30.0,
