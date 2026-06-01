@@ -78,7 +78,9 @@ def find_keyword(text: str, keywords: tuple[str, ...]) -> str | None:
     return None
 
 
-def _sample_background_saturation(image_array: np.ndarray, min_x: int, max_x: int, min_y: int, max_y: int) -> float:
+def _sample_background_color_metrics(
+    image_array: np.ndarray, min_x: int, max_x: int, min_y: int, max_y: int
+) -> tuple[float, float | None, float, float, float]:
     pad_x = max(10, min(28, max(4, (max_x - min_x) // 3)))
     pad_y = max(8, min(20, max(4, (max_y - min_y) // 2)))
     crop = image_array[
@@ -86,7 +88,7 @@ def _sample_background_saturation(image_array: np.ndarray, min_x: int, max_x: in
         max(0, min_x - pad_x) : min(image_array.shape[1], max_x + pad_x),
     ].astype(np.float32)
     if crop.size == 0:
-        return 0.0
+        return 0.0, None, 0.0, 0.0, 0.0
     flat = crop.reshape(-1, 3)
     rgb_max = flat.max(axis=1)
     rgb_min = flat.min(axis=1)
@@ -95,7 +97,22 @@ def _sample_background_saturation(image_array: np.ndarray, min_x: int, max_x: in
     usable = saturation[value > 0.45]
     if usable.size == 0:
         usable = saturation
-    return float(np.median(usable))
+    background_saturation = float(np.median(usable))
+    rgb_usable = flat[value > 0.20]
+    if rgb_usable.size == 0:
+        rgb_usable = flat
+    median_r, median_g, median_b = np.median(rgb_usable, axis=0)
+    blue_green_delta = float(median_b - median_g)
+    blue_red_ratio = float(median_b / max(1.0, median_r))
+    hsv = cv2.cvtColor(crop.astype(np.uint8), cv2.COLOR_RGB2HSV).reshape(-1, 3).astype(np.float32)
+    hsv_saturation = hsv[:, 1] / 255.0
+    hsv_value = hsv[:, 2] / 255.0
+    color_mask = (hsv_value > 0.20) & (hsv_saturation > 0.10)
+    if np.count_nonzero(color_mask) >= 16:
+        background_hue = float(np.median(hsv[color_mask, 0]))
+        background_value = float(np.median(hsv_value[color_mask]))
+        return background_saturation, background_hue, background_value, blue_green_delta, blue_red_ratio
+    return background_saturation, None, float(np.median(hsv_value)), blue_green_delta, blue_red_ratio
 
 
 def _normalize_region_item(item: OcrItem, region: Any | None) -> OcrItem:
@@ -135,6 +152,15 @@ def _to_rule_items(
             continue
         confidence = item.get("confidence")
         confidence_value = float(confidence) if confidence is not None else 1.0
+        (
+            background_saturation,
+            background_hue,
+            background_value,
+            background_blue_green_delta,
+            background_blue_red_ratio,
+        ) = _sample_background_color_metrics(
+            image_array, min_x, max_x, min_y, max_y
+        )
         rule_items.append(
             {
                 "raw_text": str(item.get("text", "")),
@@ -148,9 +174,11 @@ def _to_rule_items(
                 "center_y": round((min_y + max_y) / 2, 1),
                 "width": max_x - min_x,
                 "height": max_y - min_y,
-                "background_saturation": round(
-                    _sample_background_saturation(image_array, min_x, max_x, min_y, max_y), 4
-                ),
+                "background_saturation": round(background_saturation, 4),
+                "background_hue": round(background_hue, 2) if background_hue is not None else None,
+                "background_value": round(background_value, 4),
+                "background_blue_green_delta": round(background_blue_green_delta, 2),
+                "background_blue_red_ratio": round(background_blue_red_ratio, 4),
                 "debug_stage": "ocr_kept",
                 "debug_reason": "",
             }
@@ -204,6 +232,48 @@ def _round_bounds(bounds: list[float]) -> list[float]:
     return [round(float(value), 3) for value in bounds]
 
 
+def _item_bounds(item: dict[str, Any], image_width: int, image_height: int) -> list[float]:
+    return _round_bounds(
+        [
+            item["min_x"] / image_width,
+            item["min_y"] / image_height,
+            item["max_x"] / image_width,
+            item["max_y"] / image_height,
+        ]
+    )
+
+
+def _debug_excluded_entry(
+    *,
+    entry_type: str,
+    reason: str,
+    text: str,
+    image_width: int,
+    image_height: int,
+    raw_text: str | None = None,
+    bounds: list[float] | None = None,
+    matched_keyword: str | None = None,
+    confidence: float | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "type": entry_type,
+        "reason": reason,
+        "text": text,
+    }
+    if raw_text is not None:
+        entry["raw_text"] = raw_text
+    if bounds is not None:
+        entry["bounds"] = bounds
+    if matched_keyword:
+        entry["matched_keyword"] = matched_keyword
+    if confidence is not None:
+        entry["confidence"] = round(float(confidence), 4)
+    if extra:
+        entry.update(extra)
+    return entry
+
+
 def _order_segments(segments: list[tuple[int, int, str]], line_gap: int) -> list[str]:
     ordered = sorted(segments, key=lambda item: (item[0], item[1]))
     if not ordered:
@@ -247,7 +317,11 @@ def build_dialogue_result(
     rules = dict(rules or {})
     image_width, image_height = image_size
     line_gap = int(rules["line_gap"])
-    name_gap = int(rules["name_gap"])
+    if "name_gap_ratio" in rules:
+        name_gap = int(round(image_height * float(rules["name_gap_ratio"])))
+    else:
+        name_gap_value = float(rules["name_gap"])
+        name_gap = int(round(image_height * name_gap_value)) if name_gap_value < 1 else int(round(name_gap_value))
     min_confidence = float(rules["min_confidence"])
     min_height = image_height * float(rules["min_box_height_ratio"])
     sender_detection = (
@@ -257,6 +331,7 @@ def build_dialogue_result(
     result_excluded = _keywords(rules["ocr_result_excluded_keywords"])
     line_excluded = _keywords(rules["line_excluded_keywords"])
     line_and_below = _keywords(rules["line_and_below_keywords"])
+    excluded_entries: list[dict[str, Any]] = []
 
     def invalid_reason(item: dict[str, Any]) -> str | None:
         text = item["text"]
@@ -302,10 +377,33 @@ def build_dialogue_result(
     def sender_for(item: dict[str, Any]) -> str:
         method = str(sender_detection["method"])
         sender2_min_x_ratio = float(sender_detection["sender2_min_x_ratio"])
+        center_position_sender = "sender2" if item["center_x"] > image_width * sender2_min_x_ratio else "sender1"
         if method == "position":
             return "sender2" if item["min_x"] > image_width * sender2_min_x_ratio else "sender1"
         if method == "center_position":
-            return "sender2" if item["center_x"] > image_width * sender2_min_x_ratio else "sender1"
+            return center_position_sender
+        if method == "bubble_color":
+            hue = item.get("background_hue")
+            saturation = float(item.get("background_saturation") or 0.0)
+            value = float(item.get("background_value") or 0.0)
+            min_saturation = float(sender_detection.get("bubble_color_min_saturation", 0.12))
+            min_value = float(sender_detection.get("bubble_color_min_value", 0.20))
+            hue_min = float(sender_detection.get("bubble_color_sender2_hue_min", 125))
+            hue_max = float(sender_detection.get("bubble_color_sender2_hue_max", 170))
+            blue_green_min = float(sender_detection.get("bubble_color_sender2_blue_green_min", 65))
+            blue_red_ratio_min = float(sender_detection.get("bubble_color_sender2_blue_red_ratio_min", 1.60))
+            blue_min_saturation = float(sender_detection.get("bubble_color_sender2_blue_min_saturation", 0.30))
+            if hue is not None and saturation >= min_saturation and value >= min_value:
+                is_sender2_hue = hue_min <= float(hue) <= hue_max
+                blue_green_delta = float(item.get("background_blue_green_delta") or 0.0)
+                blue_red_ratio = float(item.get("background_blue_red_ratio") or 0.0)
+                is_sender2_blue = (
+                    saturation >= blue_min_saturation
+                    and blue_green_delta >= blue_green_min
+                    and blue_red_ratio >= blue_red_ratio_min
+                )
+                return "sender2" if is_sender2_hue or is_sender2_blue else "sender1"
+            return center_position_sender
         saturation_threshold = float(sender_detection["color_saturation_threshold"])
         if method == "color" and item.get("background_saturation", 0.0) >= saturation_threshold:
             return "sender2"
@@ -321,6 +419,20 @@ def build_dialogue_result(
         if reason:
             item["debug_stage"] = "filtered_before_merge"
             item["debug_reason"] = reason
+            matched_keyword = find_keyword(item["text"], result_excluded) if reason == "ocr_keyword" else None
+            excluded_entries.append(
+                _debug_excluded_entry(
+                    entry_type="item",
+                    reason=reason,
+                    text=item["text"],
+                    raw_text=item.get("raw_text"),
+                    image_width=image_width,
+                    image_height=image_height,
+                    bounds=_item_bounds(item, image_width, image_height),
+                    matched_keyword=matched_keyword,
+                    confidence=item.get("confidence"),
+                )
+            )
             continue
         item["sender"] = sender_for(item)
         item["debug_stage"] = "candidate_kept"
@@ -331,9 +443,45 @@ def build_dialogue_result(
     for group in _group_by_line(candidates, line_gap):
         text = _line_text(group, line_gap)
         if cutoff:
+            excluded_entries.append(
+                _debug_excluded_entry(
+                    entry_type="line",
+                    reason="after_line_and_below_cutoff",
+                    text=text,
+                    image_width=image_width,
+                    image_height=image_height,
+                    bounds=_round_bounds(
+                        [
+                            min(item["min_x"] for item in group) / image_width,
+                            min(item["min_y"] for item in group) / image_height,
+                            max(item["max_x"] for item in group) / image_width,
+                            max(item["max_y"] for item in group) / image_height,
+                        ]
+                    ),
+                )
+            )
             continue
-        if find_keyword(text, line_and_below):
+        matched_line_and_below = find_keyword(text, line_and_below)
+        if matched_line_and_below:
             cutoff = True
+            excluded_entries.append(
+                _debug_excluded_entry(
+                    entry_type="line",
+                    reason="line_and_below_keyword",
+                    text=text,
+                    image_width=image_width,
+                    image_height=image_height,
+                    bounds=_round_bounds(
+                        [
+                            min(item["min_x"] for item in group) / image_width,
+                            min(item["min_y"] for item in group) / image_height,
+                            max(item["max_x"] for item in group) / image_width,
+                            max(item["max_y"] for item in group) / image_height,
+                        ]
+                    ),
+                    matched_keyword=matched_line_and_below,
+                )
+            )
             continue
         filtered_groups.append(group)
 
@@ -366,8 +514,30 @@ def build_dialogue_result(
     dialogues: list[dict[str, str]] = []
     for item in merged:
         content = "".join(_order_segments(item["segments"], line_gap)).strip()
-        if content and not find_keyword(content, line_excluded):
+        matched_line_excluded = find_keyword(content, line_excluded) if content else None
+        if content and not matched_line_excluded:
             dialogues.append({"sender": item["sender"], "content": content})
+            continue
+        if content:
+            excluded_entries.append(
+                _debug_excluded_entry(
+                    entry_type="dialogue",
+                    reason="line_excluded_keyword",
+                    text=content,
+                    image_width=image_width,
+                    image_height=image_height,
+                    bounds=_round_bounds(
+                        [
+                            item["min_x"] / image_width,
+                            item["min_y"] / image_height,
+                            item["max_x"] / image_width,
+                            item["max_y"] / image_height,
+                        ]
+                    ),
+                    matched_keyword=matched_line_excluded,
+                    extra={"sender": item["sender"]},
+                )
+            )
 
     name_candidates = [
         item["text"]
@@ -377,7 +547,11 @@ def build_dialogue_result(
         and contains_cjk(item["text"])
         and not looks_like_time_text(item["text"])
     ]
-    return {"user_name": name_candidates[0] if name_candidates else "", "dialogues": dialogues}
+    return {
+        "user_name": name_candidates[0] if name_candidates else "",
+        "dialogues": dialogues,
+        "debug": {"excluded": excluded_entries},
+    }
 
 
 def _box_overlap_ratio(left: dict[str, Any], right: dict[str, Any]) -> float:
@@ -611,15 +785,25 @@ def _detect_red_badge_bounds(
         search_left = max(0, int(image_width * float(rules["left_badge_min_ratio"])))
         search_right = min(image_width, int(image_width * float(rules["left_badge_max_ratio"])))
         search_top = max(0, row_top - int(image_height * float(rules["left_badge_extra_top_ratio"])))
+        search_bottom = min(image_height, row_bottom)
+        search_height_ratio = rules.get("left_red_badge_search_height_ratio")
+        if search_height_ratio is not None:
+            search_height_px = max(
+                int(rules.get("left_red_badge_search_min_height_px", 0)),
+                int(round(image_height * float(search_height_ratio))),
+            )
+            if search_height_px > 0:
+                search_bottom = min(search_bottom, search_top + search_height_px)
     else:
         search_left = max(row_left, int(image_width * float(rules["right_badge_min_ratio"])))
         search_right = min(image_width, row_right)
         search_top = max(0, row_top)
+        search_bottom = min(image_height, row_bottom)
     search_box = (
         search_left,
         search_top,
         max(search_left + 1, search_right),
-        min(image_height, row_bottom),
+        max(search_top + 1, search_bottom),
     )
     crop = image_array[search_box[1] : search_box[3], search_box[0] : search_box[2]]
     if crop.size == 0:
@@ -627,6 +811,14 @@ def _detect_red_badge_bounds(
     hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
     red_saturation_min = int(rules["red_badge_saturation_min"])
     red_value_min = int(rules["red_badge_value_min"])
+    min_area = float(rules.get("red_badge_min_area", max(30.0, image_width * 0.04)))
+    min_width = int(rules.get("red_badge_min_width", 6))
+    min_height = int(rules.get("red_badge_min_height", 6))
+    max_width_ratio = float(rules.get("red_badge_max_width_ratio", 0.09))
+    max_height_ratio = float(rules.get("red_badge_max_height_ratio", 0.09))
+    min_aspect_ratio = float(rules.get("red_badge_min_aspect_ratio", 0.55))
+    max_aspect_ratio = float(rules.get("red_badge_max_aspect_ratio", 1.8))
+    min_circularity = float(rules.get("red_badge_min_circularity", 0.30))
     mask1 = cv2.inRange(hsv, np.array([0, red_saturation_min, red_value_min]), np.array([14, 255, 255]))
     mask2 = cv2.inRange(hsv, np.array([165, red_saturation_min, red_value_min]), np.array([180, 255, 255]))
     mask = cv2.bitwise_or(mask1, mask2)
@@ -639,18 +831,18 @@ def _detect_red_badge_bounds(
     for contour in contours:
         area = cv2.contourArea(contour)
         x, y, width, height = cv2.boundingRect(contour)
-        if area < max(30.0, image_width * 0.04):
+        if area < min_area:
             continue
-        if width < 6 or height < 6 or width > image_width * 0.09 or height > image_width * 0.09:
+        if width < min_width or height < min_height or width > image_width * max_width_ratio or height > image_width * max_height_ratio:
             continue
         ratio = width / max(1, height)
-        if ratio > 1.8 or ratio < 0.55:
+        if ratio > max_aspect_ratio or ratio < min_aspect_ratio:
             continue
         perimeter = cv2.arcLength(contour, True)
         if perimeter <= 0:
             continue
         circularity = 4.0 * np.pi * area / (perimeter * perimeter)
-        if circularity < 0.30:
+        if circularity < min_circularity:
             continue
         score = area * circularity
         if score > best_score:
@@ -712,36 +904,59 @@ def _read_left_badge_number_from_row_crop(
     max_unread_count: int,
     rules: dict[str, Any],
 ) -> int | None:
+    def read_from_region(
+        *,
+        crop_left: float,
+        crop_width: float,
+        crop_top_offset: float,
+        crop_height: float,
+        scale: int,
+        min_confidence: float,
+    ) -> int | None:
+        crop_top = max(0.0, (row_top / image_height) - crop_top_offset)
+        normalized_width = min(crop_width, max(0.0, 1.0 - crop_left))
+        normalized_height = min(crop_height, max(0.0, 1.0 - crop_top))
+        if normalized_width <= 0.0 or normalized_height <= 0.0:
+            return None
+        config = dict(base_ocr_config)
+        config["region"] = [crop_left, crop_top, normalized_width, normalized_height]
+        config["preprocess"] = "original"
+        config["scale"] = max(1, scale)
+        config["rotate_to_portrait"] = False
+        best_value: int | None = None
+        best_confidence = -1.0
+        for item in ocr(source_image, config):
+            value = _unread_count_from_badge_text(str(item.get("text", "")), max_unread_count)
+            if value is None:
+                continue
+            confidence = float(item.get("confidence") or 0.0)
+            if confidence < min_confidence:
+                continue
+            if confidence > best_confidence:
+                best_value = value
+                best_confidence = confidence
+        return best_value
+
     image_width, image_height = image_size
     _row_left, row_top, _row_right, _row_bottom = row_bounds
-    crop_left = float(rules.get("left_badge_ocr_left_ratio", rules["left_badge_min_ratio"]))
-    crop_width = float(rules.get("left_badge_ocr_width_ratio", 0.08))
-    crop_top_offset = float(rules.get("left_badge_ocr_top_offset_ratio", 0.012))
-    crop_height = float(rules.get("left_badge_ocr_height_ratio", 0.045))
-    crop_top = max(0.0, (row_top / image_height) - crop_top_offset)
-    crop_width = min(crop_width, max(0.0, 1.0 - crop_left))
-    crop_height = min(crop_height, max(0.0, 1.0 - crop_top))
-    if crop_width <= 0.0 or crop_height <= 0.0:
-        return None
-    config = dict(base_ocr_config)
-    config["region"] = [crop_left, crop_top, crop_width, crop_height]
-    config["preprocess"] = "original"
-    config["scale"] = max(1, int(rules.get("left_badge_ocr_scale", rules["badge_ocr_scale"])))
-    config["rotate_to_portrait"] = False
-    min_confidence = float(rules.get("left_badge_ocr_min_confidence", 0.50))
-    best_value: int | None = None
-    best_confidence = -1.0
-    for item in ocr(source_image, config):
-        value = _unread_count_from_badge_text(str(item.get("text", "")), max_unread_count)
-        if value is None:
-            continue
-        confidence = float(item.get("confidence") or 0.0)
-        if confidence < min_confidence:
-            continue
-        if confidence > best_confidence:
-            best_value = value
-            best_confidence = confidence
-    return best_value
+    primary_value = read_from_region(
+        crop_left=float(rules.get("left_badge_ocr_left_ratio", rules["left_badge_min_ratio"])),
+        crop_width=float(rules.get("left_badge_ocr_width_ratio", 0.08)),
+        crop_top_offset=float(rules.get("left_badge_ocr_top_offset_ratio", 0.012)),
+        crop_height=float(rules.get("left_badge_ocr_height_ratio", 0.045)),
+        scale=int(rules.get("left_badge_ocr_scale", rules["badge_ocr_scale"])),
+        min_confidence=float(rules.get("left_badge_ocr_min_confidence", 0.50)),
+    )
+    if primary_value is not None:
+        return primary_value
+    return read_from_region(
+        crop_left=float(rules.get("left_badge_retry_left_ratio", rules.get("left_badge_ocr_left_ratio", rules["left_badge_min_ratio"]))),
+        crop_width=float(rules.get("left_badge_retry_width_ratio", rules.get("left_badge_ocr_width_ratio", 0.08))),
+        crop_top_offset=float(rules.get("left_badge_retry_top_offset_ratio", rules.get("left_badge_ocr_top_offset_ratio", 0.012))),
+        crop_height=float(rules.get("left_badge_retry_height_ratio", rules.get("left_badge_ocr_height_ratio", 0.045))),
+        scale=int(rules.get("left_badge_retry_scale", rules.get("left_badge_ocr_scale", rules["badge_ocr_scale"]))),
+        min_confidence=float(rules.get("left_badge_retry_min_confidence", rules.get("left_badge_ocr_min_confidence", 0.50))),
+    )
 
 
 def _read_unread_number_from_row_strip(
@@ -902,35 +1117,106 @@ def build_list_result(
     bottom_nav = _build_bottom_nav_result(rule_items, image_size, rules)
     bottom_nav_names = [item["name"] for item in bottom_nav]
     image_array = np.array(load_image(source_image).convert("RGB")) if source_image is not None else None
+    excluded_entries: list[dict[str, Any]] = []
 
-    candidates = _dedupe_rule_items(
-        [
-            item
-            for item in rule_items
-            if item["confidence"] >= min_confidence
-            and (
-                item["height"] >= min_height
-                or _looks_like_unread_badge(item, image_width, image_height, right_meta_min, max_unread_count)
+    pre_candidates: list[dict[str, Any]] = []
+    for item in rule_items:
+        reason: str | None = None
+        if item["confidence"] < min_confidence:
+            reason = "low_confidence"
+        elif (
+            item["height"] < min_height
+            and not _looks_like_unread_badge(item, image_width, image_height, right_meta_min, max_unread_count)
+        ):
+            reason = "box_too_short"
+        elif not (top <= item["center_y"] <= bottom):
+            reason = "outside_list_region"
+        elif item["min_x"] >= image_width * 0.96:
+            reason = "too_far_right"
+        if reason:
+            excluded_entries.append(
+                _debug_excluded_entry(
+                    entry_type="item",
+                    reason=reason,
+                    text=item["text"],
+                    raw_text=item.get("raw_text"),
+                    image_width=image_width,
+                    image_height=image_height,
+                    bounds=_item_bounds(item, image_width, image_height),
+                    confidence=item.get("confidence"),
+                )
             )
-            and top <= item["center_y"] <= bottom
-            and item["min_x"] < image_width * 0.96
-        ]
-    )
+            continue
+        pre_candidates.append(item)
+    candidates = _dedupe_rule_items(pre_candidates)
 
     lines: list[dict[str, Any]] = []
     for group in _group_by_line(candidates, line_gap):
         line = _build_list_line(group, image_width, line_gap, rules)
         text = line["left_text"]
         if not text:
+            excluded_entries.append(
+                _debug_excluded_entry(
+                    entry_type="line",
+                    reason="empty_left_text",
+                    text="",
+                    image_width=image_width,
+                    image_height=image_height,
+                    bounds=_round_bounds(
+                        [
+                            line["min_x"] / image_width,
+                            line["min_y"] / image_height,
+                            line["max_x"] / image_width,
+                            line["max_y"] / image_height,
+                        ]
+                    ),
+                )
+            )
             continue
         is_top_nav_line = top_nav_bottom > top_nav_top and top_nav_top <= line["center_y"] <= top_nav_bottom
         if _looks_like_bottom_nav(text, tuple(bottom_nav_names)) and (
             line["center_y"] >= bottom_nav_top or is_top_nav_line
         ):
+            excluded_entries.append(
+                _debug_excluded_entry(
+                    entry_type="line",
+                    reason="bottom_nav_line",
+                    text=text,
+                    image_width=image_width,
+                    image_height=image_height,
+                    bounds=_round_bounds(
+                        [
+                            line["min_x"] / image_width,
+                            line["min_y"] / image_height,
+                            line["max_x"] / image_width,
+                            line["max_y"] / image_height,
+                        ]
+                    ),
+                )
+            )
             continue
-        if line["center_y"] < image_height * 0.14 and (
-            find_keyword(text, system_keywords) or find_keyword(text, excluded_keywords)
-        ):
+        matched_system_keyword = find_keyword(text, system_keywords)
+        matched_excluded_keyword = find_keyword(text, excluded_keywords)
+        if line["center_y"] < image_height * 0.14 and (matched_system_keyword or matched_excluded_keyword):
+            reason = "system_keyword_line" if matched_system_keyword else "excluded_keyword_line"
+            excluded_entries.append(
+                _debug_excluded_entry(
+                    entry_type="line",
+                    reason=reason,
+                    text=text,
+                    image_width=image_width,
+                    image_height=image_height,
+                    bounds=_round_bounds(
+                        [
+                            line["min_x"] / image_width,
+                            line["min_y"] / image_height,
+                            line["max_x"] / image_width,
+                            line["max_y"] / image_height,
+                        ]
+                    ),
+                    matched_keyword=matched_system_keyword or matched_excluded_keyword,
+                )
+            )
             continue
         lines.append(line)
 
@@ -975,10 +1261,46 @@ def build_list_result(
     for index, row in enumerate(raw_rows):
         header_line = row["header_line"]
         if header_line["center_y"] >= bottom_nav_top:
+            excluded_entries.append(
+                _debug_excluded_entry(
+                    entry_type="row",
+                    reason="row_below_bottom_nav",
+                    text=header_line["left_text"],
+                    image_width=image_width,
+                    image_height=image_height,
+                    bounds=_round_bounds(
+                        [
+                            header_line["min_x"] / image_width,
+                            header_line["min_y"] / image_height,
+                            row["max_x"] / image_width,
+                            row["last_max_y"] / image_height,
+                        ]
+                    ),
+                )
+            )
             continue
         unread_count, header_text = _strip_unread_prefix(header_line["left_text"])
         name = _strip_list_name_suffixes(_extract_list_name(header_text), rules)
-        if not name or find_keyword(name, excluded_keywords):
+        matched_name_excluded = find_keyword(name, excluded_keywords) if name else None
+        if not name or matched_name_excluded:
+            excluded_entries.append(
+                _debug_excluded_entry(
+                    entry_type="row",
+                    reason="invalid_name" if not name else "excluded_name_keyword",
+                    text=header_line["left_text"],
+                    image_width=image_width,
+                    image_height=image_height,
+                    bounds=_round_bounds(
+                        [
+                            header_line["min_x"] / image_width,
+                            header_line["min_y"] / image_height,
+                            row["max_x"] / image_width,
+                            row["last_max_y"] / image_height,
+                        ]
+                    ),
+                    matched_keyword=matched_name_excluded,
+                )
+            )
             continue
         content_parts = [
             _clean_list_content(line["left_text"], name)
@@ -988,7 +1310,26 @@ def build_list_result(
         content = "".join(part for part in content_parts if part).strip()
         if name and content.startswith(name):
             content = content[len(name) :].lstrip(" :|-_")
-        if find_keyword(content, content_excluded_keywords):
+        matched_content_excluded = find_keyword(content, content_excluded_keywords)
+        if matched_content_excluded:
+            excluded_entries.append(
+                _debug_excluded_entry(
+                    entry_type="row",
+                    reason="content_excluded_keyword",
+                    text="".join(part for part in [name, content] if part),
+                    image_width=image_width,
+                    image_height=image_height,
+                    bounds=_round_bounds(
+                        [
+                            header_line["min_x"] / image_width,
+                            header_line["min_y"] / image_height,
+                            row["max_x"] / image_width,
+                            row["last_max_y"] / image_height,
+                        ]
+                    ),
+                    matched_keyword=matched_content_excluded,
+                )
+            )
             continue
         row_text = "".join([name, content, *[line["left_text"] for line in row["content_lines"]]])
         suppress_unread_count = bool(find_keyword(row_text, unread_count_excluded_keywords))
@@ -1006,6 +1347,7 @@ def build_list_result(
         favorability_candidates: list[int] = []
         unread_candidates: list[int] = []
         badge_position = str(rules["badge_position"]).strip().lower()
+        left_red_badge_force_default = bool(rules.get("left_red_badge_force_default_unread_count", False))
         for line in row_lines:
             for right_item in line["right_items"]:
                 if looks_like_time_text(right_item["text"]):
@@ -1046,6 +1388,24 @@ def build_list_result(
                 value = _unread_count_from_text(item["text"], max_unread_count)
                 if value is not None:
                     unread_candidates.append(value)
+        left_red_badge_bounds: tuple[int, int, int, int] | None = None
+        if (
+            badge_position == "left"
+            and not suppress_unread_count
+            and enable_red_badge_detection
+            and image_array is not None
+        ):
+            left_red_badge_bounds = _detect_red_badge_bounds(
+                image_array,
+                (row_left, row_top, row_right, detection_row_bottom),
+                image_width,
+                image_height,
+                rules,
+            )
+            if left_red_badge_bounds is not None and left_red_badge_force_default:
+                default_unread_count = int(rules["badge_default_unread_count"])
+                if default_unread_count > 0:
+                    unread_candidates.append(default_unread_count)
         if (
             badge_position != "left"
             and not unread_candidates
@@ -1087,6 +1447,7 @@ def build_list_result(
             badge_position == "left"
             and not unread_candidates
             and not suppress_unread_count
+            and not (left_red_badge_force_default and left_red_badge_bounds is not None)
             and ocr_config is not None
             and source_image is not None
         ):
@@ -1107,7 +1468,7 @@ def build_list_result(
             and image_array is not None
             and ocr_config is not None
         ):
-            badge_bounds = _detect_red_badge_bounds(
+            badge_bounds = left_red_badge_bounds or _detect_red_badge_bounds(
                 image_array,
                 (row_left, row_top, row_right, detection_row_bottom),
                 image_width,
@@ -1162,7 +1523,7 @@ def build_list_result(
                 ]),
             }
         )
-    return {"message_list": rows, "bottom_nav": bottom_nav}
+    return {"message_list": rows, "bottom_nav": bottom_nav, "debug": {"excluded": excluded_entries}}
 
 
 def _points_value_from_text(text: str, keywords: tuple[str, ...]) -> str | None:

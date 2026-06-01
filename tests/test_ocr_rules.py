@@ -88,6 +88,118 @@ def test_run_ocr_mode_returns_portrait_bounds_for_landscape_input(monkeypatch):
     assert result["result"]["bottom_nav"][0]["bounds"] == [0.7, 0.8, 0.9, 0.95]
 
 
+def test_dialogue_result_returns_excluded_reasons():
+    items = [
+        {
+            "text": "hello",
+            "raw_text": "hello",
+            "confidence": 0.99,
+            "min_x": 20,
+            "max_x": 110,
+            "min_y": 100,
+            "max_y": 140,
+            "center_x": 65,
+            "center_y": 120,
+            "width": 90,
+            "height": 40,
+            "background_saturation": 0.0,
+        },
+        {
+            "text": "blocked_item_message",
+            "raw_text": "blocked_item_message",
+            "confidence": 0.99,
+            "min_x": 20,
+            "max_x": 180,
+            "min_y": 150,
+            "max_y": 190,
+            "center_x": 100,
+            "center_y": 170,
+            "width": 160,
+            "height": 40,
+            "background_saturation": 0.0,
+        },
+        {
+            "text": "blocked_line_message",
+            "raw_text": "blocked_line_message",
+            "confidence": 0.99,
+            "min_x": 20,
+            "max_x": 190,
+            "min_y": 200,
+            "max_y": 240,
+            "center_x": 105,
+            "center_y": 220,
+            "width": 170,
+            "height": 40,
+            "background_saturation": 0.0,
+        },
+        {
+            "text": "cutoff",
+            "raw_text": "cutoff",
+            "confidence": 0.99,
+            "min_x": 20,
+            "max_x": 90,
+            "min_y": 250,
+            "max_y": 290,
+            "center_x": 55,
+            "center_y": 270,
+            "width": 70,
+            "height": 40,
+            "background_saturation": 0.0,
+        },
+        {
+            "text": "after_cutoff",
+            "raw_text": "after_cutoff",
+            "confidence": 0.99,
+            "min_x": 20,
+            "max_x": 130,
+            "min_y": 300,
+            "max_y": 340,
+            "center_x": 75,
+            "center_y": 320,
+            "width": 110,
+            "height": 40,
+            "background_saturation": 0.0,
+        },
+    ]
+
+    result = build_dialogue_result(
+        items,
+        (200, 400),
+        _dialogue_rules(
+            ocr_result_excluded_keywords=["blocked_item"],
+            line_excluded_keywords=["blocked_line"],
+            line_and_below_keywords=["cutoff"],
+            basic_filter={
+                "enable_max_x_filter": False,
+                "enable_max_width_filter": False,
+                "enable_non_cjk_non_emoji_filter": False,
+                "enable_right_narrow_non_cjk_filter": False,
+            },
+        ),
+    )
+
+    excluded = result["debug"]["excluded"]
+    assert any(
+        item["reason"] == "ocr_keyword"
+        and item["text"] == "blocked_item_message"
+        and item["matched_keyword"] == "blocked_item"
+        for item in excluded
+    )
+    assert any(
+        item["reason"] == "line_excluded_keyword"
+        and item["text"] == "helloblocked_line_message"
+        and item["matched_keyword"] == "blocked_line"
+        for item in excluded
+    )
+    assert any(
+        item["reason"] == "line_and_below_keyword"
+        and item["text"] == "cutoff"
+        and item["matched_keyword"] == "cutoff"
+        for item in excluded
+    )
+    assert any(item["reason"] == "after_line_and_below_cutoff" and item["text"] == "after_cutoff" for item in excluded)
+
+
 def test_dialogue_rules_filter_time_and_merge_sender_lines():
     items = [
         {
@@ -137,6 +249,49 @@ def test_dialogue_rules_filter_time_and_merge_sender_lines():
     result = build_dialogue_result(items, (200, 300), _dialogue_rules(name_gap=80))
 
     assert result["dialogues"] == [{"sender": "sender1", "content": "你好在吗"}]
+
+
+def test_dialogue_name_gap_ratio_scales_with_image_height():
+    items = [
+        {
+            "text": "浣犲ソ",
+            "raw_text": "浣犲ソ",
+            "confidence": 0.99,
+            "min_x": 20,
+            "max_x": 80,
+            "min_y": 220,
+            "max_y": 250,
+            "center_x": 50,
+            "center_y": 235,
+            "width": 60,
+            "height": 30,
+            "background_saturation": 0.0,
+        },
+        {
+            "text": "鍦ㄥ悧",
+            "raw_text": "鍦ㄥ悧",
+            "confidence": 0.99,
+            "min_x": 22,
+            "max_x": 82,
+            "min_y": 299,
+            "max_y": 329,
+            "center_x": 52,
+            "center_y": 314,
+            "width": 60,
+            "height": 30,
+            "background_saturation": 0.0,
+        },
+    ]
+    rules = _dialogue_rules(name_gap_ratio=0.05)
+
+    tall_result = build_dialogue_result(items, (200, 1000), rules)
+    short_result = build_dialogue_result(items, (200, 500), rules)
+
+    assert tall_result["dialogues"] == [{"sender": "sender1", "content": "浣犲ソ鍦ㄥ悧"}]
+    assert short_result["dialogues"] == [
+        {"sender": "sender1", "content": "浣犲ソ"},
+        {"sender": "sender1", "content": "鍦ㄥ悧"},
+    ]
 
 
 def test_dialogue_rules_filter_right_narrow_non_cjk_items():
@@ -219,4 +374,35 @@ def test_huanyou_dialogue_rules_keep_colored_chat_bubbles_only():
     assert result["dialogues"] == [
         {"sender": "sender2", "content": "你觉得相处起来什么最重要"},
         {"sender": "sender1", "content": "你好"},
+    ]
+
+
+def test_huanyou_dialogue_rules_do_not_merge_separate_left_bubbles_with_large_gap():
+    def item(text: str, min_x: int, max_x: int, min_y: int, max_y: int) -> dict:
+        return {
+            "text": text,
+            "raw_text": text,
+            "confidence": 0.99,
+            "min_x": min_x,
+            "max_x": max_x,
+            "min_y": min_y,
+            "max_y": max_y,
+            "center_x": (min_x + max_x) / 2,
+            "center_y": (min_y + max_y) / 2,
+            "width": max_x - min_x,
+            "height": max_y - min_y,
+            "background_saturation": 0.60,
+        }
+
+    items = [
+        item("你好", 126, 180, 273, 304),
+        item("看你也是个值得托付的人，我", 114, 424, 370, 402),
+        item("想把爱交给你", 115, 258, 406, 435),
+    ]
+
+    result = build_dialogue_result(items, (681, 1222), HUANYOU_DIALOGUE_OCR_MODE["rules"])
+
+    assert result["dialogues"] == [
+        {"sender": "sender1", "content": "你好"},
+        {"sender": "sender1", "content": "看你也是个值得托付的人，我想把爱交给你"},
     ]

@@ -929,6 +929,40 @@ def test_huanyou_idle_wait_uses_list_rescan_instead_of_full_list_confirm(monkeyp
     assert calls == ["find", "points", "rescan"]
 
 
+def test_rescan_unread_target_dismisses_popups_before_list_ocr(monkeypatch):
+    robot = FakeRobot()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "capture_after_popups",
+        lambda robot, config, label="screen", max_dismiss=2, reporter=None: calls.append(label) or b"after_popup",
+    )
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "run_ocr_mode",
+        lambda image, config, mode, region=None: {
+            "result": {
+                "message_list": [
+                    {
+                        "name": "未读用户",
+                        "favorability": 1,
+                        "unread_count": 1,
+                        "content": "你好",
+                        "bounds": [0.2, 0.4, 0.6, 0.5],
+                    }
+                ]
+            }
+        },
+    )
+
+    target = huanyou_app.steps.rescan_unread_target(robot, {})
+
+    assert target is not None
+    assert target["name"] == "未读用户"
+    assert calls == ["idle_list_rescan"]
+
+
 def test_huanyou_balance_display_truncates_decimals_after_dividing_by_ten():
     assert huanyou_app.HuanyouApp._balance_from_points("124.15") == "12"
     assert huanyou_app.HuanyouApp._balance_from_points("125.29") == "12"

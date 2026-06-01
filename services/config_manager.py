@@ -130,12 +130,48 @@ def _normalize_app_templates(app_name: str, app_config: dict[str, Any]) -> None:
             templates[group] = app_template_path
 
 
+def _normalize_huanyou_dialogue_rules(app_name: str, app_config: dict[str, Any]) -> None:
+    if str(app_name) != "huanyou" or not isinstance(app_config, dict):
+        return
+    ocr_modes = app_config.get("ocr_modes", {})
+    if not isinstance(ocr_modes, dict):
+        return
+    dialogue = ocr_modes.get("dialogue", {})
+    if not isinstance(dialogue, dict):
+        return
+    rules = dialogue.get("rules", {})
+    if not isinstance(rules, dict):
+        return
+    sender_detection = rules.get("sender_detection", {})
+    if not isinstance(sender_detection, dict):
+        return
+    has_bubble_keys = any(str(key).startswith("bubble_color_") for key in sender_detection.keys())
+    if str(sender_detection.get("method", "")).strip() == "center_position" and not has_bubble_keys:
+        sender_detection["method"] = "bubble_color"
+        sender_detection["bubble_color_min_saturation"] = 0.12
+        sender_detection["bubble_color_min_value"] = 0.20
+        sender_detection["bubble_color_sender2_hue_min"] = 110
+        sender_detection["bubble_color_sender2_hue_max"] = 150
+        sender_detection["bubble_color_sender2_blue_green_min"] = 65
+        sender_detection["bubble_color_sender2_blue_red_ratio_min"] = 1.60
+        sender_detection["bubble_color_sender2_blue_min_saturation"] = 0.30
+    if "name_gap_ratio" not in rules and "name_gap" in rules:
+        try:
+            name_gap_value = float(rules["name_gap"])
+        except (TypeError, ValueError):
+            name_gap_value = 0.0
+        if name_gap_value >= 1:
+            rules["name_gap_ratio"] = 0.037
+            rules.pop("name_gap", None)
+
+
 def _normalize_app_configs(app_configs: dict[str, Any]) -> None:
     if not isinstance(app_configs, dict):
         return
     for app_name, app_config in app_configs.items():
         if isinstance(app_config, dict):
             _normalize_app_templates(str(app_name), app_config)
+            _normalize_huanyou_dialogue_rules(str(app_name), app_config)
 
 
 def _load_json_dict(path: Path) -> dict[str, Any]:
@@ -170,6 +206,7 @@ def _load_app_override_file(app_config_root: Path, app_name: str) -> dict[str, A
     payload = _load_json_dict(_app_config_path(app_config_root, app_name))
     app_level, _, _ = _split_override_scopes(payload)
     _normalize_app_templates(app_name, app_level)
+    _normalize_huanyou_dialogue_rules(app_name, app_level)
     return app_level
 
 

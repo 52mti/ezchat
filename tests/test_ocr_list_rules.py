@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 
+import numpy as np
 from PIL import Image
 
 import vision.ocr_rules as ocr_rules
@@ -332,13 +333,67 @@ def test_list_rules_zero_badge_default_does_not_create_unread(monkeypatch):
     result = build_list_result(
         items,
         (560, 997),
-        _huanyou_rules(min_box_height_ratio=0.01),
+        _huanyou_rules(
+            min_box_height_ratio=0.01,
+            badge_default_unread_count=0,
+            enable_red_badge_detection=True,
+            left_red_badge_force_default_unread_count=True,
+        ),
         source_image=Image.new("RGB", (560, 997), "white"),
         ocr_config={"runtime_enabled": True, "preprocess": "original"},
     )
 
     assert result["message_list"][0]["name"] == "微风"
     assert result["message_list"][0]["unread_count"] is None
+
+
+def test_huanyou_list_rules_use_red_badge_block_as_unread_one(monkeypatch):
+    items = [
+        _item("梦幻之旅", 128, 260, 265, 297),
+        _item("丘比特牵线礼物", 128, 360, 305, 338),
+    ]
+
+    monkeypatch.setattr(ocr_rules, "_detect_red_badge_bounds", lambda *args, **kwargs: (88, 240, 114, 266))
+    monkeypatch.setattr(
+        ocr_rules,
+        "_read_left_badge_number_from_row_crop",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not call left badge OCR")),
+    )
+
+    result = build_list_result(
+        items,
+        (560, 997),
+        _huanyou_rules(min_box_height_ratio=0.01),
+        source_image=Image.new("RGB", (560, 997), "white"),
+        ocr_config={"runtime_enabled": True, "preprocess": "original"},
+    )
+
+    assert result["message_list"][0]["name"] == "梦幻之旅"
+    assert result["message_list"][0]["unread_count"] == 1
+
+
+def test_detect_red_badge_bounds_ignore_small_red_patch_for_huanyou():
+    rules = _huanyou_rules()
+    image = Image.new("RGB", (560, 997), "white")
+    pixels = image.load()
+    for x in range(18, 27):
+        for y in range(146, 155):
+            pixels[x, y] = (220, 40, 40)
+    for x in range(90, 115):
+        for y in range(135, 160):
+            if (x - 102) ** 2 + (y - 147) ** 2 <= 12 ** 2:
+                pixels[x, y] = (220, 60, 45)
+
+    badge_bounds = ocr_rules._detect_red_badge_bounds(
+        np.array(image),
+        (0, 140, 540, 220),
+        560,
+        997,
+        rules,
+    )
+
+    assert badge_bounds is not None
+    assert badge_bounds[0] >= 80
 
 
 def test_list_rules_keep_numeric_name_for_xinyu_layout():
@@ -452,7 +507,7 @@ def test_huanyou_list_rules_filter_helper_rows_and_disable_visual_unread(monkeyp
     )
 
     assert [row["name"] for row in result["message_list"]] == ["微笑的绿巨人"]
-    assert result["message_list"][0]["unread_count"] is None
+    assert result["message_list"][0]["unread_count"] == 1
 
 
 def test_huanyou_list_rules_accept_left_ocr_unread_badge():

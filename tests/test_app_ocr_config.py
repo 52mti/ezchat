@@ -39,16 +39,22 @@ def test_huanyou_dialogue_sender_anchor_is_app_specific():
     wechat_sender = WECHAT_CONFIG["ocr_modes"]["dialogue"]["rules"]["sender_detection"]
     xinyu_sender = XINYU_CONFIG["ocr_modes"]["dialogue"]["rules"]["sender_detection"]
 
-    assert huanyou_sender["method"] == "center_position"
+    assert huanyou_sender["method"] == "bubble_color"
+    assert huanyou_sender["bubble_color_sender2_hue_min"] == 110
+    assert huanyou_sender["bubble_color_sender2_hue_max"] == 150
+    assert huanyou_sender["bubble_color_sender2_blue_green_min"] == 65
+    assert huanyou_sender["bubble_color_sender2_blue_red_ratio_min"] == 1.60
+    assert huanyou_sender["bubble_color_sender2_blue_min_saturation"] == 0.30
     assert wechat_sender["method"] == "position"
     assert xinyu_sender["method"] == "position"
 
 
-def test_huanyou_list_rules_are_conservative_for_default_unread_and_marketing_rows():
+def test_huanyou_list_rules_enable_left_badge_unread_and_filter_marketing_rows():
     rules = HUANYOU_CONFIG["ocr_modes"]["list"]["rules"]
 
-    assert rules["badge_default_unread_count"] == 0
-    assert rules["enable_red_badge_detection"] is False
+    assert rules["badge_default_unread_count"] == 1
+    assert rules["enable_red_badge_detection"] is True
+    assert rules["left_red_badge_force_default_unread_count"] is True
     assert "在线匹配" in rules["excluded_keywords"]
     assert "在线配对" in rules["excluded_keywords"]
     assert "小助手" in rules["excluded_keywords"]

@@ -584,7 +584,7 @@ def rescan_unread_target(
 ) -> dict[str, Any] | None:
     cfg = _config(config)
     _report(reporter, "chat_list_ocr", "列表 OCR 复扫")
-    image = capture_transform_image(robot, cfg, pre_move=True, label="idle_list_rescan")
+    image = capture_after_popups(robot, cfg, label="idle_list_rescan", reporter=reporter)
     ocr_result = run_unread_list_ocr(image, cfg)
     return _select_unread_target_from_ocr_result(ocr_result, reporter=reporter)
 

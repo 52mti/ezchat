@@ -106,3 +106,151 @@ def test_dialogue_position_method_is_configurable():
 
     assert default_result["dialogues"] == [{"sender": "sender1", "content": "wide message"}]
     assert center_result["dialogues"] == [{"sender": "sender2", "content": "wide message"}]
+
+
+def test_dialogue_bubble_color_method_prefers_purple_bubble_over_position():
+    def item(text: str, min_x: int, max_x: int, min_y: int, max_y: int, hue: float) -> dict:
+        return {
+            "text": text,
+            "raw_text": text,
+            "confidence": 0.99,
+            "min_x": min_x,
+            "max_x": max_x,
+            "min_y": min_y,
+            "max_y": max_y,
+            "center_x": (min_x + max_x) / 2,
+            "center_y": (min_y + max_y) / 2,
+            "width": max_x - min_x,
+            "height": max_y - min_y,
+            "background_saturation": 0.45,
+            "background_hue": hue,
+            "background_value": 0.70,
+            "background_blue_green_delta": 0.0,
+            "background_blue_red_ratio": 1.0,
+        }
+
+    items = [
+        item("non purple message", 110, 190, 100, 140, 90),
+        item("purple message", 20, 100, 210, 250, 122),
+    ]
+
+    result = build_dialogue_result(
+        items,
+        (200, 300),
+        _dialogue_rules(
+            name_gap=20,
+            sender_detection={
+                "method": "bubble_color",
+                "sender2_min_x_ratio": 0.52,
+                "bubble_color_min_saturation": 0.12,
+                "bubble_color_min_value": 0.20,
+                "bubble_color_sender2_hue_min": 110,
+                "bubble_color_sender2_hue_max": 150,
+            },
+            basic_filter={
+                "enable_max_x_filter": False,
+                "enable_non_cjk_non_emoji_filter": False,
+            },
+        ),
+    )
+
+    assert result["dialogues"] == [
+        {"sender": "sender1", "content": "non purple message"},
+        {"sender": "sender2", "content": "purple message"},
+    ]
+
+
+def test_dialogue_bubble_color_method_accepts_blue_purple_camera_shift():
+    items = [
+        {
+            "text": "blue shifted purple",
+            "raw_text": "blue shifted purple",
+            "confidence": 0.99,
+            "min_x": 20,
+            "max_x": 150,
+            "min_y": 100,
+            "max_y": 140,
+            "center_x": 85,
+            "center_y": 120,
+            "width": 130,
+            "height": 40,
+            "background_saturation": 0.30,
+            "background_hue": 94,
+            "background_value": 0.70,
+            "background_blue_green_delta": 100,
+            "background_blue_red_ratio": 2.2,
+        }
+    ]
+
+    result = build_dialogue_result(
+        items,
+        (200, 300),
+        _dialogue_rules(
+            name_gap=20,
+            sender_detection={
+                "method": "bubble_color",
+                "sender2_min_x_ratio": 0.52,
+                "bubble_color_min_saturation": 0.12,
+                "bubble_color_min_value": 0.20,
+                "bubble_color_sender2_hue_min": 110,
+                "bubble_color_sender2_hue_max": 150,
+                "bubble_color_sender2_blue_green_min": 65,
+                "bubble_color_sender2_blue_red_ratio_min": 1.60,
+                "bubble_color_sender2_blue_min_saturation": 0.30,
+            },
+            basic_filter={
+                "enable_max_x_filter": False,
+                "enable_non_cjk_non_emoji_filter": False,
+            },
+        ),
+    )
+
+    assert result["dialogues"] == [{"sender": "sender2", "content": "blue shifted purple"}]
+
+
+def test_dialogue_bubble_color_method_keeps_low_saturation_blue_card_as_sender1():
+    items = [
+        {
+            "text": "blue image card",
+            "raw_text": "blue image card",
+            "confidence": 0.99,
+            "min_x": 20,
+            "max_x": 150,
+            "min_y": 100,
+            "max_y": 140,
+            "center_x": 85,
+            "center_y": 120,
+            "width": 130,
+            "height": 40,
+            "background_saturation": 0.36,
+            "background_hue": 93,
+            "background_value": 0.67,
+            "background_blue_green_delta": 72,
+            "background_blue_red_ratio": 1.48,
+        }
+    ]
+
+    result = build_dialogue_result(
+        items,
+        (200, 300),
+        _dialogue_rules(
+            name_gap=20,
+            sender_detection={
+                "method": "bubble_color",
+                "sender2_min_x_ratio": 0.52,
+                "bubble_color_min_saturation": 0.12,
+                "bubble_color_min_value": 0.20,
+                "bubble_color_sender2_hue_min": 110,
+                "bubble_color_sender2_hue_max": 150,
+                "bubble_color_sender2_blue_green_min": 65,
+                "bubble_color_sender2_blue_red_ratio_min": 1.60,
+                "bubble_color_sender2_blue_min_saturation": 0.30,
+            },
+            basic_filter={
+                "enable_max_x_filter": False,
+                "enable_non_cjk_non_emoji_filter": False,
+            },
+        ),
+    )
+
+    assert result["dialogues"] == [{"sender": "sender1", "content": "blue image card"}]
