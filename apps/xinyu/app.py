@@ -164,6 +164,12 @@ class XinyuApp(BaseApp):
             steps.enter_chat(self.robot, float(target["x"]), float(target["y"]))
             self._mark_activity()
             chat_image = steps.confirm_chat_window(self.robot, self.config, reporter=reporter)
+            if steps.send_new_greeting_if_available(self.robot, self.config, image=chat_image, reporter=reporter):
+                self._mark_activity()
+                reporter("wait_next_round", "等待下一轮扫描")
+                self.record_reply_round(time.monotonic() - round_started_at)
+                self.mark_success()
+                return
 
             if use_list_content:
                 message = steps.build_list_message(target, list_content)

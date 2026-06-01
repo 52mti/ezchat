@@ -53,6 +53,8 @@ UNREAD_BUTTON_NO_RED = "button.unread.no_red"
 SEND_BUTTON_KEY = "button.send"
 MY_BUTTON = "button.my"
 MESSAGE_BUTTON = "button.message"
+NEW_GREETING_BUTTON = "button.new_greeting"
+BACK_BUTTON_2 = "button.back.secondary"
 TTS_POST_DELAY_SECONDS = 3.0
 POPUP_MAX_X = 0.9
 
@@ -73,6 +75,8 @@ BUTTON_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
     SEND_BUTTON_KEY: ("btn_发送按钮.jpg", "btn_send.jpg"),
     MY_BUTTON: ("btn_我的按钮.jpg",),
     MESSAGE_BUTTON: ("btn_消息按钮.jpg",),
+    NEW_GREETING_BUTTON: ("btn_新招呼按钮.jpg",),
+    BACK_BUTTON_2: ("btn_返回按钮_2.jpg",),
 }
 
 
@@ -283,6 +287,12 @@ def current_screen(image: Any, config: dict[str, Any]) -> str:
     return "unknown"
 
 
+def _is_chat_window_image(image: Any, config: dict[str, Any]) -> bool:
+    if _matches_screen(image, config, CHAT_WINDOW_SCREEN):
+        return True
+    return False
+
+
 def _popup_close_point(image: Any, config: dict[str, Any]) -> tuple[float, float] | None:
     for popup_template in popup_template_paths(config):
         result = _popup_match(image, popup_template, config)
@@ -293,6 +303,8 @@ def _popup_close_point(image: Any, config: dict[str, Any]) -> tuple[float, float
 
 
 def is_popup_visible(image: Any, config: dict[str, Any]) -> bool:
+    if _is_chat_window_image(image, config):
+        return False
     return _popup_close_point(image, config) is not None
 
 
@@ -305,6 +317,8 @@ def dismiss_popups(
     current_image = image if image is not None else capture_transform_image(
         robot, config, pre_move=True, label="popup_check"
     )
+    if _is_chat_window_image(current_image, config):
+        return False
     close_point = _popup_close_point(current_image, config)
     if close_point is None:
         return False
@@ -327,6 +341,8 @@ def capture_after_popups(
 ) -> Any:
     image = capture_transform_image(robot, config, pre_move=True, label=label)
     for _ in range(max_dismiss):
+        if _is_chat_window_image(image, config):
+            break
         close_point = _popup_close_point(image, config)
         if close_point is None:
             break
@@ -375,7 +391,7 @@ def _click_message_button(
 
 def ensure_list_screen(robot: Any, config: dict[str, Any] | None = None, reporter: Reporter | None = None) -> Any | None:
     cfg = _config(config)
-    _report(reporter, "confirm_xinyu_list", "确认心遇见聊天列表")
+    _report(reporter, "confirm_xinyu_list", "确认心遇聊天列表")
     image = capture_after_popups(robot, cfg, label="confirm_list", reporter=reporter)
     _raise_if_black_screen(image, cfg)
     if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
@@ -589,6 +605,43 @@ def confirm_chat_window(
     if not _matches_screen(image, cfg, CHAT_WINDOW_SCREEN):
         raise StepUnavailable("chat window screen template did not match")
     return image
+
+
+def send_new_greeting_if_available(
+    robot: Any,
+    config: dict[str, Any] | None = None,
+    image: Any | None = None,
+    reporter: Reporter | None = None,
+) -> bool:
+    cfg = _config(config)
+    current_image = image if image is not None else capture_after_popups(robot, cfg, label="new_greeting", reporter=reporter)
+    pos = _template_center(current_image, cfg, NEW_GREETING_BUTTON, group="buttons")
+    if pos is None:
+        return False
+
+    send_point = (min(0.98, pos[0] + 0.2), pos[1])
+    _report(
+        reporter,
+        "new_greeting_send",
+        "发送新招呼",
+        log_label=f"发送新招呼：{format_point(*send_point)}",
+    )
+    click_image_point(robot, *send_point)
+    time.sleep(0.4)
+
+    image_after_send = capture_after_popups(robot, cfg, label="after_new_greeting", reporter=reporter)
+    back_pos = _template_center(image_after_send, cfg, BACK_BUTTON_2, group="buttons")
+    if back_pos is None:
+        raise StepUnavailable("back button 2 was not found after new greeting")
+    _report(
+        reporter,
+        "new_greeting_return",
+        "新招呼后返回列表",
+        log_label=f"新招呼后返回列表：{format_point(*back_pos)}",
+    )
+    click_image_point(robot, *back_pos)
+    time.sleep(0.4)
+    return True
 
 
 def read_message(
