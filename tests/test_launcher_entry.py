@@ -7,7 +7,7 @@ import launcher_entry
 
 def test_spawn_packaged_app_uses_inline_bootstrap(monkeypatch, tmp_path: Path):
     root = tmp_path / "package"
-    python_exe = root / ".runtime_env" / "python.exe"
+    python_exe = root / "runtime" / "app" / "python.exe"
     python_exe.parent.mkdir(parents=True)
     python_exe.write_text("", encoding="utf-8")
 
@@ -43,7 +43,7 @@ def test_spawn_packaged_app_uses_inline_bootstrap(monkeypatch, tmp_path: Path):
 
 def test_spawn_packaged_app_logs_nonzero_exit(monkeypatch, tmp_path: Path):
     root = tmp_path / "package"
-    python_exe = root / ".runtime_env" / "python.exe"
+    python_exe = root / "runtime" / "app" / "python.exe"
     python_exe.parent.mkdir(parents=True)
     python_exe.write_text("", encoding="utf-8")
 

@@ -47,6 +47,26 @@ def test_device_table_has_checkbox_column_and_batch_selection(qtbot, tmp_path):
     assert window._checked_rows() == []
 
 
+def test_top_bar_shows_ocr_mode_from_runtime_state(qtbot, tmp_path):
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    (runtime_dir / "install_state.json").write_text(
+        json.dumps({"status": "installed", "validation": "ok", "backend": "cpu", "ocr_device": "cpu"}),
+        encoding="utf-8",
+    )
+    window = _window(qtbot, tmp_path, [{"ip": "192.168.1.108", "selected_app": "wechat"}])
+
+    assert window.ocr_mode_label.text() == "OCR: CPU"
+
+    (runtime_dir / "install_state.json").write_text(
+        json.dumps({"status": "installed", "validation": "ok", "backend": "paddle_cuda", "ocr_device": "gpu:0"}),
+        encoding="utf-8",
+    )
+    window = _window(qtbot, tmp_path, [{"ip": "192.168.1.108", "selected_app": "wechat"}])
+
+    assert window.ocr_mode_label.text() == "OCR: GPU"
+
+
 def test_device_table_is_sorted_by_ip(qtbot, tmp_path):
     window = _window(
         qtbot,

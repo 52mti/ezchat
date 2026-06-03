@@ -7,7 +7,7 @@ paddleocr==3.4.0
 paddlex[ocr-core]==3.4.3
 pywin32; platform_system == "Windows"
 
-# OCR runtime packages are installed on the customer machine by install_runtime.py:
+# Full-package OCR runtimes are assembled during build:
 # - Common OCR packages: paddleocr + paddlex[ocr-core]
 # - NVIDIA: paddlepaddle-gpu
 # - AMD/Intel Windows GPU: onnxruntime-directml + rapidocr_onnxruntime

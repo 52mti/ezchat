@@ -109,6 +109,16 @@ class BaseApp:
             return
         self.status.error_count += 1
         self.status.last_error = str(exc)
+        self.emit_runtime_log(
+            "error",
+            "app_error",
+            {
+                "step": self.status.current_step,
+                "label": self.status.current_step_label,
+                "error": str(exc),
+                "error_count": self.status.error_count,
+            },
+        )
         self._save_error_capture()
         if not self.status.is_circuit_open:
             self._try_recover()

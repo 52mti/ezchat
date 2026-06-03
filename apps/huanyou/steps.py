@@ -53,6 +53,7 @@ CHAT_WINDOW_SCROLL_REPEAT = 1
 INPUT_BOX_RETRACT_CENTER = (0.5, 0.3)
 INPUT_BOX_RETRACT_JITTER = 0.02
 INPUT_BOX_RETRACT_DELAY_SECONDS = 0.3
+INPUT_BOX_FOCUS_SETTLE_SECONDS = 0.8
 
 SCREEN_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
     CHAT_LIST_SCREEN: ("screen_聊天列表.jpg", "chat_list.jpg", "screen_message_list.jpg"),
@@ -887,6 +888,7 @@ def focus_input_box(
     click_point = (pos[0] - 0.5, pos[1])
     _report(reporter, "input_box_click", "点击输入框偏移位置", log_label=f"点击输入框偏移位置：{format_point(*click_point)}")
     click_image_point(robot, *click_point)
+    time.sleep(float(cfg.get("input_box_focus_settle_seconds", INPUT_BOX_FOCUS_SETTLE_SECONDS) or INPUT_BOX_FOCUS_SETTLE_SECONDS))
 
 
 def play_voice_reply(
@@ -909,6 +911,12 @@ def play_voice_reply(
                 click_image_point(robot, *microphone)
                 break
             if deadline.expired():
+                _report(
+                    reporter,
+                    "microphone_not_found",
+                    "麦克风按钮未找到",
+                    log_label=f"麦克风按钮未找到：等待{deadline.elapsed_seconds():.1f}s，超时{_step_timeout(cfg):.1f}s",
+                )
                 raise StepUnavailable("microphone button was not found")
             time.sleep(0.4)
 

@@ -38,6 +38,29 @@ def test_app_config_dialog_returns_device_app_template_paths(qtbot, tmp_path):
     assert "192.168.1.108 / wechat" in dialog.windowTitle()
 
 
+def test_app_config_persona_selector_uses_preset_and_custom_ids(qtbot, tmp_path):
+    dialog = AppConfigDialog(
+        {"persona": {"requestPersona": "REMOVED-BEARER-TOKEN"}},
+        device_ip="192.168.1.108",
+        app_name="wechat",
+        template_root=tmp_path / "templates",
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.request_persona_combo.currentText() == "特别素"
+    assert dialog.request_persona_custom_input.isEnabled() is False
+    assert dialog.values()["persona"]["requestPersona"] == "REMOVED-BEARER-TOKEN"
+
+    dialog.request_persona_combo.setCurrentText("心遇优化版")
+    assert dialog.values()["persona"]["requestPersona"] == "REMOVED-BEARER-TOKEN"
+
+    dialog.request_persona_combo.setCurrentText("自定义")
+    dialog.request_persona_custom_input.setText("app-custom-persona")
+
+    assert dialog.request_persona_custom_input.isEnabled() is True
+    assert dialog.values()["persona"]["requestPersona"] == "app-custom-persona"
+
+
 def test_ocr_settings_tab_is_hidden_until_requested(qtbot, tmp_path):
     dialog = AppConfigDialog(
         {},

@@ -6,10 +6,6 @@ import os
 import sys
 from pathlib import Path
 
-PACKAGE_ROOT = Path(__file__).resolve().parent
-if str(PACKAGE_ROOT) not in sys.path:
-    sys.path.insert(0, str(PACKAGE_ROOT))
-
 from services import (
     ConfigManager,
     cleanup_old_error_captures,
@@ -18,6 +14,9 @@ from services import (
 )
 from ui.main_window import run_app
 from vision.ocr_runtime import create_ocr_runtime_engine
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parent
 
 
 def _log_retention_days(config_manager: ConfigManager | None = None) -> int:
@@ -30,7 +29,7 @@ def _log_retention_days(config_manager: ConfigManager | None = None) -> int:
 
 
 def _runtime_state_path() -> Path:
-    return Path(__file__).resolve().parent / "runtime" / "install_state.json"
+    return PACKAGE_ROOT / "runtime" / "install_state.json"
 
 
 def _load_runtime_state() -> dict[str, object] | None:
@@ -59,12 +58,14 @@ def _preload_ocr_runtime() -> str:
         return ""
     if str(state.get("validation", "")).strip().lower() != "ok":
         return ""
-    engine = create_ocr_runtime_engine(
-        {
-            "backend": state.get("backend", "auto"),
-            "model_tier": state.get("model_tier", "auto"),
-        }
-    )
+    config = {
+        "backend": state.get("backend", "auto"),
+        "model_tier": state.get("model_tier", "auto"),
+    }
+    execution_mode = str(state.get("execution_mode", "") or "").strip()
+    if execution_mode:
+        config["execution_mode"] = execution_mode
+    engine = create_ocr_runtime_engine(config)
     return str(engine.preload() or "")
 
 
@@ -76,11 +77,11 @@ def main() -> int:
     try:
         _preload_ocr_runtime()
         return run_app(sys.argv)
-    except Exception as exc:
-        _show_startup_error(f"OCR模型加载失败：{exc}")
-        return 1
     except KeyboardInterrupt:
         return 130
+    except Exception as exc:
+        _show_startup_error(f"OCR runtime preload failed: {exc}")
+        return 1
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ class XinyuApp(BaseApp):
         sent_callback: Callable[[ReplyAction, dict[str, str]], None] | None = None,
     ) -> None:
         merged_config = _deep_merge(DEFAULT_CONFIG, config or {})
+        steps._disable_dialogue_region_filter(merged_config)
         super().__init__(robot, merged_config)
         self.reply_provider = reply_provider or (lambda message: "")
         self.sent_callback = sent_callback
@@ -241,7 +242,7 @@ class XinyuApp(BaseApp):
             if self.sent_callback:
                 reporter("mark_sent", "记录发送结果")
                 self.sent_callback(action, message)
-            steps.go_back(self.robot, self.config, reporter=reporter)
+            steps.go_back(self.robot, self.config, double_click_on_first_attempt=True, reporter=reporter)
             self._mark_activity()
             reporter("wait_next_round", "等待下一轮扫描")
             self.record_reply_round(time.monotonic() - round_started_at)

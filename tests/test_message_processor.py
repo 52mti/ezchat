@@ -132,6 +132,54 @@ def test_message_processor_uses_app_scoped_persona(tmp_path):
     assert ai.last_persona["requestPersona"] == DEFAULT_PERSONA_ID
 
 
+def test_message_processor_uses_device_app_scoped_request_persona(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "global": {"apikey": "key", "persona": {"requestPersona": "global-persona"}},
+                "devices": [
+                    {
+                        "ip": "1.1.1.1",
+                        "selected_app": "wechat",
+                        "app_overrides": {
+                            "wechat": {
+                                "persona": {
+                                    "requestPersona": "wechat-device-app-persona",
+                                    "name": "wechat-bot",
+                                }
+                            },
+                            "xinyu": {
+                                "persona": {
+                                    "requestPersona": "xinyu-device-app-persona",
+                                    "name": "xinyu-bot",
+                                }
+                            },
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    config = ConfigManager(config_path, tmp_path / "outbox.json")
+    ai = FakeAI()
+    device = config.find_device("1.1.1.1") or {"ip": "1.1.1.1"}
+    processor = MessageProcessor(
+        device=device,
+        app_name="wechat",
+        config_manager=config,
+        ai_client=ai,  # type: ignore[arg-type]
+        memory_store=MemoryStore(tmp_path / "memory"),
+    )
+
+    processor.prepare_reply({"contact": "张三", "content": "你好", "message_time": "12:00"})
+
+    assert ai.last_persona["requestPersona"] == "wechat-device-app-persona"
+    assert ai.last_persona["name"] == "wechat-bot"
+
+
 def test_message_processor_prefers_app_persona_over_device_persona(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(

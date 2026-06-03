@@ -377,6 +377,69 @@ def test_huanyou_dialogue_rules_keep_colored_chat_bubbles_only():
     ]
 
 
+def test_huanyou_dialogue_user_name_uses_configured_top_ratio():
+    item = {
+        "text": "错误名字",
+        "raw_text": "错误名字",
+        "confidence": 0.99,
+        "min_x": 240,
+        "max_x": 340,
+        "min_y": 116,
+        "max_y": 128,
+        "center_x": 290,
+        "center_y": 122,
+        "width": 100,
+        "height": 12,
+        "background_saturation": 0.1,
+    }
+
+    result = build_dialogue_result([item], (681, 1222), HUANYOU_DIALOGUE_OCR_MODE["rules"])
+
+    assert result["user_name"] == ""
+
+
+def test_huanyou_dialogue_user_name_uses_configured_x_center_range():
+    item = {
+        "text": "错误名字",
+        "raw_text": "错误名字",
+        "confidence": 0.99,
+        "min_x": 80,
+        "max_x": 180,
+        "min_y": 56,
+        "max_y": 92,
+        "center_x": 130,
+        "center_y": 74,
+        "width": 100,
+        "height": 36,
+        "background_saturation": 0.1,
+    }
+
+    result = build_dialogue_result([item], (681, 1222), HUANYOU_DIALOGUE_OCR_MODE["rules"])
+
+    assert result["user_name"] == ""
+
+
+def test_huanyou_dialogue_user_name_excludes_distance_text():
+    item = {
+        "text": "3km内",
+        "raw_text": "3km内",
+        "confidence": 0.99,
+        "min_x": 260,
+        "max_x": 340,
+        "min_y": 56,
+        "max_y": 92,
+        "center_x": 300,
+        "center_y": 74,
+        "width": 80,
+        "height": 36,
+        "background_saturation": 0.1,
+    }
+
+    result = build_dialogue_result([item], (681, 1222), HUANYOU_DIALOGUE_OCR_MODE["rules"])
+
+    assert result["user_name"] == ""
+
+
 def test_huanyou_dialogue_rules_do_not_merge_separate_left_bubbles_with_large_gap():
     def item(text: str, min_x: int, max_x: int, min_y: int, max_y: int) -> dict:
         return {

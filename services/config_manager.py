@@ -14,7 +14,6 @@ from typing import Any
 DEFAULT_CONFIG: dict[str, Any] = {
     "schema_version": 1,
     "global": {
-        "apikey": "",
         "license_api_url": "",
         "project_uuid": "",
         "project_secret": "",
@@ -184,6 +183,49 @@ def _load_json_dict(path: Path) -> dict[str, Any]:
     return copy.deepcopy(data) if isinstance(data, dict) else {}
 
 
+def _normalize_secret_value(value: Any) -> str:
+    text = str(value or "")
+    for marker in ("\ufeff", "\u200b", "\u200c", "\u200d", "\u2060"):
+        text = text.replace(marker, "")
+    return text.strip()
+
+
+def _read_local_apikey(config_path: Path) -> str:
+    env_dir = config_path.parent / ".env"
+    for path in (env_dir / "apikey.txt", env_dir / "apikey"):
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            stripped = _normalize_secret_value(line)
+            if not stripped or stripped.startswith("#"):
+                continue
+            if "=" in stripped:
+                key, value = stripped.split("=", 1)
+                if _normalize_secret_value(key).lower() in {"apikey", "chatbot_apikey", "chatbot_api_key"}:
+                    stripped = _normalize_secret_value(value).strip('"').strip("'")
+                else:
+                    continue
+            return stripped
+    return ""
+
+
+def _write_local_apikey(config_path: Path, apikey: str) -> None:
+    env_dir = config_path.parent / ".env"
+    path = env_dir / "apikey.txt"
+    value = _normalize_secret_value(apikey)
+    env_dir.mkdir(parents=True, exist_ok=True)
+    if not value:
+        path.unlink(missing_ok=True)
+        return
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(f"CHATBOT_APIKEY={value}\n", encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
@@ -309,6 +351,7 @@ class ConfigManager:
         self._outbox = self._load_json(self.outbox_path, DEFAULT_OUTBOX)
         self._migrate_if_needed()
         self._normalize_loaded_device_scopes()
+        self._move_config_apikey_to_env()
         self._apply_environment_overrides()
 
     def _load_json(self, path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -367,6 +410,15 @@ class ConfigManager:
                 changed = True
         if changed:
             self._atomic_write(self.config_path, self._config)
+
+    def _move_config_apikey_to_env(self) -> None:
+        global_config = self._config.get("global", {})
+        if not isinstance(global_config, dict) or "apikey" not in global_config:
+            return
+        file_apikey = _normalize_secret_value(global_config.pop("apikey", ""))
+        if file_apikey and not os.getenv("CHATBOT_APIKEY") and not _read_local_apikey(self.config_path):
+            _write_local_apikey(self.config_path, file_apikey)
+        self._atomic_write(self.config_path, self._config)
 
     def _migrate_config(
         self,
@@ -427,7 +479,7 @@ class ConfigManager:
         return migrated
 
     def _apply_environment_overrides(self) -> None:
-        apikey = os.getenv("CHATBOT_APIKEY")
+        apikey = _normalize_secret_value(os.getenv("CHATBOT_APIKEY")) or _read_local_apikey(self.config_path)
         if apikey:
             self._config.setdefault("global", {})["apikey"] = apikey
 
@@ -602,6 +654,14 @@ class ConfigManager:
         if not keys:
             raise ValueError("at least one key is required")
         with self._lock:
+            if keys == ("global", "apikey"):
+                apikey = str(value or "").strip()
+                _write_local_apikey(self.config_path, apikey)
+                self._config.setdefault("global", {}).pop("apikey", None)
+                self._atomic_write(self.config_path, self._config)
+                if apikey:
+                    self._config.setdefault("global", {})["apikey"] = apikey
+                return
             current = self._config
             for key in keys[:-1]:
                 current = current.setdefault(key, {})

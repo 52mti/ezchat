@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import importlib
+import json
 import queue
 import re
 import signal
@@ -62,6 +63,15 @@ from vision.screen import ensure_portrait_image
 from workers import DeviceWorker, WorkerEvent
 
 
+PERSONA_PRESETS: tuple[tuple[str, str], ...] = (
+    ("偶尔开车", "REMOVED-BEARER-TOKEN"),
+    ("特别素", "REMOVED-BEARER-TOKEN"),
+    ("心遇优化版", "REMOVED-BEARER-TOKEN"),
+    ("漂流瓶引诱", "REMOVED-BEARER-TOKEN"),
+)
+CUSTOM_PERSONA_LABEL = "自定义"
+
+
 def _pixmap_from_pil_image(image: Image.Image) -> QPixmap:
     buffer = BytesIO()
     image.convert("RGB").save(buffer, format="PNG")
@@ -82,6 +92,92 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             merged[key] = copy.deepcopy(value)
     return merged
+
+
+def _create_request_persona_selector(current_value: str) -> tuple[QWidget, QComboBox, QLineEdit]:
+    current = str(current_value or "").strip()
+    container = QWidget()
+    layout = QHBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(8)
+
+    combo = QComboBox()
+    for label, persona_id in PERSONA_PRESETS:
+        combo.addItem(label, persona_id)
+    combo.addItem(CUSTOM_PERSONA_LABEL, "")
+
+    custom_input = QLineEdit()
+    custom_input.setPlaceholderText("请输入人设授权 ID")
+
+    matched_index = -1
+    for index, (_label, persona_id) in enumerate(PERSONA_PRESETS):
+        if persona_id == current:
+            matched_index = index
+            break
+    if matched_index >= 0:
+        combo.setCurrentIndex(matched_index)
+        custom_input.setText("")
+    else:
+        combo.setCurrentText(CUSTOM_PERSONA_LABEL)
+        custom_input.setText(current)
+
+    def sync_custom_input() -> None:
+        is_custom = combo.currentText() == CUSTOM_PERSONA_LABEL
+        custom_input.setVisible(is_custom)
+        custom_input.setEnabled(is_custom)
+
+    combo.currentIndexChanged.connect(lambda _index: sync_custom_input())
+    sync_custom_input()
+
+    layout.addWidget(combo, 0)
+    layout.addWidget(custom_input, 1)
+    return container, combo, custom_input
+
+
+def _request_persona_value(combo: QComboBox, custom_input: QLineEdit) -> str:
+    selected = combo.currentData()
+    if combo.currentText() == CUSTOM_PERSONA_LABEL:
+        return custom_input.text().strip()
+    return str(selected or "").strip()
+
+
+def _ocr_device_label_from_backend(backend: object) -> str:
+    normalized = str(backend or "").strip().lower()
+    if normalized in {"paddle_cuda", "onnx_directml", "gpu", "cuda", "directml"}:
+        return "GPU"
+    if normalized == "cpu":
+        return "CPU"
+    return ""
+
+
+def _ocr_mode_label(config_manager: ConfigManager) -> str:
+    config_root = Path(getattr(config_manager, "config_path", Path("config.json"))).resolve().parent
+    state_path = config_root / "runtime" / "install_state.json"
+    if state_path.is_file():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        if isinstance(state, dict):
+            device = str(state.get("ocr_device", "") or "").strip().lower()
+            if device.startswith(("gpu", "cuda", "dml")):
+                return "OCR: GPU"
+            if device == "cpu":
+                return "OCR: CPU"
+            label = _ocr_device_label_from_backend(state.get("backend", ""))
+            if label:
+                return f"OCR: {label}"
+
+    devices = config_manager.get("devices", default=[])
+    device = devices[0] if isinstance(devices, list) and devices and isinstance(devices[0], dict) else {}
+    app_name = str(device.get("selected_app", "wechat") or "wechat")
+    device_ip = str(device.get("ip", "") or "")
+    app_config = config_manager.get_app_config(device_ip, app_name, _app_default_config(app_name))
+    ocr_config = app_config.get("ocr", {}) if isinstance(app_config.get("ocr", {}), dict) else {}
+    label = _ocr_device_label_from_backend(ocr_config.get("backend", ocr_config.get("ocr_backend", "")))
+    if not label:
+        label = "GPU" if bool(ocr_config.get("use_gpu", False)) else "CPU"
+    return f"OCR: {label}"
 
 
 def _app_default_config(app_name: str) -> dict[str, Any]:
@@ -138,6 +234,14 @@ QLabel#MetricValue {
 QLabel#MetricLabel {
   color: #64748b;
   font-size: 12px;
+}
+QLabel#OcrModeLabel {
+  color: #475569;
+  background: #f1f5f9;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-weight: 600;
 }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
   min-height: 30px;
@@ -381,6 +485,10 @@ class MainWindow(QMainWindow):
         self.scan_device_button = self._button("扫描设备")
         self.scan_device_button.clicked.connect(self._scan_devices)
         top_bar.addWidget(self.scan_device_button)
+        top_bar.addSpacing(12)
+        self.ocr_mode_label = QLabel(_ocr_mode_label(self.config_manager))
+        self.ocr_mode_label.setObjectName("OcrModeLabel")
+        top_bar.addWidget(self.ocr_mode_label)
         top_bar.addStretch(1)
         layout.addWidget(top_panel)
 
@@ -1003,21 +1111,12 @@ class MainWindow(QMainWindow):
             return f"[{event.level}] {event.device_ip}: 欢友余额 {payload.get('balance', '')}"
         if event.message == "huanyou_balance_failed":
             return f"[{event.level}] {event.device_ip}: 欢友余额读取失败 {payload.get('error', '')}"
-        if event.message == "robot_monitor_before_operation":
-            operation = str(payload.get("operation", "") or "")
-            recent_count = len(payload.get("recent_statuses", []) or [])
-            current_status = payload.get("current_status", {}) if isinstance(payload.get("current_status", {}), dict) else {}
-            ok = current_status.get("ok")
-            error = str(current_status.get("error", "") or "")
-            suffix = "状态正常" if ok else f"状态异常 {error}".strip()
-            return f"[{event.level}] {event.device_ip}: 机械臂监控 {operation} 前，最近 {recent_count} 步，{suffix}"
-        if event.message == "robot_monitor_after_operation":
-            operation = str(payload.get("operation", "") or "")
-            ok_text = "成功" if bool(payload.get("ok")) else "失败"
-            elapsed = payload.get("elapsed_seconds", "")
+        if event.message == "app_error":
+            label = str(payload.get("label", "") or payload.get("step", "") or "")
             error = str(payload.get("error", "") or "")
-            suffix = f"，{error}" if error else ""
-            return f"[{event.level}] {event.device_ip}: 机械臂监控 {operation} {ok_text}，用时 {elapsed}s{suffix}"
+            count = payload.get("error_count", "")
+            suffix = f"（第 {count} 次）" if count != "" else ""
+            return f"[{event.level}] {event.device_ip}: 运行异常{suffix} {label}：{error}"
         if event.message in {"memory hit", "memory miss", "memory updated", "memory lookup failed", "memory update failed"}:
             contact = str(payload.get("contact", "") or "")
             conversation_id = str(payload.get("conversation_id", "") or "")
@@ -1247,8 +1346,11 @@ class _LegacyAppConfigDialog(QDialog):
         persona_layout.setSpacing(10)
         persona = overrides.get("persona", {}) if isinstance(overrides.get("persona", {}), dict) else {}
         self.persona_inputs: dict[str, QLineEdit] = {}
+        persona_selector, self.request_persona_combo, self.request_persona_custom_input = _create_request_persona_selector(
+            str(persona.get("requestPersona", ""))
+        )
+        persona_layout.addRow("人设授权 ID", persona_selector)
         for key, label in [
-            ("requestPersona", "人设授权 ID"),
             ("name", "名字"),
             ("age", "年龄"),
             ("work", "职业"),
@@ -1314,7 +1416,10 @@ class _LegacyAppConfigDialog(QDialog):
                 "buttons": str(self.template_manager.buttons_dir),
                 "screens": str(self.template_manager.screens_dir),
             },
-            "persona": {key: field.text().strip() for key, field in self.persona_inputs.items()},
+            "persona": {
+                "requestPersona": _request_persona_value(self.request_persona_combo, self.request_persona_custom_input),
+                **{key: field.text().strip() for key, field in self.persona_inputs.items()},
+            },
         })
         if self.app_name == "huanyou":
             values["next_message_click_x_offset"] = self.template_manager.next_message_click_x_offset
@@ -2231,8 +2336,11 @@ class AppConfigDialog(QDialog):
         form.setSpacing(10)
         persona = overrides.get("persona", {}) if isinstance(overrides.get("persona", {}), dict) else {}
         self.persona_inputs: dict[str, QLineEdit] = {}
+        persona_selector, self.request_persona_combo, self.request_persona_custom_input = _create_request_persona_selector(
+            str(persona.get("requestPersona", ""))
+        )
+        form.addRow("人设授权 ID", persona_selector)
         for key, label in [
-            ("requestPersona", "人设授权 ID"),
             ("name", "名字"),
             ("age", "年龄"),
             ("work", "职业"),
@@ -2308,7 +2416,10 @@ class AppConfigDialog(QDialog):
                 "buttons": str(self.template_manager.buttons_dir),
                 "screens": str(self.template_manager.screens_dir),
             },
-            "persona": {key: field.text().strip() for key, field in self.persona_inputs.items()},
+            "persona": {
+                "requestPersona": _request_persona_value(self.request_persona_combo, self.request_persona_custom_input),
+                **{key: field.text().strip() for key, field in self.persona_inputs.items()},
+            },
         })
         return values
 

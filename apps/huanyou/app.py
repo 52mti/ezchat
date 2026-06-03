@@ -226,7 +226,7 @@ class HuanyouApp(BaseApp):
         self.recover_error_count = 0
         self.emit_runtime_log(
             "warning",
-            "huanyou_step_unavailable",
+            f"huanyou_step_unavailable: {exc}",
             {
                 "step": self.status.current_step,
                 "label": self.status.current_step_label,
@@ -311,7 +311,7 @@ class HuanyouApp(BaseApp):
                         "huanyou_next_chat_missing",
                         {"previous_name": current_name, "reason": str(exc)},
                     )
-                    steps.go_back(self.robot, self.config, reporter=reporter)
+                    steps.go_back(self.robot, self.config, reporter=reporter, click_count=2)
                     self._mark_activity()
                     reporter("wait_next_round", "???????")
                     self.record_reply_round(time.monotonic() - round_started_at)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -20,8 +21,9 @@ class AIReply:
 
 
 DEFAULT_CHAT_BEARER = "REMOVED-BEARER-TOKEN"
-DEFAULT_CREDITS_BEARER = "REMOVED-BEARER-TOKEN-12.13"
+DEFAULT_CREDITS_BEARER = "REMOVED-BEARER-TOKEN"
 INSUFFICIENT_CREDIT_HINTS = ("次数不足", "请充值", "余额不足", "剩余积分不足")
+JSON_CODE_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
 
 
 class AIClient:
@@ -45,16 +47,32 @@ class AIClient:
         return {"Authorization": f"Bearer {bearer}", "Content-Type": "application/json"}
 
     @staticmethod
+    def _answer_candidates(answer: str) -> list[str]:
+        raw = str(answer or "").strip()
+        candidates = [raw]
+        match = JSON_CODE_BLOCK_RE.search(raw)
+        if match:
+            candidates.insert(0, match.group(1).strip())
+        return [candidate for candidate in candidates if candidate]
+
+    @staticmethod
+    def _text_from_answer_string(answer: str) -> str:
+        fallback = str(answer or "")
+        for candidate in AIClient._answer_candidates(answer):
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return str(parsed.get("huifu", ""))
+        return fallback
+
+    @staticmethod
     def parse_reply_payload(payload: dict[str, Any]) -> AIReply:
         answer = payload.get("answer", "")
         text = ""
         if isinstance(answer, str):
-            try:
-                parsed = json.loads(answer)
-            except json.JSONDecodeError:
-                text = answer
-            else:
-                text = str(parsed.get("huifu", ""))
+            text = AIClient._text_from_answer_string(answer)
         elif isinstance(answer, dict):
             text = str(answer.get("huifu", ""))
 
@@ -80,6 +98,8 @@ class AIClient:
     ) -> AIReply:
         if not apikey:
             raise AIClientError("apikey is not configured")
+        request_persona = str(persona.get("requestPersona", "") or "").strip()
+        chat_bearer = request_persona or self.chat_bearer
         payload = {
             "inputs": {
                 "name": persona.get("name", ""),
@@ -99,7 +119,7 @@ class AIClient:
             try:
                 response = self.session.post(
                     f"{self.api_base}/v1/chat-messages",
-                    headers=self._headers(self.chat_bearer),
+                    headers=self._headers(chat_bearer),
                     json=payload,
                     timeout=self.timeout,
                 )

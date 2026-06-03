@@ -94,7 +94,7 @@ DIALOGUE_OCR_MODE = {
             "enable_time_text_filter": True,
             "enable_debug_text_filter": True,
             "enable_reward_text_filter": True,
-            "enable_center_y_region_filter": True,
+            "enable_center_y_region_filter": False,
             "center_y_min_ratio": 0.18,
             "center_y_max_ratio": 0.88,
             "enable_max_x_filter": True,

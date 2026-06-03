@@ -1,17 +1,3 @@
-"""构建「机械臂脚本」交付包。
-
-设计见 `打包流程.md`：
-- 瘦启动器 `机械臂脚本.exe`（launcher_entry.py）与安装器 `安装环境.exe`（install_launcher_entry.py）由 PyInstaller 冻结；
-- 随包带嵌入式引导 Python（`_bootstrap/python/`）与离线通用依赖（`wheelhouse/`）；
-- OCR 模型与显卡相关后端由客户机首次运行 `安装环境.cmd` 联网安装；
-- `config.json` 等密钥文件、内部文档、测试与缓存不打包。
-
-构建机要求：Windows + Python 3.13 + win_amd64。
-
-纯函数（被 tests/test_build_package*.py 约束）只用标准库，PyInstaller / pip download
-等重步骤延迟导入或以子进程调用，确保 `import build` 轻量可测。
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -22,21 +8,18 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 from typing import Iterator
 
 
-PACKAGE_NAME = "机械臂脚本"
+PACKAGE_NAME = "jixiebijiaoben"
 LAUNCHER_EXE = "机械臂脚本.exe"
-INSTALLER_EXE = "安装环境.exe"
 LAUNCHER_ALIAS_EXE = "jixiebijiaoben_launcher.exe"
-INSTALLER_ALIAS_EXE = "jixiebijiaoben_installer.exe"
+START_CMD = "start_jixiebijiaoben.cmd"
+DEFAULT_FULL_PACKAGE_NVIDIA_LANE = "cu118"
 
-# pip download 默认走清华镜像，避免直连 PyPI 超时；可用 --index-url 覆盖（如阿里源）。
-DEFAULT_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
-
-# 源码与运行所需文件（从工作树复制；未提交 git 的运行时文件也会一并带上）。
 INCLUDE_PATHS = [
     "apps",
     "vision",
@@ -46,30 +29,35 @@ INCLUDE_PATHS = [
     "lgb",
     "main.py",
     "launcher_entry.py",
-    "install_runtime.py",
-    "install_launcher_entry.py",
+    "ocr_subprocess_entry.py",
+    "runtime_layout.py",
     "requirements.txt",
     "pyproject.toml",
     "config.json.example",
-    "runtime_manifest.json",  # 可选：存在才复制（缺省走代码内置默认清单）
+    "runtime_manifest.json",
 ]
 
-# 运行时随包带上的默认数据文件（相对工作树）。
 BUNDLED_DATA_FILES = [
     "runtime/greetings/pingtai.txt",
 ]
 
-# 交付包内需保留的空目录骨架。
 RUNTIME_SKELETON_DIRS = [
+    "runtime/app",
+    "runtime/ocr_cpu",
+    "runtime/ocr_nvidia",
+    "runtime/ocr_directml",
     "runtime/logs",
     "runtime/errors",
     "runtime/memory",
+    "runtime/reports",
+    "runtime/tmp/ocr_requests",
     "runtime/greetings",
+    "models/ocr/paddlex_named_models",
+    "models/ocr/metadata",
     "photo",
     "photo/errors",
 ]
 
-# 复制源码时忽略的名称 / 后缀。
 _IGNORE_NAMES = {
     ".git",
     ".gitignore",
@@ -77,21 +65,29 @@ _IGNORE_NAMES = {
     ".pytest_cache",
     ".ruff_cache",
     ".mypy_cache",
+    ".env",
     "dist",
     "build",
-    "config.json",
+    "wheelhouse",
+    "_bootstrap",
     "outbox.json",
     "install_state.json",
     "AGENTS.md",
 }
-_IGNORE_SUFFIXES = (".pyc", ".pyo", ".tmp", ".md")  # 内部 .md 文档一律不打包
+_IGNORE_SUFFIXES = (".pyc", ".pyo", ".tmp", ".md")
+_STORED_SUFFIXES = {".zip", ".jpg", ".jpeg", ".png", ".gz", ".7z", ".exe"}
 
-# 已是压缩格式的文件，入 zip 时不再二次压缩（STORED），避免对 wheel/图片做无谓 DEFLATE。
-_STORED_SUFFIXES = {".whl", ".zip", ".jpg", ".jpeg", ".png", ".gz", ".7z", ".exe"}
-
-# lite wheelhouse 默认只随包体积小的通用 wheel（单个 ≤ 此阈值 MB），
-# 大件（opencv / numpy / PyQt6-Qt6 / scipy / pywin32 等）仍由客户机联网安装。
-LITE_WHEEL_MAX_MB = 5.0
+RUNTIME_CACHE_INPUTS = (
+    "runtime_builder.py",
+    "runtime_manifest.json",
+    "requirements.txt",
+    "runtime_layout.py",
+    "ocr_subprocess_entry.py",
+)
+PACKAGE_CACHE_EXTRA_INPUTS = (
+    "build.py",
+    "runtime_builder.py",
+)
 
 
 def _requirements_specs(root: Path) -> list[str]:
@@ -108,7 +104,6 @@ def _requirements_specs(root: Path) -> list[str]:
 
 
 def _runtime_manifest_payload(root: Path) -> dict:
-    """读取 runtime_manifest.json；缺省时回退到与代码一致的默认共享包清单。"""
     default = {
         "sharedPackages": [
             {"spec": "paddleocr==3.4.0"},
@@ -120,10 +115,10 @@ def _runtime_manifest_payload(root: Path) -> dict:
     if not path.is_file():
         return default
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return default
-    return loaded if isinstance(loaded, dict) else default
+    return payload if isinstance(payload, dict) else default
 
 
 def _shared_runtime_specs(root: Path) -> set[str]:
@@ -140,9 +135,34 @@ def _shared_runtime_specs(root: Path) -> set[str]:
 
 
 def _bundled_dependency_specs(root: Path) -> list[str]:
-    """通用离线依赖 = requirements.txt 去掉 manifest 中的共享 OCR 包。"""
     shared = _shared_runtime_specs(root)
     return [spec for spec in _requirements_specs(root) if spec not in shared]
+
+
+def _manifest_default_model_spec(root: Path, *, backend_key: str, model_tier: str) -> dict[str, str]:
+    payload = _runtime_manifest_payload(root)
+    models = payload.get("models", {})
+    if not isinstance(models, dict):
+        return {}
+    tiers = models.get("tiers", {})
+    if not isinstance(tiers, dict):
+        return {}
+    tier_payload = tiers.get(model_tier, {})
+    if not isinstance(tier_payload, dict):
+        return {}
+    backends = tier_payload.get("backends", {})
+    if not isinstance(backends, dict):
+        return {}
+    backend_payload = backends.get(backend_key, {})
+    if not isinstance(backend_payload, dict):
+        return {}
+    return {
+        "provider": str(backend_payload.get("provider", "") or "").strip(),
+        "det": str(backend_payload.get("detModelName", "") or "").strip(),
+        "rec": str(backend_payload.get("recModelName", "") or "").strip(),
+        "det_version": str(backend_payload.get("detVersion", "") or "").strip(),
+        "rec_version": str(backend_payload.get("recVersion", "") or "").strip(),
+    }
 
 
 def _relative_matches_prefix(relative: str, prefix: str) -> bool:
@@ -150,66 +170,45 @@ def _relative_matches_prefix(relative: str, prefix: str) -> bool:
     return relative == normalized or relative.startswith(normalized + "/")
 
 
-# --------------------------------------------------------------------------- #
-# 压缩档
-# --------------------------------------------------------------------------- #
-
-def _archive_excludes(relative: str, *, exclude_wheelhouse: bool, exclude_bootstrap: bool) -> bool:
-    """判断交付包内的相对路径是否应被压缩档排除。"""
-    if exclude_bootstrap and _relative_matches_prefix(relative, "_bootstrap"):
+def _archive_excludes(relative: str, *, exclude_runtime_state: bool, exclude_full_runtimes: bool) -> bool:
+    if exclude_runtime_state and relative == "runtime/install_state.json":
         return True
-    if relative == "runtime/install_state.json":
+    if exclude_full_runtimes and (
+        _relative_matches_prefix(relative, "runtime/app")
+        or _relative_matches_prefix(relative, "runtime/ocr_cpu")
+        or _relative_matches_prefix(relative, "runtime/ocr_nvidia")
+        or _relative_matches_prefix(relative, "runtime/ocr_directml")
+        or _relative_matches_prefix(relative, "models/ocr")
+    ):
         return True
     if _relative_matches_prefix(relative, "runtime/.paddlex"):
-        return True
-    if exclude_wheelhouse and _relative_matches_prefix(relative, "wheelhouse"):
         return True
     parts = relative.split("/")
     if "__pycache__" in parts:
         return True
-    if relative.endswith((".pyc", ".pyo")):
-        return True
-    return False
+    return relative.endswith((".pyc", ".pyo"))
 
 
-def _iter_archive_dirs(
-    package_root: Path,
-    *,
-    exclude_wheelhouse: bool,
-    exclude_bootstrap: bool,
-) -> Iterator[str]:
+def _iter_archive_dirs(package_root: Path, *, exclude_runtime_state: bool, exclude_full_runtimes: bool) -> Iterator[str]:
     for path in sorted(package_root.rglob("*")):
         if not path.is_dir():
             continue
         relative = path.relative_to(package_root).as_posix()
         if not relative:
             continue
-        if _archive_excludes(
-            relative,
-            exclude_wheelhouse=exclude_wheelhouse,
-            exclude_bootstrap=exclude_bootstrap,
-        ):
+        if _archive_excludes(relative, exclude_runtime_state=exclude_runtime_state, exclude_full_runtimes=exclude_full_runtimes):
             continue
-        yield f"{package_root.name}/{relative}/"
+        yield f"{PACKAGE_NAME}/{relative}/"
 
 
-def _iter_archive_files(
-    package_root: Path,
-    *,
-    exclude_wheelhouse: bool,
-    exclude_bootstrap: bool,
-) -> Iterator[tuple[Path, str]]:
+def _iter_archive_files(package_root: Path, *, exclude_runtime_state: bool, exclude_full_runtimes: bool) -> Iterator[tuple[Path, str]]:
     for path in sorted(package_root.rglob("*")):
         if not path.is_file():
             continue
         relative = path.relative_to(package_root).as_posix()
-        if _archive_excludes(
-            relative,
-            exclude_wheelhouse=exclude_wheelhouse,
-            exclude_bootstrap=exclude_bootstrap,
-        ):
+        if _archive_excludes(relative, exclude_runtime_state=exclude_runtime_state, exclude_full_runtimes=exclude_full_runtimes):
             continue
-        yield path, f"{package_root.name}/{relative}"
+        yield path, f"{PACKAGE_NAME}/{relative}"
 
 
 def _write_archive(
@@ -217,95 +216,79 @@ def _write_archive(
     dist_root: Path,
     suffix: str,
     *,
-    exclude_wheelhouse: bool,
-    exclude_bootstrap: bool,
+    exclude_runtime_state: bool,
+    exclude_full_runtimes: bool,
 ) -> Path:
     dist_root.mkdir(parents=True, exist_ok=True)
-    archive_path = dist_root / f"{package_root.name}{suffix}.zip"
+    archive_path = dist_root / f"{PACKAGE_NAME}{suffix}.zip"
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for arcname in _iter_archive_dirs(
             package_root,
-            exclude_wheelhouse=exclude_wheelhouse,
-            exclude_bootstrap=exclude_bootstrap,
+            exclude_runtime_state=exclude_runtime_state,
+            exclude_full_runtimes=exclude_full_runtimes,
         ):
             archive.writestr(arcname, "")
         for path, arcname in _iter_archive_files(
             package_root,
-            exclude_wheelhouse=exclude_wheelhouse,
-            exclude_bootstrap=exclude_bootstrap,
+            exclude_runtime_state=exclude_runtime_state,
+            exclude_full_runtimes=exclude_full_runtimes,
         ):
-            compress = zipfile.ZIP_STORED if path.suffix.lower() in _STORED_SUFFIXES else zipfile.ZIP_DEFLATED
-            archive.write(path, arcname, compress_type=compress)
+            compression = zipfile.ZIP_STORED if path.suffix.lower() in _STORED_SUFFIXES else zipfile.ZIP_DEFLATED
+            archive.write(path, arcname, compress_type=compression)
     return archive_path
 
 
 def _write_full_package_archive(package_root: Path, dist_root: Path) -> Path:
-    """全量交付包：含引导 Python、wheelhouse 等离线资源，但排除安装状态、模型缓存。"""
     return _write_archive(
         package_root,
         dist_root,
         "_full",
-        exclude_wheelhouse=False,
-        exclude_bootstrap=False,
+        exclude_runtime_state=False,
+        exclude_full_runtimes=False,
     )
 
 
 def _write_customer_update_archive(package_root: Path, dist_root: Path) -> Path:
-    """增量更新包：仅源码/资源/exe，额外排除 wheelhouse 与引导 Python。"""
     return _write_archive(
         package_root,
         dist_root,
         "_update",
-        exclude_wheelhouse=True,
-        exclude_bootstrap=True,
+        exclude_runtime_state=True,
+        exclude_full_runtimes=True,
     )
 
 
-# --------------------------------------------------------------------------- #
-# 复制与组装
-# --------------------------------------------------------------------------- #
-
 def _ignore(_dir_path: str, names: list[str]) -> set[str]:
-    ignored: set[str] = set()
-    for name in names:
-        if name in _IGNORE_NAMES:
-            ignored.add(name)
-        elif name.endswith(_IGNORE_SUFFIXES):
-            ignored.add(name)
-        elif name.endswith(".bak") or name.startswith("config.json.bak"):
-            ignored.add(name)
+    ignored = {name for name in names if name in _IGNORE_NAMES}
+    ignored.update(name for name in names if any(name.endswith(suffix) for suffix in _IGNORE_SUFFIXES))
     return ignored
 
 
 def _copy_item(source: Path, target: Path) -> None:
     if source.is_dir():
         shutil.copytree(source, target, ignore=_ignore, dirs_exist_ok=True)
-    else:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
 
 
 def _handle_remove_readonly(function, path, _excinfo) -> None:
-    try:
-        os.chmod(path, stat.S_IWRITE)
-        function(path)
-    except FileNotFoundError:
-        return
+    os.chmod(path, stat.S_IWRITE)
+    function(path)
 
 
 def _copy_sources(root: Path, package_root: Path) -> None:
     for relative in INCLUDE_PATHS:
         source = root / relative
-        if source.exists():
-            _copy_item(source, package_root / relative)
-    # 调试 demo 与编译缓存不进包
-    for junk in (package_root / "lgb" / "test.py",):
-        junk.unlink(missing_ok=True)
-    for cache in package_root.rglob("__pycache__"):
-        if cache.is_dir():
-            shutil.rmtree(cache, ignore_errors=True)
-    for compiled in [*package_root.rglob("*.pyc"), *package_root.rglob("*.pyo")]:
-        compiled.unlink(missing_ok=True)
+        if not source.exists():
+            continue
+        _copy_item(source, package_root / relative)
+    for skeleton in RUNTIME_SKELETON_DIRS:
+        (package_root / skeleton).mkdir(parents=True, exist_ok=True)
+    (package_root / "runtime" / ".paddlex").mkdir(parents=True, exist_ok=True)
+    root_config = package_root / "config.json"
+    if root_config.exists():
+        root_config.unlink()
 
 
 def _copy_bundled_data(root: Path, package_root: Path) -> None:
@@ -313,10 +296,499 @@ def _copy_bundled_data(root: Path, package_root: Path) -> None:
         source = root / relative
         if source.is_file():
             _copy_item(source, package_root / relative)
-        else:
-            print(f"[warn] 缺少随包数据文件：{relative}")
-    for relative in RUNTIME_SKELETON_DIRS:
-        (package_root / relative).mkdir(parents=True, exist_ok=True)
+
+
+def _run_build_step(command: list[str], *, cwd: Path) -> None:
+    print("[build-step] " + " ".join(str(part) for part in command))
+    subprocess.check_call(command, cwd=cwd)
+
+
+def _install_runtime_into_package(
+    root: Path,
+    package_root: Path,
+    *,
+    runtime_name: str,
+    install_scope: str,
+    backend: str | None = None,
+    model_tier: str = "lite",
+    cuda_lane: str | None = None,
+    skip_validation: bool = False,
+    bundle_models: bool = False,
+    allow_missing_hardware: bool = False,
+) -> None:
+    command = [
+        sys.executable,
+        str(root / "runtime_builder.py"),
+        "--package-root",
+        str(package_root),
+        "--runtime-name",
+        runtime_name,
+        "--install-scope",
+        install_scope,
+        "--model-tier",
+        model_tier,
+        "--skip-state-write",
+    ]
+    if backend is not None:
+        command.extend(["--backend", backend])
+    if cuda_lane is not None:
+        command.extend(["--cuda-lane", cuda_lane])
+    if skip_validation:
+        command.append("--skip-validation")
+    if bundle_models:
+        command.append("--bundle-models")
+    if allow_missing_hardware:
+        command.append("--allow-missing-hardware")
+    _run_build_step(command, cwd=root)
+
+
+def _cleanup_packaged_ocr_cache(package_root: Path) -> None:
+    cache_root = package_root / "runtime" / ".paddlex"
+    if cache_root.exists():
+        shutil.rmtree(cache_root, onexc=_handle_remove_readonly)
+
+
+def _cleanup_packaged_transients(package_root: Path) -> None:
+    _cleanup_packaged_ocr_cache(package_root)
+    for cache_dir in package_root.rglob("__pycache__"):
+        if cache_dir.is_dir():
+            shutil.rmtree(cache_dir, onexc=_handle_remove_readonly)
+
+
+def _cleanup_python_caches(package_root: Path) -> None:
+    for path in sorted(package_root.rglob("__pycache__"), reverse=True):
+        if path.is_dir():
+            shutil.rmtree(path, onexc=_handle_remove_readonly)
+    for path in package_root.rglob("*.pyc"):
+        path.unlink(missing_ok=True)
+    for path in package_root.rglob("*.pyo"):
+        path.unlink(missing_ok=True)
+
+
+def _write_full_package_runtime_state(package_root: Path, *, model_tier: str, nvidia_cuda_lane: str) -> None:
+    state_path = package_root / "runtime" / "install_state.json"
+    model_spec = _manifest_default_model_spec(package_root, backend_key="cpu", model_tier=model_tier)
+    payload = {
+        "schema_version": 5,
+        "backend": "auto",
+        "model_tier": model_tier,
+        "execution_mode": "subprocess",
+        "package_mode": "full",
+        "runtime_name": "app",
+        "cuda_lane": nvidia_cuda_lane,
+        "cache_home": str((package_root / "runtime" / ".paddlex").resolve()),
+        "status": "installed",
+        "python_executable": str((package_root / "runtime" / "app" / "python.exe").resolve()),
+        "runtime_path": str((package_root / "runtime" / "app").resolve()),
+        "message": "Full package runtimes assembled by build.py",
+        "validation": "ok",
+        "validation_error": "",
+        "ocr_device": "",
+        "hardware": {},
+        "common_packages": _bundled_dependency_specs(package_root),
+        "packages": [],
+        "installed_backends": ["cpu", "paddle_cuda", "onnx_directml"],
+        "runtime_inventory": {
+            "app": "runtime/app",
+            "cpu": "runtime/ocr_cpu",
+            "paddle_cuda": "runtime/ocr_nvidia",
+            "onnx_directml": "runtime/ocr_directml",
+        },
+        "models": model_spec,
+        "validation_details": {
+            "build_mode": "full_package",
+            "bundled_models_root": "models/ocr/paddlex_named_models",
+            "nvidia_cuda_lane": nvidia_cuda_lane,
+        },
+    }
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _runtime_cache_root(root: Path) -> Path:
+    configured = str(os.environ.get("JXB_RUNTIME_CACHE_ROOT", "") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if os.name == "nt":
+        system_drive = os.environ.get("SystemDrive", "C:")
+        return Path(system_drive + os.sep) / "jxb_rt_cache"
+    return Path(tempfile.gettempdir()) / "jxb_rt_cache"
+
+
+def _runtime_cache_key(
+    root: Path,
+    *,
+    runtime_name: str,
+    install_scope: str,
+    backend: str | None,
+    model_tier: str,
+    cuda_lane: str | None,
+    skip_validation: bool,
+    bundle_models: bool,
+) -> str:
+    payload = {
+        "runtime_name": runtime_name,
+        "install_scope": install_scope,
+        "backend": backend,
+        "model_tier": model_tier,
+        "cuda_lane": cuda_lane,
+        "skip_validation": skip_validation,
+        "bundle_models": bundle_models,
+        "python": sys.version,
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+    for relative in RUNTIME_CACHE_INPUTS:
+        path = root / relative
+        digest.update(relative.encode("utf-8"))
+        if not path.is_file():
+            digest.update(b"<missing>")
+            continue
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
+def _runtime_cache_dir(root: Path, *, runtime_name: str, cache_key: str) -> Path:
+    return _runtime_cache_root(root) / runtime_name / cache_key
+
+
+def _restore_runtime_from_cache(package_root: Path, cache_dir: Path, *, runtime_name: str) -> bool:
+    runtime_source = cache_dir / "runtime" / runtime_name
+    if not runtime_source.is_dir():
+        return False
+    runtime_target = package_root / "runtime" / runtime_name
+    if runtime_target.exists():
+        shutil.rmtree(runtime_target, onexc=_handle_remove_readonly)
+    shutil.copytree(runtime_source, runtime_target)
+    models_source = cache_dir / "models"
+    if models_source.is_dir():
+        shutil.copytree(models_source, package_root / "models", dirs_exist_ok=True)
+    return True
+
+
+def _store_runtime_cache(package_root: Path, cache_dir: Path, *, runtime_name: str, include_models: bool) -> None:
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir, onexc=_handle_remove_readonly)
+    (cache_dir / "runtime").mkdir(parents=True, exist_ok=True)
+    shutil.copytree(package_root / "runtime" / runtime_name, cache_dir / "runtime" / runtime_name)
+    if include_models:
+        models_root = package_root / "models"
+        if models_root.is_dir():
+            shutil.copytree(models_root, cache_dir / "models")
+
+
+def _ensure_runtime_available(
+    root: Path,
+    package_root: Path,
+    *,
+    runtime_name: str,
+    install_scope: str,
+    backend: str | None = None,
+    model_tier: str = "lite",
+    cuda_lane: str | None = None,
+    skip_validation: bool = False,
+    bundle_models: bool = False,
+    allow_missing_hardware: bool = False,
+    use_cache: bool = True,
+) -> None:
+    cache_key = _runtime_cache_key(
+        root,
+        runtime_name=runtime_name,
+        install_scope=install_scope,
+        backend=backend,
+        model_tier=model_tier,
+        cuda_lane=cuda_lane,
+        skip_validation=skip_validation,
+        bundle_models=bundle_models,
+    )
+    cache_dir = _runtime_cache_dir(root, runtime_name=runtime_name, cache_key=cache_key)
+    if use_cache and _restore_runtime_from_cache(package_root, cache_dir, runtime_name=runtime_name):
+        print(f"[runtime-cache] reuse {runtime_name} ({cache_key})")
+        return
+    _install_runtime_into_package(
+        root,
+        package_root,
+        runtime_name=runtime_name,
+        install_scope=install_scope,
+        backend=backend,
+        model_tier=model_tier,
+        cuda_lane=cuda_lane,
+        skip_validation=skip_validation,
+        bundle_models=bundle_models,
+        allow_missing_hardware=allow_missing_hardware,
+    )
+    if use_cache:
+        _store_runtime_cache(package_root, cache_dir, runtime_name=runtime_name, include_models=bundle_models)
+        print(f"[runtime-cache] store {runtime_name} ({cache_key})")
+
+
+def _build_full_package_runtimes(
+    root: Path,
+    package_root: Path,
+    *,
+    model_tier: str,
+    nvidia_cuda_lane: str,
+    use_cache: bool,
+) -> None:
+    _ensure_runtime_available(root, package_root, runtime_name="app", install_scope="app", model_tier=model_tier, use_cache=use_cache)
+    _ensure_runtime_available(
+        root,
+        package_root,
+        runtime_name="ocr_cpu",
+        install_scope="backend",
+        backend="cpu",
+        model_tier=model_tier,
+        bundle_models=True,
+        use_cache=use_cache,
+    )
+    _ensure_runtime_available(
+        root,
+        package_root,
+        runtime_name="ocr_nvidia",
+        install_scope="backend",
+        backend="paddle_cuda",
+        model_tier=model_tier,
+        cuda_lane=nvidia_cuda_lane,
+        skip_validation=True,
+        allow_missing_hardware=True,
+        use_cache=use_cache,
+    )
+    _ensure_runtime_available(
+        root,
+        package_root,
+        runtime_name="ocr_directml",
+        install_scope="backend",
+        backend="onnx_directml",
+        model_tier=model_tier,
+        skip_validation=True,
+        allow_missing_hardware=True,
+        use_cache=use_cache,
+    )
+
+
+def _staging_root(dist_root: Path) -> Path:
+    return dist_root / "_staging"
+
+
+def _next_staging_session_root(dist_root: Path) -> Path:
+    staging_root = _staging_root(dist_root)
+    staging_root.mkdir(parents=True, exist_ok=True)
+    for index in range(1, 1000):
+        candidate = staging_root / f"build_{index:03d}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("Could not allocate a free staging directory under dist/_staging.")
+
+
+def _prepare_staging_package_root(dist_root: Path) -> Path:
+    package_root = _next_staging_session_root(dist_root) / PACKAGE_NAME
+    package_root.mkdir(parents=True, exist_ok=True)
+    return package_root
+
+
+def _package_cache_root(root: Path) -> Path:
+    configured = str(os.environ.get("JXB_PACKAGE_CACHE_ROOT", "") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if os.name == "nt":
+        return Path(root.anchor) / "jxb_pkg_cache"
+    return Path(tempfile.gettempdir()) / "jxb_pkg_cache"
+
+
+def _iter_hashable_input_files(root: Path, relatives: list[str]) -> Iterator[tuple[str, Path]]:
+    for relative in relatives:
+        source = root / relative
+        if not source.exists():
+            continue
+        if source.is_file():
+            yield relative.replace("\\", "/"), source
+            continue
+        for path in sorted(source.rglob("*")):
+            if not path.is_file():
+                continue
+            if path.name in _ignore(str(path.parent), [path.name]):
+                continue
+            yield path.relative_to(root).as_posix(), path
+
+
+def _package_cache_key(
+    root: Path,
+    *,
+    model_tier: str,
+    nvidia_cuda_lane: str,
+    include_full_payload: bool,
+) -> str:
+    digest = hashlib.sha256()
+    payload = {
+        "model_tier": model_tier,
+        "nvidia_cuda_lane": nvidia_cuda_lane,
+        "include_full_payload": include_full_payload,
+        "python": sys.version,
+    }
+    digest.update(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+    relatives = [*INCLUDE_PATHS, *BUNDLED_DATA_FILES, *PACKAGE_CACHE_EXTRA_INPUTS]
+    for relative, path in _iter_hashable_input_files(root, relatives):
+        digest.update(relative.encode("utf-8"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
+def _package_cache_dir(root: Path, cache_key: str) -> Path:
+    return _package_cache_root(root) / cache_key
+
+
+def _package_cache_complete(
+    cache_dir: Path,
+    *,
+    require_package_dir: bool,
+    require_full_zip: bool,
+) -> bool:
+    if require_package_dir and not (cache_dir / PACKAGE_NAME).is_dir():
+        return False
+    if not (cache_dir / f"{PACKAGE_NAME}_update.zip").is_file():
+        return False
+    if require_full_zip and not (cache_dir / f"{PACKAGE_NAME}_full.zip").is_file():
+        return False
+    return True
+
+
+def _link_or_copy_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    try:
+        if source.anchor.lower() == target.anchor.lower():
+            os.link(source, target)
+            return
+    except OSError:
+        pass
+    shutil.copy2(source, target)
+
+
+def _remove_path(target: Path) -> None:
+    target_str = str(target)
+    if not os.path.lexists(target_str):
+        return
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd", "/c", "rmdir", "/S", "/Q", target_str],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+        if completed.returncode == 0 or not os.path.lexists(target_str):
+            return
+    if target.is_symlink() or target.is_file():
+        target.unlink(missing_ok=True)
+        return
+    shutil.rmtree(target, onexc=_handle_remove_readonly)
+
+
+def _junction_or_copy_dir(source: Path, target: Path) -> None:
+    if os.path.lexists(str(target)):
+        _remove_path(target)
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(target), str(source)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+        if completed.returncode == 0:
+            return
+    shutil.copytree(source, target)
+
+
+def _publish_package_directory(staged_package_root: Path, dist_root: Path) -> Path:
+    published_root = dist_root / PACKAGE_NAME
+    try:
+        _remove_path(published_root)
+        shutil.copytree(staged_package_root, published_root)
+        return published_root
+    except PermissionError:
+        locked_target = dist_root / f"{PACKAGE_NAME}_built"
+        _remove_path(locked_target)
+        shutil.copytree(staged_package_root, locked_target)
+        print(f"[warn] publish dir busy, kept new build at: {locked_target}")
+        return locked_target
+
+
+def _cleanup_staging(dist_root: Path) -> None:
+    staging_root = _staging_root(dist_root)
+    if staging_root.exists():
+        _remove_path(staging_root)
+
+
+def _remove_dist_full_archive(dist_root: Path) -> None:
+    full_zip = dist_root / f"{PACKAGE_NAME}_full.zip"
+    if full_zip.exists():
+        full_zip.unlink(missing_ok=True)
+
+
+def _publish_cached_package_directory(cached_package_root: Path, dist_root: Path) -> Path:
+    target = dist_root / PACKAGE_NAME
+    try:
+        _remove_path(target)
+        shutil.copytree(cached_package_root, target)
+        return target
+    except PermissionError:
+        fallback = dist_root / f"{PACKAGE_NAME}_built"
+        _remove_path(fallback)
+        shutil.copytree(cached_package_root, fallback)
+        print(f"[warn] publish dir busy, kept cached build at: {fallback}")
+        return fallback
+
+
+def _restore_package_from_cache(root: Path, dist_root: Path, cache_dir: Path) -> tuple[Path, Path, Path]:
+    dist_root.mkdir(parents=True, exist_ok=True)
+    full_zip = dist_root / f"{PACKAGE_NAME}_full.zip"
+    update_zip = dist_root / f"{PACKAGE_NAME}_update.zip"
+    _link_or_copy_file(cache_dir / f"{PACKAGE_NAME}_full.zip", full_zip)
+    _link_or_copy_file(cache_dir / f"{PACKAGE_NAME}_update.zip", update_zip)
+    published_root = _publish_cached_package_directory(cache_dir / PACKAGE_NAME, dist_root)
+    return published_root, full_zip, update_zip
+
+
+def _restore_archives_from_cache(
+    dist_root: Path,
+    cache_dir: Path,
+    *,
+    include_full: bool,
+) -> tuple[Path | None, Path]:
+    dist_root.mkdir(parents=True, exist_ok=True)
+    full_zip: Path | None = None
+    update_zip = dist_root / f"{PACKAGE_NAME}_update.zip"
+    target_full = dist_root / f"{PACKAGE_NAME}_full.zip"
+    if include_full:
+        cached_full = cache_dir / f"{PACKAGE_NAME}_full.zip"
+        if cached_full.is_file():
+            _link_or_copy_file(cached_full, target_full)
+            full_zip = target_full
+    elif target_full.exists():
+        target_full.unlink(missing_ok=True)
+    _link_or_copy_file(cache_dir / f"{PACKAGE_NAME}_update.zip", update_zip)
+    return full_zip, update_zip
+
+
+def _store_package_cache(
+    root: Path,
+    published_root: Path,
+    full_zip: Path | None,
+    update_zip: Path,
+    *,
+    cache_key: str,
+) -> Path:
+    cache_dir = _package_cache_dir(root, cache_key)
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir, onexc=_handle_remove_readonly)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(published_root, cache_dir / PACKAGE_NAME)
+    if full_zip is not None and full_zip.is_file():
+        shutil.copy2(full_zip, cache_dir / f"{PACKAGE_NAME}_full.zip")
+    shutil.copy2(update_zip, cache_dir / f"{PACKAGE_NAME}_update.zip")
+    return cache_dir
 
 
 def _write_windows_script(path: Path, lines: list[str]) -> None:
@@ -326,80 +798,27 @@ def _write_windows_script(path: Path, lines: list[str]) -> None:
 
 
 def _copy_executable_aliases(package_root: Path) -> None:
-    for source_name, alias_name in (
-        (LAUNCHER_EXE, LAUNCHER_ALIAS_EXE),
-        (INSTALLER_EXE, INSTALLER_ALIAS_EXE),
-    ):
-        source = package_root / source_name
-        if source.is_file():
-            shutil.copy2(source, package_root / alias_name)
+    source = package_root / LAUNCHER_EXE
+    if source.is_file():
+        shutil.copy2(source, package_root / LAUNCHER_ALIAS_EXE)
 
 
 def _write_cmd_launchers(package_root: Path) -> None:
     _write_windows_script(
-        package_root / "安装环境.cmd",
-        [
-            "@echo off",
-            "setlocal",
-            'cd /d "%~dp0"',
-            "",
-            f'set "INSTALLER_EXE=%~dp0{INSTALLER_ALIAS_EXE}"',
-            'set "BOOTSTRAP_PYTHON=%~dp0_bootstrap\\python\\python.exe"',
-            'set "EXIT_CODE=0"',
-            "",
-            "echo [JIXIEBIJIAOBEN] Installing OCR runtime...",
-            "echo [JIXIEBIJIAOBEN] This may take several minutes.",
-            "echo.",
-            "",
-            'if exist "%INSTALLER_EXE%" goto run_installer',
-            'if exist "%BOOTSTRAP_PYTHON%" goto run_bootstrap',
-            "echo Missing installer executable and bootstrap Python.",
-            'set "EXIT_CODE=1"',
-            "goto finish",
-            "",
-            ":run_installer",
-            '\"%INSTALLER_EXE%\" %*',
-            'set "EXIT_CODE=%ERRORLEVEL%"',
-            "goto finish",
-            "",
-            ":run_bootstrap",
-            'set "PYTHONNOUSERSITE=1"',
-            '\"%BOOTSTRAP_PYTHON%\" -s -u \"%~dp0install_runtime.py\" %*',
-            'set "EXIT_CODE=%ERRORLEVEL%"',
-            "",
-            ":finish",
-            'if not "%EXIT_CODE%"=="0" (',
-            "  echo.",
-            '  echo Install failed. Exit code: %EXIT_CODE%',
-            "  pause",
-            "  exit /b %EXIT_CODE%",
-            ")",
-            "",
-            "echo.",
-            "echo Install completed.",
-            "pause",
-            "exit /b 0",
-        ],
-    )
-    _write_windows_script(
-        package_root / "启动程序.cmd",
+        package_root / START_CMD,
         [
             "@echo off",
             "setlocal",
             'cd /d "%~dp0"',
             "",
             f'set "LAUNCHER_EXE=%~dp0{LAUNCHER_ALIAS_EXE}"',
-            'set "RUNTIME_PYTHON=%~dp0.runtime_env\\python.exe"',
-            'set "RUNTIME_PYTHON_LEGACY=%~dp0.runtime_env\\Scripts\\python.exe"',
+            'set "RUNTIME_PYTHON=%~dp0runtime\\app\\python.exe"',
+            'set "RUNTIME_PYTHON_ALT=%~dp0runtime\\app\\pythonw.exe"',
             "",
             'if exist "%LAUNCHER_EXE%" goto start_exe',
             'if exist "%RUNTIME_PYTHON%" goto run_runtime',
-            'if exist "%RUNTIME_PYTHON_LEGACY%" goto run_runtime_legacy',
-            "where py >nul 2>nul",
-            "if %ERRORLEVEL%==0 goto run_py",
-            "where python >nul 2>nul",
-            "if %ERRORLEVEL%==0 goto run_system_python",
-            "echo Python was not found.",
+            'if exist "%RUNTIME_PYTHON_ALT%" goto run_runtime_alt',
+            "echo Missing launcher executable and packaged runtime.",
             "pause",
             "exit /b 1",
             "",
@@ -412,19 +831,9 @@ def _write_cmd_launchers(package_root: Path) -> None:
             '\"%RUNTIME_PYTHON%\" -s -u \"%~dp0main.py\"',
             "exit /b %ERRORLEVEL%",
             "",
-            ":run_runtime_legacy",
+            ":run_runtime_alt",
             'set "PYTHONNOUSERSITE=1"',
-            '\"%RUNTIME_PYTHON_LEGACY%\" -s -u \"%~dp0main.py\"',
-            "exit /b %ERRORLEVEL%",
-            "",
-            ":run_py",
-            'set "PYTHONNOUSERSITE=1"',
-            'py -3 -s -u \"%~dp0main.py\"',
-            "exit /b %ERRORLEVEL%",
-            "",
-            ":run_system_python",
-            'set "PYTHONNOUSERSITE=1"',
-            'python -s -u \"%~dp0main.py\"',
+            '\"%RUNTIME_PYTHON_ALT%\" -s -u \"%~dp0main.py\"',
             "exit /b %ERRORLEVEL%",
         ],
     )
@@ -444,124 +853,22 @@ def _write_package_manifest(package_root: Path) -> None:
         if not path.is_file():
             continue
         relative = path.relative_to(package_root).as_posix()
-        if relative.startswith(("_bootstrap/", "wheelhouse/")):
-            continue  # 体积大且为外部资源，不逐一登记
+        if relative.startswith("runtime/.paddlex/"):
+            continue
         files.append({"path": relative, "sha256": _sha256(path), "size": path.stat().st_size})
-    manifest = {
+    payload = {
         "schema_version": 2,
         "package_name": PACKAGE_NAME,
         "contains_private_config": False,
         "files": files,
     }
     (package_root / "package_manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
 
-# --------------------------------------------------------------------------- #
-# 重步骤：引导 Python / wheelhouse / PyInstaller（可选，按需调用）
-# --------------------------------------------------------------------------- #
-
-def _prepare_bootstrap_python(root: Path, package_root: Path, embed_source: Path | None) -> None:
-    """把嵌入式引导 Python 与 get-pip.py 放进交付包的 `_bootstrap/`。
-
-    embed_source 指向已解压的嵌入式 Python 目录（python-3.13-embed-amd64）。
-    需确保其 `pythonXX._pth` 已取消注释 `import site`，否则 venv/pip 不可用。
-    缺省时回退到仓库 `_bootstrap/python/`（由 prepare_bootstrap.py 准备）。
-    """
-    bootstrap = package_root / "_bootstrap"
-    if embed_source is None:
-        repo_python = root / "_bootstrap" / "python"
-        embed_source = repo_python if repo_python.is_dir() else None
-    if embed_source is None:
-        print("[warn] 未找到引导 Python：先运行 `python prepare_bootstrap.py` 或传 --embed-python（交付前必须补齐 _bootstrap/python/）")
-        return
-    if not embed_source.is_dir():
-        raise FileNotFoundError(f"嵌入式 Python 源目录不存在：{embed_source}")
-    target = bootstrap / "python"
-    if target.exists():
-        shutil.rmtree(target, onexc=_handle_remove_readonly)
-    shutil.copytree(embed_source, target)
-    _ensure_embeddable_site_enabled(target)
-    get_pip = bootstrap / "get-pip.py"
-    repo_get_pip = root / "_bootstrap" / "get-pip.py"
-    if repo_get_pip.is_file():
-        shutil.copy2(repo_get_pip, get_pip)
-    else:
-        print("[warn] 缺少 _bootstrap/get-pip.py：先运行 `python prepare_bootstrap.py`（嵌入式 Python 引导 pip 必需）")
-
-
-def _ensure_embeddable_site_enabled(python_dir: Path) -> None:
-    for pth in python_dir.glob("python*._pth"):
-        lines = pth.read_text(encoding="utf-8").splitlines()
-        changed = False
-        for index, line in enumerate(lines):
-            if line.strip() in {"#import site", "# import site"}:
-                lines[index] = "import site"
-                changed = True
-        if changed:
-            pth.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _download_wheels(root: Path, specs: list[str], *, index_url: str = DEFAULT_INDEX_URL) -> Path:
-    """把 specs（含传递依赖）下载到持久缓存 `root/wheelhouse`（cp313 / win_amd64）。
-
-    走 `index_url` 镜像（默认清华），并加大超时/重试，避免直连 PyPI 超时。
-    缓存不随 `dist/` 删除；pip download 跳过已存在的 wheel，第二次起几乎不再下载。
-    """
-    cache = root / "wheelhouse"
-    cache.mkdir(parents=True, exist_ok=True)
-    command = [
-        sys.executable, "-m", "pip", "download",
-        "--dest", str(cache),
-        "--only-binary=:all:",
-        "--python-version", "3.13",
-        "--platform", "win_amd64",
-        "--timeout", "60",
-        "--retries", "5",
-    ]
-    if index_url:
-        command.extend(["--index-url", index_url])
-    command.extend(specs)
-    print("[wheelhouse] " + " ".join(command))
-    subprocess.check_call(command, cwd=root)
-    return cache
-
-
-def _build_wheelhouse(root: Path, package_root: Path, *, lite: bool, index_url: str = DEFAULT_INDEX_URL) -> None:
-    """把通用依赖 wheel 装进交付包的 `wheelhouse/`（与显卡无关的全部依赖）。
-
-    始终下载“全通用闭包”——`requirements.txt` 全部依赖（含 paddleocr/paddlex）及其传递依赖，
-    但**不含**显卡相关后端（paddlepaddle-gpu/paddlepaddle/onnxruntime，那些按硬件联网装）。
-
-    - 默认（full）：闭包里的 wheel 全部打入包。交付包约 250~350MB；客户装时只联网下 paddle + 模型。
-    - `--lite-wheelhouse`：只把单个 ≤ LITE_WHEEL_MAX_MB 的小 wheel 打入，大件仍联网装（包 ~50MB）。
-
-    安装端 `install_runtime` 用 `--find-links wheelhouse --index-url <镜像>`：本地有就用本地、
-    缺的再联网，因此即便是 lite 这种“部分 wheelhouse”也能正常工作。
-    """
-    specs = ["pip", "setuptools", "wheel", *_bundled_dependency_specs(root), *sorted(_shared_runtime_specs(root))]
-    cache = _download_wheels(root, specs, index_url=index_url)
-
-    dest = package_root / "wheelhouse"
-    dest.mkdir(parents=True, exist_ok=True)
-    copied: list[str] = []
-    skipped: list[str] = []
-    for wheel in sorted(cache.glob("*.whl")):
-        size_mb = wheel.stat().st_size / (1024 * 1024)
-        if not lite or size_mb <= LITE_WHEEL_MAX_MB:
-            shutil.copy2(wheel, dest / wheel.name)
-            copied.append(wheel.name)
-        else:
-            skipped.append(f"{wheel.name}（{size_mb:.0f}MB）")
-    print(f"[wheelhouse] 打入 {len(copied)} 个 wheel" + (f"；联网安装 {len(skipped)} 个大件" if lite else "（全通用依赖）"))
-    if skipped:
-        print("[wheelhouse] 联网安装：" + "、".join(skipped))
-
-
 def _exe_cache_fresh(cached_exe: Path, root: Path, deps: list[str]) -> bool:
-    """缓存的 exe 是否仍然新鲜：存在且不旧于任一源依赖。"""
     if not cached_exe.is_file():
         return False
     exe_mtime = cached_exe.stat().st_mtime
@@ -573,88 +880,115 @@ def _exe_cache_fresh(cached_exe: Path, root: Path, deps: list[str]) -> bool:
 
 
 def _freeze_executables(root: Path, package_root: Path, *, rebuild: bool) -> None:
-    """冻结启动器与安装器；源未变（或 rebuild=False）则复用缓存 exe，跳过 PyInstaller。"""
     cache = root / "build" / "exe_cache"
     cache.mkdir(parents=True, exist_ok=True)
     work = root / "build" / "_pyinstaller"
-    # deps 列出冻结结果实际依赖的源文件：安装器把 install_runtime 一起打入，故也需跟踪它。
-    specs = [
-        {"exe": LAUNCHER_EXE, "entry": "launcher_entry.py", "console": "--noconsole",
-         "deps": ["launcher_entry.py"]},
-        {"exe": INSTALLER_EXE, "entry": "install_launcher_entry.py", "console": "--console",
-         "deps": ["install_launcher_entry.py", "install_runtime.py"]},
-    ]
-    for spec in specs:
-        exe_name = spec["exe"]
-        cached_exe = cache / exe_name
-        if not rebuild or _exe_cache_fresh(cached_exe, root, spec["deps"]):
-            if not cached_exe.is_file():
-                print(f"[warn] 无缓存 exe 可复用：{exe_name}（首次构建勿用 --skip-freeze）")
-                continue
-            print(f"[pyinstaller] 复用缓存 exe：{exe_name}")
-        else:
-            try:
-                import PyInstaller  # noqa: F401
-            except ImportError as exc:  # pragma: no cover - 仅构建机触发
-                raise RuntimeError("未安装 PyInstaller，请先 `pip install -r requirements-dev.txt`。") from exc
-            name = exe_name[: -len(".exe")] if exe_name.endswith(".exe") else exe_name
-            command = [
-                sys.executable, "-m", "PyInstaller",
-                "--onefile", spec["console"],
-                "--name", name,
-                "--distpath", str(cache),
-                "--workpath", str(work),
-                "--specpath", str(work),
-                str(root / spec["entry"]),
-            ]
-            print("[pyinstaller] " + " ".join(command))
-            subprocess.check_call(command, cwd=root)
-        shutil.copy2(cached_exe, package_root / exe_name)
+    cached_exe = cache / LAUNCHER_EXE
+    deps = ["launcher_entry.py", "runtime_layout.py"]
+    if rebuild and not _exe_cache_fresh(cached_exe, root, deps):
+        try:
+            import PyInstaller  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError("PyInstaller is required. Run `pip install -r requirements-dev.txt`.") from exc
+        command = [
+            sys.executable,
+            "-m",
+            "PyInstaller",
+            "--onefile",
+            "--noconsole",
+            "--name",
+            LAUNCHER_EXE[:-4],
+            "--distpath",
+            str(cache),
+            "--workpath",
+            str(work),
+            "--specpath",
+            str(work),
+            str(root / "launcher_entry.py"),
+        ]
+        print("[pyinstaller] " + " ".join(command))
+        subprocess.check_call(command, cwd=root)
+    if not cached_exe.is_file():
+        raise RuntimeError(f"Missing cached launcher executable: {cached_exe}")
+    shutil.copy2(cached_exe, package_root / LAUNCHER_EXE)
 
-
-# --------------------------------------------------------------------------- #
-# 入口
-# --------------------------------------------------------------------------- #
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Build 机械臂脚本 delivery package.")
-    parser.add_argument("--embed-python", type=Path, default=None,
-                        help="已解压的嵌入式 Python 目录（python-3.13-embed-amd64）")
-    parser.add_argument("--lite-wheelhouse", action="store_true",
-                        help="只打小件通用依赖（≤LITE_WHEEL_MAX_MB），大件联网装（包 ~50MB；默认打全部）")
-    parser.add_argument("--no-wheelhouse", action="store_true",
-                        help="完全不打 wheelhouse，通用依赖全部联网装")
-    parser.add_argument("--index-url", default=DEFAULT_INDEX_URL,
-                        help=f"pip download 镜像源（默认清华 {DEFAULT_INDEX_URL}；阿里源 https://mirrors.aliyun.com/pypi/simple）")
-    parser.add_argument("--skip-freeze", action="store_true", help="跳过 PyInstaller，复用 exe 缓存")
+    parser = argparse.ArgumentParser(description="Build the full jixiebijiaoben package.")
+    parser.add_argument("--full", action="store_true", help="also build dist/jixiebijiaoben_full.zip")
+    parser.add_argument("--skip-freeze", action="store_true", help="reuse cached launcher exe")
+    parser.add_argument("--no-runtime-cache", action="store_true", help="do not reuse cached runtimes")
+    parser.add_argument("--publish-dir", action="store_true", help="also publish the unpacked package directory into dist/")
+    parser.add_argument("--model-tier", default="lite")
+    parser.add_argument("--nvidia-cuda-lane", default=DEFAULT_FULL_PACKAGE_NVIDIA_LANE)
     args = parser.parse_args(argv)
 
-    root = Path.cwd()
+    root = Path(__file__).resolve().parent
     dist = root / "dist"
-    package_root = dist / PACKAGE_NAME
-    if package_root.exists():
-        shutil.rmtree(package_root, onexc=_handle_remove_readonly)
-    package_root.mkdir(parents=True, exist_ok=True)
+    dist.mkdir(parents=True, exist_ok=True)
+    include_full_payload = bool(args.full or args.publish_dir)
 
+    package_cache_key = _package_cache_key(
+        root,
+        model_tier=args.model_tier,
+        nvidia_cuda_lane=args.nvidia_cuda_lane,
+        include_full_payload=include_full_payload,
+    )
+    cache_dir = _package_cache_dir(root, package_cache_key)
+    if _package_cache_complete(
+        cache_dir,
+        require_package_dir=include_full_payload,
+        require_full_zip=False,
+    ):
+        print(f"[package-cache] hit {package_cache_key}")
+        full_zip, update_zip = _restore_archives_from_cache(dist, cache_dir, include_full=args.full)
+        if args.full and full_zip is None:
+            full_zip = _write_full_package_archive(cache_dir / PACKAGE_NAME, dist)
+        if args.publish_dir:
+            published_root = _publish_cached_package_directory(cache_dir / PACKAGE_NAME, dist)
+            print(f"[done] package={published_root}")
+        if full_zip is not None:
+            print(f"[done] full={full_zip}")
+        print(f"[done] update={update_zip}")
+        return 0
+
+    if not args.full:
+        _remove_dist_full_archive(dist)
+    package_root = _prepare_staging_package_root(dist)
     _copy_sources(root, package_root)
     _copy_bundled_data(root, package_root)
-
-    if args.no_wheelhouse:
-        print("[wheelhouse] --no-wheelhouse：通用依赖全部联网安装")
-    else:
-        _build_wheelhouse(root, package_root, lite=args.lite_wheelhouse, index_url=args.index_url)
-    _prepare_bootstrap_python(root, package_root, args.embed_python)
+    if include_full_payload:
+        _build_full_package_runtimes(
+            root,
+            package_root,
+            model_tier=args.model_tier,
+            nvidia_cuda_lane=args.nvidia_cuda_lane,
+            use_cache=not args.no_runtime_cache,
+        )
+        _cleanup_packaged_transients(package_root)
+        _cleanup_python_caches(package_root)
+        _write_full_package_runtime_state(package_root, model_tier=args.model_tier, nvidia_cuda_lane=args.nvidia_cuda_lane)
     _freeze_executables(root, package_root, rebuild=not args.skip_freeze)
     _copy_executable_aliases(package_root)
     _write_cmd_launchers(package_root)
-
     _write_package_manifest(package_root)
-    full = _write_full_package_archive(package_root, dist)
-    update = _write_customer_update_archive(package_root, dist)
 
-    print(f"交付目录：{package_root}")
-    print(f"全量包：{full}")
-    print(f"更新包：{update}")
+    full_zip: Path | None = None
+    if args.full:
+        full_zip = _write_full_package_archive(package_root, dist)
+    update_zip = _write_customer_update_archive(package_root, dist)
+    cache_dir = _store_package_cache(root, package_root, full_zip, update_zip, cache_key=package_cache_key)
+    published_root: Path | None = None
+    if args.publish_dir:
+        published_root = _publish_package_directory(package_root, dist)
+    _cleanup_staging(dist)
+
+    print(f"[package-cache] store {package_cache_key} -> {cache_dir}")
+    if published_root is not None:
+        print(f"[done] package={published_root}")
+    if full_zip is not None:
+        print(f"[done] full={full_zip}")
+    print(f"[done] update={update_zip}")
     return 0
 
 

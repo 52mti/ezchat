@@ -55,6 +55,12 @@ NEW_GREETING_BUTTON = "button.new_greeting"
 BACK_BUTTON_2 = "button.back.secondary"
 TTS_POST_DELAY_SECONDS = 3.0
 POPUP_MAX_X = 0.9
+EMPTY_LIST_TARGET_NAMES = {
+    "\u6682\u65e0\u6d88\u606f",
+    "\u6682\u65e0\u4fe1\u606f",
+    "\u6ca1\u6709\u6d88\u606f",
+    "\u65e0\u6d88\u606f",
+}
 
 SCREEN_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
     CHAT_LIST_SCREEN: ("screen_聊天列表.jpg", "chat_list.jpg", "screen_message_list.jpg"),
@@ -190,6 +196,25 @@ def _template_center(image: Any, config: dict[str, Any], key: str, *, group: str
 
 def _matches_screen(image: Any, config: dict[str, Any], key: str) -> bool:
     return _template_match(image, config, key, group="screens") is not None
+
+
+def _clean_list_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _is_empty_list_row(row: dict[str, Any]) -> bool:
+    name = _clean_list_text(row.get("name"))
+    content = _clean_list_text(row.get("content"))
+    return not content and name in EMPTY_LIST_TARGET_NAMES
+
+
+def _list_candidate_score(index: int, row: dict[str, Any]) -> tuple[int, int, dict[str, Any]]:
+    favorability = row.get("favorability")
+    try:
+        favorability_value = int(favorability) if favorability is not None else -1
+    except (TypeError, ValueError):
+        favorability_value = -1
+    return favorability_value, -index, row
 
 
 def _looks_like_black_screen(image: Any, config: dict[str, Any]) -> bool:
@@ -486,20 +511,22 @@ def find_unread_target(
     ocr_result = _run_ocr_mode(image, cfg, "list", region=None)
     image, ocr_result = check_unread_button(robot, cfg, image, reporter=reporter, ocr_result=ocr_result)
     rows = ocr_result["result"].get("message_list", [])
-    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    unread_candidates: list[tuple[int, int, dict[str, Any]]] = []
+    content_candidates: list[tuple[int, int, dict[str, Any]]] = []
     for index, row in enumerate(rows):
+        if _is_empty_list_row(row):
+            continue
         try:
             unread_count = int(row.get("unread_count") or 0)
         except (TypeError, ValueError):
             unread_count = 0
-        if unread_count < 1:
+        candidate = _list_candidate_score(index, row)
+        if unread_count >= 1:
+            unread_candidates.append(candidate)
             continue
-        favorability = row.get("favorability")
-        try:
-            favorability_value = int(favorability) if favorability is not None else -1
-        except (TypeError, ValueError):
-            favorability_value = -1
-        candidates.append((favorability_value, -index, row))
+        if _clean_list_text(row.get("content")):
+            content_candidates.append(candidate)
+    candidates = unread_candidates or content_candidates
     if not candidates:
         return None
     _favorability, _position, selected_row = max(candidates, key=lambda item: (item[0], item[1]))

@@ -90,6 +90,44 @@ def test_xinyu_list_ocr_treats_left_badge_as_default_unread(monkeypatch, tmp_pat
     assert target["unread_count"] == 1
 
 
+def test_xinyu_dialogue_region_filter_is_forced_off(tmp_path):
+    config = _config(tmp_path)
+    config["ocr_modes"] = {
+        "dialogue": {
+            "rules": {
+                "basic_filter": {
+                    "enable_center_y_region_filter": True,
+                    "center_y_min_ratio": 0.18,
+                    "center_y_max_ratio": 0.88,
+                }
+            }
+        }
+    }
+
+    resolved = steps._config(config)
+
+    assert resolved["ocr_modes"]["dialogue"]["rules"]["basic_filter"]["enable_center_y_region_filter"] is False
+
+
+def test_xinyu_app_dialogue_region_filter_is_forced_off(tmp_path):
+    config = _config(tmp_path)
+    config["ocr_modes"] = {
+        "dialogue": {
+            "rules": {
+                "basic_filter": {
+                    "enable_center_y_region_filter": True,
+                    "center_y_min_ratio": 0.18,
+                    "center_y_max_ratio": 0.88,
+                }
+            }
+        }
+    }
+
+    app = xinyu_app.XinyuApp(FakeRobot([]), config, reply_provider=lambda message: "AI回复")
+
+    assert app.config["ocr_modes"]["dialogue"]["rules"]["basic_filter"]["enable_center_y_region_filter"] is False
+
+
 def test_xinyu_ensure_list_screen_raises_on_black_screen(monkeypatch, tmp_path):
     config = _config(tmp_path)
     robot = FakeRobot(["black"])
@@ -365,6 +403,172 @@ def test_xinyu_list_selects_highest_favorability_target(monkeypatch, tmp_path):
     assert target["name"] == "乙"
 
 
+def test_xinyu_list_falls_back_to_content_when_unread_is_missing(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list"])
+    monkeypatch.setattr(steps, "ensure_list_screen", lambda robot, config, reporter=None: "list")
+    monkeypatch.setattr(steps, "check_unread_button", lambda robot, config, image, reporter=None, ocr_result=None: (image, ocr_result))
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "result": {
+                "message_list": [
+                    {"name": "user_a", "favorability": 2, "unread_count": 0, "content": "hello", "bounds": [0.1, 0.2, 0.3, 0.3]},
+                    {"name": "user_b", "favorability": 7, "unread_count": 0, "content": "reply me", "bounds": [0.2, 0.4, 0.5, 0.5]},
+                ]
+            },
+            "ocr_items": [],
+        },
+    )
+
+    target = steps.find_unread_target(robot, config)
+
+    assert target["name"] == "user_b"
+    assert target["unread_count"] == 0
+
+
+def test_xinyu_list_ignores_empty_placeholder_when_falling_back_to_content(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list"])
+    monkeypatch.setattr(steps, "ensure_list_screen", lambda robot, config, reporter=None: "list")
+    monkeypatch.setattr(steps, "check_unread_button", lambda robot, config, image, reporter=None, ocr_result=None: (image, ocr_result))
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "result": {
+                "message_list": [
+                    {"name": "\u6682\u65e0\u6d88\u606f", "favorability": 99, "unread_count": 0, "content": "", "bounds": [0.1, 0.2, 0.3, 0.3]},
+                    {"name": "user_b", "favorability": 3, "unread_count": 0, "content": "available", "bounds": [0.2, 0.4, 0.5, 0.5]},
+                ]
+            },
+            "ocr_items": [],
+        },
+    )
+
+    target = steps.find_unread_target(robot, config)
+
+    assert target["name"] == "user_b"
+
+
+def test_xinyu_list_still_prefers_unread_target_over_content_fallback(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list"])
+    monkeypatch.setattr(steps, "ensure_list_screen", lambda robot, config, reporter=None: "list")
+    monkeypatch.setattr(steps, "check_unread_button", lambda robot, config, image, reporter=None, ocr_result=None: (image, ocr_result))
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "result": {
+                "message_list": [
+                    {"name": "content_only", "favorability": 50, "unread_count": 0, "content": "reply me", "bounds": [0.1, 0.2, 0.3, 0.3]},
+                    {"name": "unread_user", "favorability": 4, "unread_count": 1, "content": "", "bounds": [0.2, 0.4, 0.5, 0.5]},
+                ]
+            },
+            "ocr_items": [],
+        },
+    )
+
+    target = steps.find_unread_target(robot, config)
+
+    assert target["name"] == "unread_user"
+    assert target["unread_count"] == 1
+
+
+def test_xinyu_list_falls_back_to_content_when_unread_is_missing(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list"])
+
+    def fake_match(image, template, threshold=0.85):
+        if image == "list" and Path(template).name == "screen_鑱婂ぉ鍒楄〃.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+    monkeypatch.setattr(steps, "_has_red_pixels", lambda image, match_result: True)
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "result": {
+                "message_list": [
+                    {"name": "user_a", "favorability": 2, "unread_count": 0, "content": "hello", "bounds": [0.1, 0.2, 0.3, 0.3]},
+                    {"name": "user_b", "favorability": 7, "unread_count": 0, "content": "reply me", "bounds": [0.2, 0.4, 0.5, 0.5]},
+                ]
+            },
+            "ocr_items": [],
+        },
+    )
+
+    target = steps.find_unread_target(robot, config)
+
+    assert target["name"] == "user_b"
+    assert target["unread_count"] == 0
+
+
+def test_xinyu_list_ignores_empty_placeholder_when_falling_back_to_content(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list"])
+
+    def fake_match(image, template, threshold=0.85):
+        if image == "list" and Path(template).name == "screen_鑱婂ぉ鍒楄〃.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+    monkeypatch.setattr(steps, "_has_red_pixels", lambda image, match_result: True)
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "result": {
+                "message_list": [
+                    {"name": "\u6682\u65e0\u6d88\u606f", "favorability": 99, "unread_count": 0, "content": "", "bounds": [0.1, 0.2, 0.3, 0.3]},
+                    {"name": "user_b", "favorability": 3, "unread_count": 0, "content": "available", "bounds": [0.2, 0.4, 0.5, 0.5]},
+                ]
+            },
+            "ocr_items": [],
+        },
+    )
+
+    target = steps.find_unread_target(robot, config)
+
+    assert target["name"] == "user_b"
+
+
+def test_xinyu_list_still_prefers_unread_target_over_content_fallback(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list"])
+
+    def fake_match(image, template, threshold=0.85):
+        if image == "list" and Path(template).name == "screen_鑱婂ぉ鍒楄〃.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+    monkeypatch.setattr(steps, "_has_red_pixels", lambda image, match_result: True)
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "result": {
+                "message_list": [
+                    {"name": "content_only", "favorability": 50, "unread_count": 0, "content": "reply me", "bounds": [0.1, 0.2, 0.3, 0.3]},
+                    {"name": "unread_user", "favorability": 4, "unread_count": 1, "content": "", "bounds": [0.2, 0.4, 0.5, 0.5]},
+                ]
+            },
+            "ocr_items": [],
+        },
+    )
+
+    target = steps.find_unread_target(robot, config)
+
+    assert target["name"] == "unread_user"
+    assert target["unread_count"] == 1
+
+
 def test_xinyu_app_uses_short_list_content_directly(monkeypatch, tmp_path):
     config = _config(tmp_path)
     robot = FakeRobot(["list", "chat", "chat", "chat", "chat", "list"])
@@ -625,9 +829,33 @@ def test_xinyu_app_reads_dialogue_sender1_last_message(monkeypatch, tmp_path):
     assert seen == [{"text": "AI回复"}]
 
 
-def test_xinyu_go_back_clicks_back_twice(monkeypatch, tmp_path):
+def test_xinyu_go_back_clicks_back_twice_after_send(monkeypatch, tmp_path):
     config = _config(tmp_path)
-    robot = FakeRobot(["chat", "list"])
+    robot = FakeRobot(["chat", "chat", "list"])
+
+    def fake_match(image, template, threshold=0.85):
+        if image == "chat" and Path(template).name in {"btn_返回按钮_2.jpg", "btn_返回按钮.jpg"}:
+            return {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1, "score": 0.99}
+        if image == "list" and Path(template).name == "screen_聊天列表.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+    monkeypatch.setattr(steps, "ensure_send_cleared", lambda robot, config, reporter=None: 0)
+    monkeypatch.setattr(
+        steps,
+        "capture_after_popups",
+        lambda robot, config, label="screen", max_dismiss=3, reporter=None: robot.get_transform_image(),
+    )
+
+    steps.go_back(robot, config, double_click_on_first_attempt=True)
+
+    assert robot.clicks == [pytest.approx((0.15, 0.15)), pytest.approx((0.15, 0.15))]
+
+
+def test_xinyu_go_back_single_clicks_when_not_after_send(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["chat", "chat", "chat", "chat", "list"])
 
     def fake_match(image, template, threshold=0.85):
         if image == "chat" and Path(template).name in {"btn_返回按钮_2.jpg", "btn_返回按钮.jpg"}:

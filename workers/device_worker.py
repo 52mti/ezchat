@@ -20,7 +20,6 @@ from services import (
     setup_runtime_logging,
 )
 from services.license_client import _is_future_time
-from services.robot_monitor import MonitoredRobot, RobotArmMonitor
 
 
 @dataclass(frozen=True)
@@ -55,18 +54,7 @@ class DeviceWorker(threading.Thread):
             runtime_context["device_ip"] = str(device["ip"])
             runtime_context["app_name"] = app_name
             runtime_context["should_stop"] = self._stop_event.is_set
-        raw_robot = robot or RobotInterface(str(device["ip"]))
-        monitor_config = self.app_config.get("robot_monitor", {})
-        monitor_config = monitor_config if isinstance(monitor_config, dict) else {}
-        self.robot_monitor = RobotArmMonitor(
-            raw_robot,
-            device_ip=str(device["ip"]),
-            emit=self._emit,
-            interval_seconds=float(monitor_config.get("interval_seconds", 1.0) or 1.0),
-            history_size=int(monitor_config.get("history_size", 8) or 8),
-            enabled=bool(monitor_config.get("enabled", True)),
-        )
-        self.robot = MonitoredRobot(raw_robot, self.robot_monitor)
+        self.robot = robot or RobotInterface(str(device["ip"]))
         try:
             setattr(self.robot, "_codex_should_stop", self._stop_event.is_set)
         except Exception:
@@ -191,7 +179,6 @@ class DeviceWorker(threading.Thread):
 
     def run(self) -> None:
         poll_interval = float(self.app_config.get("poll_interval", 1))
-        self.robot_monitor.start()
         self._emit("info", "started")
         try:
             if not self._ensure_startup_templates():
@@ -215,5 +202,4 @@ class DeviceWorker(threading.Thread):
                 if self._stop_event.wait(wait_interval):
                     break
         finally:
-            self.robot_monitor.stop()
             self._emit("info", "stopped")

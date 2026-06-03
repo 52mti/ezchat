@@ -1,0 +1,90 @@
+{
+  "version": "2026.06.02-full-package",
+  "executionMode": "subprocess",
+  "runtimeDirectories": {
+    "app": "runtime/app",
+    "cpu": "runtime/ocr_cpu",
+    "paddle_cuda": "runtime/ocr_nvidia",
+    "onnx_directml": "runtime/ocr_directml"
+  },
+  "pip": {
+    "indexUrl": "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+  },
+  "sharedPackages": [
+    {
+      "spec": "paddleocr==3.4.0"
+    },
+    {
+      "spec": "paddlex[ocr-core]==3.4.3"
+    }
+  ],
+  "backends": {
+    "paddle_cuda": {
+      "device": "gpu:0",
+      "description": "NVIDIA CUDA + PaddleOCR PP-OCRv5 mobile",
+      "packages": [
+        {
+          "spec": "paddlepaddle-gpu==3.2.2"
+        }
+      ],
+      "lanes": {
+        "cu118": "https://www.paddlepaddle.org.cn/packages/stable/cu118/",
+        "cu126": "https://www.paddlepaddle.org.cn/packages/stable/cu126/",
+        "cu129": "https://www.paddlepaddle.org.cn/packages/stable/cu129/"
+      },
+      "modelProvider": "paddlex_named_models"
+    },
+    "onnx_directml": {
+      "device": "dml:0",
+      "description": "Windows AMD/Intel DirectML + RapidOCR",
+      "packages": [
+        {
+          "spec": "onnxruntime-directml"
+        },
+        {
+          "spec": "rapidocr_onnxruntime"
+        }
+      ],
+      "modelProvider": "rapidocr_builtin"
+    },
+    "cpu": {
+      "device": "cpu",
+      "description": "CPU + PaddleOCR PP-OCRv5 mobile",
+      "packages": [
+        {
+          "spec": "paddlepaddle==3.2.2",
+          "indexUrl": "https://www.paddlepaddle.org.cn/packages/stable/cpu/"
+        }
+      ],
+      "modelProvider": "paddlex_named_models"
+    }
+  },
+  "models": {
+    "defaultTier": "lite",
+    "tiers": {
+      "lite": {
+        "backends": {
+          "paddle_cuda": {
+            "provider": "paddlex_named_models",
+            "detModelName": "PP-OCRv5_mobile_det",
+            "recModelName": "PP-OCRv5_mobile_rec",
+            "detVersion": "PP-OCRv5_mobile_det",
+            "recVersion": "PP-OCRv5_mobile_rec"
+          },
+          "cpu": {
+            "provider": "paddlex_named_models",
+            "detModelName": "PP-OCRv5_mobile_det",
+            "recModelName": "PP-OCRv5_mobile_rec",
+            "detVersion": "PP-OCRv5_mobile_det",
+            "recVersion": "PP-OCRv5_mobile_rec"
+          },
+          "onnx_directml": {
+            "provider": "rapidocr_builtin",
+            "detVersion": "rapidocr_builtin_det",
+            "recVersion": "rapidocr_builtin_rec"
+          }
+        }
+      }
+    }
+  }
+}

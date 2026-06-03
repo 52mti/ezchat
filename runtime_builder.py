@@ -8,8 +8,15 @@ import shutil
 import subprocess
 import sys
 from collections import OrderedDict
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from runtime_layout import (
+    bundled_paddlex_models_root,
+    runtime_dir as packaged_runtime_dir,
+)
 
 
 DEFAULT_MANIFEST: dict[str, Any] = {
@@ -80,11 +87,56 @@ DEFAULT_MANIFEST: dict[str, Any] = {
     },
 }
 
+FULL_PACKAGE_RUNTIME_NAMES = ("app", "ocr_cpu", "ocr_nvidia", "ocr_directml")
+_PACKAGE_ROOT_OVERRIDE: Path | None = None
+_RUNTIME_NAME_OVERRIDE = "legacy"
+
+
+@dataclass(slots=True)
+class CommandExecutionError(RuntimeError):
+    stage: str
+    command: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
+    log_path: Path
+
+    def __str__(self) -> str:
+        return (
+            f"{self.stage} failed with exit code {self.returncode}. "
+            f"See log: {self.log_path}"
+        )
+
 
 def _package_root() -> Path:
+    if _PACKAGE_ROOT_OVERRIDE is not None:
+        return _PACKAGE_ROOT_OVERRIDE
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def _set_package_root_override(path: str | Path | None) -> None:
+    global _PACKAGE_ROOT_OVERRIDE
+    if path is None:
+        _PACKAGE_ROOT_OVERRIDE = None
+        return
+    resolved = Path(path).expanduser().resolve()
+    _PACKAGE_ROOT_OVERRIDE = resolved if resolved.is_dir() else resolved.parent
+
+
+def _normalize_runtime_name(runtime_name: str | None) -> str:
+    candidate = str(runtime_name or _RUNTIME_NAME_OVERRIDE or "legacy").strip().lower()
+    if candidate in {"", "legacy", ".runtime_env"}:
+        return "legacy"
+    if candidate not in FULL_PACKAGE_RUNTIME_NAMES:
+        raise ValueError(f"Unsupported runtime name: {runtime_name}")
+    return candidate
+
+
+def _set_runtime_name_override(runtime_name: str | None) -> None:
+    global _RUNTIME_NAME_OVERRIDE
+    _RUNTIME_NAME_OVERRIDE = _normalize_runtime_name(runtime_name)
 
 
 def _runtime_dir() -> Path:
@@ -95,8 +147,15 @@ def _runtime_state_path() -> Path:
     return _runtime_dir() / "install_state.json"
 
 
+def _install_logs_dir() -> Path:
+    return _runtime_dir() / "install_logs"
+
+
 def _private_runtime_dir() -> Path:
-    return _package_root() / ".runtime_env"
+    runtime_name = _normalize_runtime_name(None)
+    if runtime_name == "legacy":
+        return _package_root() / ".runtime_env"
+    return packaged_runtime_dir(_package_root(), runtime_name)
 
 
 def _private_python() -> Path:
@@ -160,29 +219,41 @@ def _venv_base_command() -> list[str]:
         found = shutil.which(name)
         if found:
             return [found, "-3"] if name == "py" else [found]
-    raise RuntimeError("未找到可用于创建运行环境的 Python：缺少 _bootstrap\\python，且系统未安装 Python。")
+    raise RuntimeError("Could not find a usable Python to create the runtime environment: missing _bootstrap\\python and no system Python was found.")
 
 
 def _paddlex_cache_home() -> Path:
     configured = str(os.environ.get("PADDLE_PDX_CACHE_HOME", "") or "").strip()
     if configured:
         return Path(configured).expanduser().resolve()
+    if _PACKAGE_ROOT_OVERRIDE is not None or _normalize_runtime_name(None) != "legacy":
+        return (_package_root() / "runtime" / ".paddlex").resolve()
     if os.name == "nt":
         public_root = Path(os.environ.get("PUBLIC", r"C:\Users\Public")).resolve()
         return public_root / "jixiebijiaoben_runtime" / ".paddlex"
     return (_package_root() / "runtime" / ".paddlex").resolve()
 
 
-def _configure_paddlex_cache_home() -> Path:
+def _configure_paddlex_cache_home(*, force: bool = False) -> Path:
     cache_home = _paddlex_cache_home()
     cache_home.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(cache_home))
-    os.environ.setdefault("PADDLEX_HOME", str(cache_home))
+    if force:
+        os.environ["PADDLE_PDX_CACHE_HOME"] = str(cache_home)
+        os.environ["PADDLEX_HOME"] = str(cache_home)
+    else:
+        os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(cache_home))
+        os.environ.setdefault("PADDLEX_HOME", str(cache_home))
     return cache_home
 
 
 def _official_models_root() -> Path:
     return _configure_paddlex_cache_home() / "official_models"
+
+
+def _bundled_models_root() -> Path:
+    root = bundled_paddlex_models_root(_package_root())
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def _required_paddlex_model_files() -> tuple[str, ...]:
@@ -201,6 +272,25 @@ def _reset_incomplete_paddlex_models(model_names: list[str]) -> None:
         model_dir = root / model_name
         if model_dir.exists() and not _model_dir_is_complete(model_dir):
             shutil.rmtree(model_dir, ignore_errors=True)
+
+
+def _bundle_paddlex_models(model_names: list[str]) -> list[str]:
+    copied: list[str] = []
+    source_root = _official_models_root()
+    target_root = _bundled_models_root()
+    for model_name in model_names:
+        normalized = str(model_name or "").strip()
+        if not normalized:
+            continue
+        source_dir = source_root / normalized
+        if not _model_dir_is_complete(source_dir):
+            raise RuntimeError(f"OCR model is incomplete and cannot be bundled: {normalized}")
+        target_dir = target_root / normalized
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        shutil.copytree(source_dir, target_dir)
+        copied.append(normalized)
+    return copied
 
 
 def _load_runtime_manifest() -> dict[str, Any]:
@@ -414,6 +504,65 @@ def _run_command(command: list[str], timeout_seconds: int = 8) -> subprocess.Com
         return None
 
 
+def _write_command_log(
+    *,
+    stage: str,
+    command: list[str],
+    returncode: int,
+    stdout: str,
+    stderr: str,
+) -> Path:
+    logs_dir = _install_logs_dir()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    safe_stage = re.sub(r"[^a-zA-Z0-9_.-]+", "_", stage).strip("._") or "command"
+    log_path = logs_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_stage}.log"
+    payload = {
+        "stage": stage,
+        "command": command,
+        "returncode": returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+    log_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return log_path
+
+
+def _run_checked_command(
+    command: list[str],
+    *,
+    stage: str,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        check=False,
+    )
+    if completed.returncode == 0:
+        return completed
+    log_path = _write_command_log(
+        stage=stage,
+        command=command,
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
+    raise CommandExecutionError(
+        stage=stage,
+        command=list(command),
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        log_path=log_path,
+    )
+
+
 def _normalize_major_minor(raw_version: str | None) -> tuple[int, int] | None:
     if not raw_version:
         return None
@@ -423,19 +572,57 @@ def _normalize_major_minor(raw_version: str | None) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2) or 0)
 
 
-def _choose_cuda_lane(nvcc_version: str | None, driver_cuda_version: str | None) -> tuple[str | None, str]:
+def _parse_compute_capability(raw_value: str | None) -> tuple[int, int] | None:
+    if not raw_value:
+        return None
+    match = re.match(r"^\s*(\d+)(?:\.(\d+))?", raw_value)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
+
+
+def _format_compute_capability(value: tuple[int, int] | None) -> str:
+    if value is None:
+        return ""
+    return f"{value[0]}.{value[1]}"
+
+
+def _choose_cuda_lane(
+    nvcc_version: str | None,
+    driver_cuda_version: str | None,
+    *,
+    compute_capability: str | None = None,
+    gpu_name: str | None = None,
+) -> tuple[str | None, str]:
+    capability = _parse_compute_capability(compute_capability)
+    if sys.platform.startswith("win") and capability is not None:
+        if capability < (6, 1):
+            capability_text = _format_compute_capability(capability)
+            gpu_label = gpu_name or "NVIDIA GPU"
+            return (
+                None,
+                f"Detected {gpu_label} with compute capability {capability_text}. "
+                "Full package NVIDIA support starts at compute capability 6.1, "
+                "so this machine should use DirectML or CPU OCR instead.",
+            )
+        if capability < (8, 0):
+            capability_text = _format_compute_capability(capability)
+            return (
+                "cu118",
+                f"Detected compute capability {capability_text}; prefer Paddle cu118 for pre-Ampere NVIDIA GPUs.",
+            )
     preferred = _normalize_major_minor(nvcc_version) or _normalize_major_minor(driver_cuda_version)
     if preferred is None:
-        return None, "未检测到 CUDA Toolkit 或显卡驱动 CUDA 版本。"
+        return None, "No local CUDA Toolkit version was detected, and the GPU driver did not report a usable max CUDA version."
     major, minor = preferred
-    source = "nvcc" if nvcc_version else "nvidia-smi"
+    source = "local CUDA Toolkit (nvcc)" if nvcc_version else "GPU driver reported max CUDA (nvidia-smi)"
     if major > 12 or (major == 12 and minor >= 9):
-        return "cu129", f"从 {source} 检测到 CUDA {major}.{minor}，选择 Paddle cu129。"
+        return "cu129", f"Using {source} version {major}.{minor}; selecting Paddle cu129."
     if major == 12 and minor >= 6:
-        return "cu126", f"从 {source} 检测到 CUDA {major}.{minor}，选择 Paddle cu126。"
+        return "cu126", f"Using {source} version {major}.{minor}; selecting Paddle cu126."
     if (major == 11 and minor >= 8) or major > 11:
-        return "cu118", f"从 {source} 检测到 CUDA {major}.{minor}，选择 Paddle cu118。"
-    return None, f"检测到 CUDA {major}.{minor}，低于 Paddle 当前支持的 CUDA 11.8。"
+        return "cu118", f"Using {source} version {major}.{minor}; selecting Paddle cu118."
+    return None, f"{source} version {major}.{minor} is below the minimum supported CUDA 11.8."
 
 
 def _detect_gpu_environment() -> dict[str, Any]:
@@ -463,12 +650,21 @@ def _detect_gpu_environment() -> dict[str, Any]:
         match = re.search(r"release\s+([0-9]+(?:\.[0-9]+)?)", nvcc.stdout)
         if match:
             nvcc_version = match.group(1)
+    compute_cap_query = _run_command(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"])
+    compute_capability = ""
+    if compute_cap_query is not None and compute_cap_query.returncode == 0:
+        for line in compute_cap_query.stdout.splitlines():
+            value = line.strip()
+            if value:
+                compute_capability = value
+                break
 
     return {
         "gpu_names": gpu_names,
         "driver_version": driver_version,
         "driver_cuda_version": driver_cuda_version,
         "nvcc_version": nvcc_version,
+        "compute_capability": compute_capability,
     }
 
 
@@ -542,13 +738,13 @@ def _detect_backend() -> tuple[str, dict[str, Any]]:
     }
 
 
-def _selected_backend(explicit_backend: str) -> tuple[str, dict[str, Any]]:
+def _selected_backend(explicit_backend: str, *, allow_missing_hardware: bool = False) -> tuple[str, dict[str, Any]]:
     if explicit_backend != "auto":
         backend, hardware = _detect_backend()
-        if explicit_backend == "paddle_cuda" and not hardware.get("nvidia_detected"):
-            raise RuntimeError("OCR 后端 paddle_cuda 需要 NVIDIA 显卡。")
-        if explicit_backend == "onnx_directml" and not hardware.get("directml_available"):
-            raise RuntimeError("OCR 后端 onnx_directml 需要 Windows AMD/Intel 显卡和 DirectML。")
+        if explicit_backend == "paddle_cuda" and not hardware.get("nvidia_detected") and not allow_missing_hardware:
+            raise RuntimeError("OCR backend paddle_cuda requires an NVIDIA GPU.")
+        if explicit_backend == "onnx_directml" and not hardware.get("directml_available") and not allow_missing_hardware:
+            raise RuntimeError("OCR backend onnx_directml requires a Windows AMD/Intel GPU with DirectML support.")
         return explicit_backend, hardware
     return _detect_backend()
 
@@ -571,6 +767,48 @@ def _bootstrap_pip_into_venv(python_exe: Path, *, dry_run: bool) -> None:
         print(" ".join(command))
         return
     subprocess.check_call(command, cwd=_package_root(), env=env)
+
+
+def _source_python_root() -> Path:
+    return Path(sys.base_prefix).resolve()
+
+
+def _copy_python_tree(source: Path, target: Path) -> None:
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+    target.mkdir(parents=True, exist_ok=True)
+    copy_dirs = ("DLLs", "Lib", "libs", "tcl")
+    copy_files = ("python.exe", "pythonw.exe", "python3.dll", f"python{sys.version_info.major}{sys.version_info.minor}.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+    for name in copy_dirs:
+        src = source / name
+        if not src.exists():
+            continue
+        if name == "Lib":
+            shutil.copytree(src, target / name, ignore=shutil.ignore_patterns("site-packages", "__pycache__", "*.pyc", "*.pyo"))
+        else:
+            shutil.copytree(src, target / name, dirs_exist_ok=True)
+    for name in copy_files:
+        src = source / name
+        if src.is_file():
+            shutil.copy2(src, target / name)
+    (target / "Lib" / "site-packages").mkdir(parents=True, exist_ok=True)
+    (target / "Scripts").mkdir(parents=True, exist_ok=True)
+
+
+def _create_portable_runtime(*, dry_run: bool) -> Path:
+    runtime_dir = _private_runtime_dir()
+    python_exe = runtime_dir / "python.exe"
+    if python_exe.is_file():
+        return python_exe
+    source_root = _source_python_root()
+    if dry_run:
+        print(f"copy portable python {source_root} -> {runtime_dir}")
+        return python_exe
+    _copy_python_tree(source_root, runtime_dir)
+    if not python_exe.is_file():
+        raise RuntimeError(f"Portable runtime python.exe not found after copy: {runtime_dir}")
+    _bootstrap_pip_into_venv(python_exe, dry_run=False)
+    return python_exe
 
 
 def _bundled_bootstrap_python_dir() -> Path | None:
@@ -610,9 +848,12 @@ def _ensure_runtime_package_root(runtime_dir: Path) -> None:
 
 
 def _create_runtime_venv(*, dry_run: bool) -> Path:
+    runtime_name = _normalize_runtime_name(None)
     python_exe = _private_python()
     if python_exe.is_file():
         return python_exe
+    if runtime_name != "legacy":
+        return _create_portable_runtime(dry_run=dry_run)
     if _bundled_bootstrap_python_dir() is not None:
         if dry_run:
             print(f"copy bootstrap python -> {_private_runtime_dir()}")
@@ -626,7 +867,7 @@ def _create_runtime_venv(*, dry_run: bool) -> Path:
     if dry_run:
         print(" ".join(command))
         return python_exe
-    subprocess.check_call(command, cwd=_package_root())
+    _run_checked_command(command, stage="create_runtime_venv", cwd=_package_root())
     _bootstrap_pip_into_venv(python_exe, dry_run=dry_run)
     return python_exe
 
@@ -637,7 +878,7 @@ def _pip_env(python_exe: Path | None = None) -> dict[str, str]:
     env["PIP_USER"] = "0"
     env.pop("PYTHONPATH", None)
     if python_exe is not None:
-        scripts_dir = python_exe.parent / "Scripts"
+        scripts_dir = python_exe.parent if python_exe.parent.name.lower() == "scripts" else python_exe.parent / "Scripts"
         existing_path = env.get("PATH", "")
         env["PATH"] = str(scripts_dir) + (os.pathsep + existing_path if existing_path else "")
     return env
@@ -664,7 +905,10 @@ def _install_package_specs(
         if dry_run:
             print(" ".join(command))
             continue
-        subprocess.check_call(command, cwd=_package_root(), env=env)
+        stage = "install_runtime_packages"
+        if specs:
+            stage = f"{stage}_{specs[0].split('==', maxsplit=1)[0].replace('[', '_').replace(']', '_')}"
+        _run_checked_command(command, stage=stage, cwd=_package_root(), env=env)
 
 
 def _pip_install_specs(
@@ -676,10 +920,8 @@ def _pip_install_specs(
 ) -> None:
     """Install `specs`, preferring any wheels bundled in `wheelhouse/`.
 
-    交付包默认只随带体积小的通用依赖（lite wheelhouse）。这里同时给出 `--find-links
-    wheelhouse` 与 `--index-url <镜像>`：pip 优先用本地已有的 wheel，缺的再从镜像在线
-    下载。wheelhouse 不存在时就是纯在线安装。
-    """
+    濞存嚎鍊撶划顖炲礌閸涘甯涢悹浣靛€曡ぐ褔姊捐箛鎾舵暔濞达絾鎸捐ⅶ閻忓繐绻掑▓鎴︽焻濮樿鲸鏆忓〒姘箚缁傚棝鏁嶉崸妾宼e wheelhouse闁挎稑顦埀顒€鍊界换鏍煂鐏炶姤鍊遍柡鍐ㄥ缁即宕?`--find-links
+    wheelhouse` 濞?`--index-url <闂傗偓濠婂啫鍓?`闁挎稒顒猧p 濞村吋锚閸樻盯鎮介妸锔芥嫳闁革附婢橀崙锟犲嫉婢跺本鐣?wheel闁挎稑鐬煎閬嶆儍閸曨偄鏅欏ù鐘查叄閺嗗懘宕撹箛鎾磋含缂?    濞戞挸顑堝ù鍥Υ閸婂儶eelhouse 濞戞挸绉撮悺銊╁捶閵婏附顦ч悘蹇氶哺濡插摜鐥姘含缂佹儳鐏濋悾銊ф啑閸涱偀鍋?    """
     if not specs:
         return
     env = _pip_env(python_exe)
@@ -694,7 +936,10 @@ def _pip_install_specs(
     if dry_run:
         print(" ".join(command))
         return
-    subprocess.check_call(command, cwd=_package_root(), env=env)
+    stage = "install_common_dependencies"
+    if specs:
+        stage = f"{stage}_{specs[0].split('==', maxsplit=1)[0].replace('[', '_').replace(']', '_')}"
+    _run_checked_command(command, stage=stage, cwd=_package_root(), env=env)
 
 
 def _install_common_dependencies(
@@ -801,12 +1046,12 @@ def _validation_script(package_root: Path, cache_home: Path, backend_key: str, m
         f"sys.path.insert(0, {str(package_root)!r})\n"
         "from PIL import Image, ImageDraw, ImageFont\n"
         "from vision.ocr import ocr\n"
-        "from vision.ocr_runtime import create_ocr_runtime_engine, load_runtime_manifest, resolve_model_spec\n"
+        "from vision.ocr_runtime import create_local_runtime_engine, load_runtime_manifest, resolve_model_spec\n"
         f"manifest = load_runtime_manifest({str(package_root)!r})\n"
         f"backend = {backend_key!r}\n"
         f"model_tier = {model_tier!r}\n"
         "model_spec = resolve_model_spec(manifest, backend, model_tier)\n"
-        "engine = create_ocr_runtime_engine({'backend': backend, 'model_tier': model_tier})\n"
+        "engine = create_local_runtime_engine({'backend': backend, 'model_tier': model_tier, '_execution_mode': 'inprocess'})\n"
         "device = str(engine.preload() or '')\n"
         "base = Image.new('RGB', (120, 40), 'white')\n"
         "draw = ImageDraw.Draw(base)\n"
@@ -845,15 +1090,11 @@ def _validate_runtime(
             "ocr_device": {"paddle_cuda": "gpu:0", "onnx_directml": "dml:0", "cpu": "cpu"}[backend_key],
             "models": _manifest_model_spec(_load_runtime_manifest(), backend_key, model_tier),
         }
-    completed = subprocess.run(
+    completed = _run_checked_command(
         [str(python_exe), "-c", _validation_script(_package_root(), cache_home, backend_key, model_tier)],
+        stage=f"validate_{backend_key}_runtime",
         cwd=_package_root(),
         env=_runtime_env(cache_home),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="ignore",
-        check=True,
     )
     payload_line = ""
     for line in reversed([item.strip() for item in completed.stdout.splitlines() if item.strip()]):
@@ -877,6 +1118,23 @@ def _reset_private_runtime_dir() -> None:
         shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
+def _install_app_runtime(
+    *,
+    manifest: dict[str, Any],
+    dry_run: bool,
+) -> dict[str, Any]:
+    python_executable = _create_runtime_venv(dry_run=dry_run)
+    _ensure_pip_tooling(python_exe=python_executable, dry_run=dry_run)
+    _install_common_dependencies(python_exe=python_executable, manifest=manifest, dry_run=dry_run)
+    if not dry_run:
+        _prune_installed_docs(_private_site_packages())
+    return {
+        "python_executable": python_executable,
+        "packages": _common_dependency_specs(manifest),
+        "runtime_path": _private_runtime_dir(),
+    }
+
+
 def _state_payload(
     *,
     backend_key: str,
@@ -895,11 +1153,16 @@ def _state_payload(
     validation_details: dict[str, Any] | None = None,
     fallback_from: str = "",
     fallback_reason: str = "",
+    failure_log_path: str = "",
 ) -> dict[str, Any]:
+    runtime_name = _normalize_runtime_name(None)
     payload = {
-        "schema_version": 4,
+        "schema_version": 5,
         "backend": backend_key,
         "model_tier": model_tier,
+        "execution_mode": "subprocess",
+        "package_mode": "full" if runtime_name != "legacy" else "legacy",
+        "runtime_name": runtime_name,
         "cuda_lane": cuda_lane,
         "cache_home": str(cache_home),
         "status": status,
@@ -926,6 +1189,8 @@ def _state_payload(
         payload["fallback_from"] = fallback_from
     if fallback_reason:
         payload["fallback_reason"] = fallback_reason
+    if failure_log_path:
+        payload["failure_log_path"] = failure_log_path
     return payload
 
 
@@ -938,6 +1203,8 @@ def _install_backend_runtime(
     cache_home: Path,
     hardware: dict[str, Any],
     dry_run: bool,
+    skip_validation: bool = False,
+    bundle_models: bool = False,
 ) -> dict[str, Any]:
     runtime_plan = _manifest_backend_package_plan(manifest, backend_key, cuda_lane=cuda_lane)
     model_spec = _manifest_model_spec(manifest, backend_key, model_tier)
@@ -946,12 +1213,13 @@ def _install_backend_runtime(
     python_executable = _create_runtime_venv(dry_run=dry_run)
     _ensure_pip_tooling(python_exe=python_executable, dry_run=dry_run)
     _install_common_dependencies(python_exe=python_executable, manifest=manifest, dry_run=dry_run)
-    _install_shared_runtime_dependencies(python_exe=python_executable, manifest=manifest, dry_run=dry_run)
+    if backend_key in {"paddle_cuda", "cpu"}:
+        _install_shared_runtime_dependencies(python_exe=python_executable, manifest=manifest, dry_run=dry_run)
     _install_package_specs(python_exe=python_executable, package_specs=runtime_plan, dry_run=dry_run)
 
     ocr_device = ""
     validation_payload: dict[str, Any] = {}
-    if not dry_run:
+    if not dry_run and not skip_validation:
         if backend_key in {"paddle_cuda", "cpu"}:
             _reset_incomplete_paddlex_models(
                 [
@@ -980,6 +1248,10 @@ def _install_backend_runtime(
     else:
         ocr_device = {"paddle_cuda": "gpu:0", "onnx_directml": "dml:0", "cpu": "cpu"}[backend_key]
 
+    bundled_models: list[str] = []
+    if bundle_models and backend_key in {"paddle_cuda", "cpu"}:
+        bundled_models = _bundle_paddlex_models([model_spec.get("det", ""), model_spec.get("rec", "")])
+
     return {
         "backend": backend_key,
         "model_tier": model_tier,
@@ -991,6 +1263,7 @@ def _install_backend_runtime(
         "model_spec": model_spec,
         "ocr_device": ocr_device,
         "validation_details": validation_payload,
+        "bundled_models": bundled_models,
     }
 
 
@@ -1002,13 +1275,44 @@ def main() -> int:
     model_tier_choices = ["auto", *sorted((manifest.get("models", {}).get("tiers", {}) or {}).keys())]
 
     parser = argparse.ArgumentParser(description="Install OCR runtime.")
+    parser.add_argument("--package-root", type=Path, default=None)
+    parser.add_argument("--runtime-name", choices=["legacy", *FULL_PACKAGE_RUNTIME_NAMES], default="legacy")
+    parser.add_argument("--install-scope", choices=["backend", "app"], default="backend")
     parser.add_argument("--backend", choices=["auto", "paddle_cuda", "onnx_directml", "cpu"], default="auto")
     parser.add_argument("--model-tier", choices=model_tier_choices, default="auto")
     parser.add_argument("--cuda-lane", choices=["auto", "cu118", "cu126", "cu129"], default="auto")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--skip-validation", action="store_true")
+    parser.add_argument("--skip-state-write", action="store_true")
+    parser.add_argument("--bundle-models", action="store_true")
+    parser.add_argument("--allow-missing-hardware", action="store_true")
     args = parser.parse_args()
 
-    backend_key, hardware = _selected_backend(args.backend)
+    _set_package_root_override(args.package_root)
+    _set_runtime_name_override(args.runtime_name)
+    _configure_paddlex_cache_home(force=bool(args.package_root is not None or args.runtime_name != "legacy"))
+
+    if args.install_scope == "app":
+        result = _install_app_runtime(manifest=manifest, dry_run=args.dry_run)
+        if not args.skip_state_write:
+            payload = {
+                "schema_version": 5,
+                "package_mode": "full" if _normalize_runtime_name(None) != "legacy" else "legacy",
+                "runtime_name": _normalize_runtime_name(None),
+                "status": "dry_run" if args.dry_run else "installed",
+                "validation": "skipped",
+                "backend": "auto",
+                "execution_mode": "subprocess",
+                "python_executable": str(result["python_executable"]),
+                "runtime_path": str(result["runtime_path"]),
+                "packages": result["packages"],
+                "message": "App runtime assembled.",
+            }
+            _write_state(payload)
+        print(f"App runtime ready at {_private_runtime_dir()}")
+        return 0
+
+    backend_key, hardware = _selected_backend(args.backend, allow_missing_hardware=args.allow_missing_hardware)
     model_spec = _manifest_model_spec(manifest, backend_key, args.model_tier)
     model_tier = model_spec.get("model_tier", "lite") or "lite"
 
@@ -1023,14 +1327,15 @@ def main() -> int:
             cuda_lane, cuda_lane_reason = _choose_cuda_lane(
                 str(gpu_env.get("nvcc_version", "") or ""),
                 str(gpu_env.get("driver_cuda_version", "") or ""),
+                compute_capability=str(gpu_env.get("compute_capability", "") or ""),
+                gpu_name=str(hardware.get("gpu_name", "") or ""),
             )
             if cuda_lane is None:
                 raise RuntimeError(
                     "Could not determine a supported Paddle CUDA lane. "
-                    f"nvidia-smi CUDA={gpu_env.get('driver_cuda_version') or 'unknown'}; "
-                    f"nvcc={gpu_env.get('nvcc_version') or 'unknown'}; reason={cuda_lane_reason}"
+                    f"driver max CUDA={gpu_env.get('driver_cuda_version') or 'unknown'}; "
+                    f"nvcc(local toolkit)={gpu_env.get('nvcc_version') or 'unknown'}; reason={cuda_lane_reason}"
                 )
-
     cache_home = _configure_paddlex_cache_home()
     runtime_dir = _runtime_dir()
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -1047,11 +1352,14 @@ def main() -> int:
             cache_home=cache_home,
             hardware=hardware,
             dry_run=args.dry_run,
+            skip_validation=args.skip_validation,
+            bundle_models=args.bundle_models,
         )
     except Exception as exc:  # pragma: no cover - surfaced to user via CLI
-        if not args.dry_run and backend_key == "paddle_cuda":
+        if not args.dry_run and not args.skip_validation and backend_key == "paddle_cuda":
             print(f"[warn] GPU OCR validation failed, falling back to CPU: {exc}")
             fallback_reason = str(exc)
+            failure_log_path = str(exc.log_path) if isinstance(exc, CommandExecutionError) else ""
             _reset_private_runtime_dir()
             try:
                 result = _install_backend_runtime(
@@ -1062,6 +1370,8 @@ def main() -> int:
                     cache_home=cache_home,
                     hardware=hardware,
                     dry_run=False,
+                    skip_validation=False,
+                    bundle_models=args.bundle_models,
                 )
             except Exception as fallback_exc:
                 payload = _state_payload(
@@ -1080,8 +1390,10 @@ def main() -> int:
                     ocr_device="",
                     fallback_from="paddle_cuda",
                     fallback_reason=fallback_reason,
+                    failure_log_path=failure_log_path,
                 )
-                _write_state(payload)
+                if not args.skip_state_write:
+                    _write_state(payload)
                 raise
             payload = _state_payload(
                 backend_key="cpu",
@@ -1100,10 +1412,12 @@ def main() -> int:
                 validation_details=dict(result["validation_details"]),
                 fallback_from="paddle_cuda",
                 fallback_reason=fallback_reason,
+                failure_log_path=failure_log_path,
             )
-            _write_state(payload)
+            if not args.skip_state_write:
+                _write_state(payload)
+                print(f"OCR runtime state wrote {_runtime_state_path()}")
             print("[info] GPU OCR runtime fallback applied: using CPU backend.")
-            print(f"OCR runtime state wrote {_runtime_state_path()}")
             return 0
         payload = _state_payload(
             backend_key=backend_key,
@@ -1119,8 +1433,10 @@ def main() -> int:
             validation="failed",
             validation_error=str(exc),
             ocr_device="",
+            failure_log_path=str(exc.log_path) if isinstance(exc, CommandExecutionError) else "",
         )
-        _write_state(payload)
+        if not args.skip_state_write:
+            _write_state(payload)
         raise
 
     payload = _state_payload(
@@ -1134,13 +1450,17 @@ def main() -> int:
         hardware=hardware,
         model_spec=dict(result["model_spec"]),
         status="dry_run" if args.dry_run else "installed",
-        validation="skipped" if args.dry_run else "ok",
+        validation="skipped" if args.dry_run or args.skip_validation else "ok",
         validation_error="",
         ocr_device=str(result["ocr_device"]),
         validation_details=dict(result["validation_details"]),
     )
-    _write_state(payload)
-    print(f"OCR runtime state wrote {_runtime_state_path()}")
+    if result.get("bundled_models"):
+        payload["bundled_models"] = list(result["bundled_models"])
+    if not args.skip_state_write:
+        _write_state(payload)
+        print(f"OCR runtime state wrote {_runtime_state_path()}")
+    print(f"OCR runtime ready at {_private_runtime_dir()}")
     return 0
 
 

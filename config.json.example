@@ -1,7 +1,6 @@
 {
   "schema_version": 3,
   "global": {
-    "apikey": "",
     "license_api_url": "",
     "project_uuid": "",
     "project_secret": "",

@@ -16,6 +16,7 @@ wheelhouse/
 
 config.json
 outbox.json
+.env/
 runtime/logs/*
 !runtime/logs/.gitkeep
 runtime/errors/*

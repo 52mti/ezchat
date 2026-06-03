@@ -8,6 +8,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+from runtime_layout import (
+    bundled_paddlex_model_dir,
+    has_packaged_runtime_layout,
+    model_dir_is_complete,
+    runtime_dir,
+    runtime_python,
+    runtime_state_path,
+)
+
 
 def _app_root() -> Path:
     if getattr(sys, "frozen", False):
@@ -16,39 +25,19 @@ def _app_root() -> Path:
 
 
 def _runtime_dir(root: Path) -> Path:
-    return root / ".runtime_env"
+    return runtime_dir(root, "app")
 
 
 def _runtime_python(root: Path) -> Path:
-    if os.name == "nt":
-        runtime_dir = _runtime_dir(root)
-        for candidate in (
-            runtime_dir / "pythonw.exe",
-            runtime_dir / "Scripts" / "pythonw.exe",
-            runtime_dir / "python.exe",
-            runtime_dir / "Scripts" / "python.exe",
-        ):
-            if candidate.is_file():
-                return candidate
-        return runtime_dir / "pythonw.exe"
-    return _runtime_dir(root) / "bin" / "python"
+    return runtime_python(root, "app", gui=True)
 
 
 def _runtime_python_fallback(root: Path) -> Path:
-    if os.name == "nt":
-        runtime_dir = _runtime_dir(root)
-        for candidate in (
-            runtime_dir / "python.exe",
-            runtime_dir / "Scripts" / "python.exe",
-        ):
-            if candidate.is_file():
-                return candidate
-        return runtime_dir / "python.exe"
-    return _runtime_dir(root) / "bin" / "python"
+    return runtime_python(root, "app", gui=False)
 
 
 def _runtime_state_path(root: Path) -> Path:
-    return root / "runtime" / "install_state.json"
+    return runtime_state_path(root)
 
 
 def _load_runtime_state(root: Path) -> dict[str, object] | None:
@@ -62,14 +51,6 @@ def _load_runtime_state(root: Path) -> dict[str, object] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _required_paddlex_model_files() -> tuple[str, ...]:
-    return ("config.json", "inference.json", "inference.pdiparams", "inference.yml")
-
-
-def _model_dir_is_complete(model_dir: Path) -> bool:
-    return model_dir.is_dir() and all((model_dir / file_name).is_file() for file_name in _required_paddlex_model_files())
-
-
 def _cache_home_from_state(root: Path, state: dict[str, object]) -> Path:
     configured = str(state.get("cache_home", "") or "").strip()
     if configured:
@@ -78,6 +59,21 @@ def _cache_home_from_state(root: Path, state: dict[str, object]) -> Path:
         public_root = Path(os.environ.get("PUBLIC", r"C:\Users\Public")).resolve()
         return public_root / "jixiebijiaoben_runtime" / ".paddlex"
     return root / "runtime" / ".paddlex"
+
+
+def _bundled_models_ready(root: Path, state: dict[str, object]) -> bool:
+    models = state.get("models", {})
+    if not isinstance(models, dict):
+        return True
+    if str(models.get("provider", "")).strip().lower() != "paddlex_named_models":
+        return True
+    for model_name in (
+        str(models.get("det", "") or "").strip(),
+        str(models.get("rec", "") or "").strip(),
+    ):
+        if model_name and not model_dir_is_complete(bundled_paddlex_model_dir(root, model_name)):
+            return False
+    return True
 
 
 def _runtime_is_ready(root: Path) -> bool:
@@ -93,10 +89,20 @@ def _runtime_is_ready(root: Path) -> bool:
     if not (_runtime_python(root).is_file() or _runtime_python_fallback(root).is_file()):
         return False
 
+    if has_packaged_runtime_layout(root):
+        if not any(
+            runtime_dir(root, runtime_name).is_dir()
+            and runtime_python(root, runtime_name, gui=False).is_file()
+            for runtime_name in ("ocr_cpu", "ocr_nvidia", "ocr_directml")
+        ):
+            return False
+
     models = state.get("models", {})
     if not isinstance(models, dict):
         return True
     if str(models.get("provider", "")).strip().lower() != "paddlex_named_models":
+        return True
+    if _bundled_models_ready(root, state):
         return True
 
     cache_home = _cache_home_from_state(root, state)
@@ -105,13 +111,13 @@ def _runtime_is_ready(root: Path) -> bool:
         str(models.get("det", "") or "").strip(),
         str(models.get("rec", "") or "").strip(),
     ):
-        if model_name and not _model_dir_is_complete(official_models_root / model_name):
+        if model_name and not model_dir_is_complete(official_models_root / model_name):
             return False
     return True
 
 
 def _show_missing_runtime_message() -> None:
-    message = "OCR环境或模型未安装完成。请先双击“安装环境.cmd”完成安装，再启动机械臂脚本。"
+    message = "OCR runtime or bundled models are not ready. Rebuild the full package."
     if os.name == "nt":
         ctypes.windll.user32.MessageBoxW(None, message, "机械臂脚本", 0x10)
         return

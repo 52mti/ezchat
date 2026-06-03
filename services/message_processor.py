@@ -40,13 +40,14 @@ class MessageProcessor:
 
     def _persona_for(self, contact_name: str) -> dict[str, Any]:
         global_persona = self.config_manager.get("global", "persona", default={})
-        app_overrides = self.device.get("app_overrides", {})
+        device = self.config_manager.find_device(self.device_ip) or self.device
+        app_overrides = device.get("app_overrides", {})
         app_override = app_overrides.get(self.app_name, {}) if isinstance(app_overrides, dict) else {}
         app_persona = app_override.get("persona", {}) if isinstance(app_override, dict) else {}
         app_persona = with_app_defaults({"persona": app_persona if isinstance(app_persona, dict) else {}})["persona"]
-        device_persona = self.device.get("persona", {})
+        device_persona = device.get("persona", {})
         device_persona = device_persona if isinstance(device_persona, dict) else {}
-        contact_personas = self.device.get("contact_personas", {})
+        contact_personas = device.get("contact_personas", {})
         contact_persona = {}
         if isinstance(contact_personas, dict):
             contact_persona = contact_personas.get(contact_name, {}) or {}

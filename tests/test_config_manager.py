@@ -20,7 +20,8 @@ def test_config_manager_get_set_and_atomic_write(tmp_path):
 
     assert manager.get("global", "apikey") == "abc123"
     saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert saved["global"]["apikey"] == "abc123"
+    assert "apikey" not in saved["global"]
+    assert (tmp_path / ".env" / "apikey.txt").read_text(encoding="utf-8") == "CHATBOT_APIKEY=abc123\n"
 
 
 def test_config_manager_has_global_greetings_dir_default(tmp_path):
@@ -43,7 +44,88 @@ def test_config_manager_environment_override_is_not_written(tmp_path, monkeypatc
 
     assert manager.get("global", "apikey") == "env-key"
     saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert saved["global"]["apikey"] == "file-key"
+    assert "apikey" not in saved["global"]
+
+
+def test_config_manager_local_env_apikey_override_is_not_written(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    outbox_path = tmp_path / "outbox.json"
+    config_path.write_text(
+        json.dumps({"global": {"apikey": "file-key"}, "devices": []}),
+        encoding="utf-8",
+    )
+    env_dir = tmp_path / ".env"
+    env_dir.mkdir()
+    (env_dir / "apikey.txt").write_text("# local only\nCHATBOT_APIKEY=local-key\n", encoding="utf-8")
+    monkeypatch.delenv("CHATBOT_APIKEY", raising=False)
+
+    manager = ConfigManager(config_path, outbox_path)
+
+    assert manager.get("global", "apikey") == "local-key"
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "apikey" not in saved["global"]
+
+
+def test_config_manager_reads_local_env_apikey_with_utf8_bom(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    outbox_path = tmp_path / "outbox.json"
+    env_dir = tmp_path / ".env"
+    env_dir.mkdir()
+    (env_dir / "apikey.txt").write_text("\ufeff41d83b9a-525b-424b-bbea-c5857de9d21c\n", encoding="utf-8")
+    monkeypatch.delenv("CHATBOT_APIKEY", raising=False)
+
+    manager = ConfigManager(config_path, outbox_path)
+
+    assert manager.get("global", "apikey") == "41d83b9a-525b-424b-bbea-c5857de9d21c"
+
+
+def test_config_manager_reads_key_value_local_env_apikey_with_utf8_bom(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    outbox_path = tmp_path / "outbox.json"
+    env_dir = tmp_path / ".env"
+    env_dir.mkdir()
+    (env_dir / "apikey.txt").write_text("\ufeffCHATBOT_APIKEY=bom-key\n", encoding="utf-8")
+    monkeypatch.delenv("CHATBOT_APIKEY", raising=False)
+
+    manager = ConfigManager(config_path, outbox_path)
+
+    assert manager.get("global", "apikey") == "bom-key"
+
+
+def test_config_manager_environment_apikey_wins_over_local_env_file(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    outbox_path = tmp_path / "outbox.json"
+    config_path.write_text(
+        json.dumps({"global": {"apikey": "file-key"}, "devices": []}),
+        encoding="utf-8",
+    )
+    env_dir = tmp_path / ".env"
+    env_dir.mkdir()
+    (env_dir / "apikey.txt").write_text("local-key\n", encoding="utf-8")
+    monkeypatch.setenv("CHATBOT_APIKEY", "real-env-key")
+
+    manager = ConfigManager(config_path, outbox_path)
+
+    assert manager.get("global", "apikey") == "real-env-key"
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "apikey" not in saved["global"]
+
+
+def test_config_manager_migrates_file_apikey_to_local_env(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    outbox_path = tmp_path / "outbox.json"
+    config_path.write_text(
+        json.dumps({"global": {"apikey": "file-key"}, "devices": []}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("CHATBOT_APIKEY", raising=False)
+
+    manager = ConfigManager(config_path, outbox_path)
+
+    assert manager.get("global", "apikey") == "file-key"
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "apikey" not in saved["global"]
+    assert (tmp_path / ".env" / "apikey.txt").read_text(encoding="utf-8") == "CHATBOT_APIKEY=file-key\n"
 
 
 def test_config_manager_upserts_outbox_entry(tmp_path):

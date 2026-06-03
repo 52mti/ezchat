@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import hashlib
 import inspect
 import json
 import os
@@ -9,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -16,6 +19,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from runtime_layout import (
+    backend_runtime_name,
+    bundled_paddlex_model_dir,
+    has_packaged_runtime_layout,
+    model_dir_is_complete,
+    package_root_from_path,
+    runtime_python,
+)
 
 
 PADDLE_VERSION = "3.2.2"
@@ -23,11 +34,13 @@ PADDLEOCR_VERSION = "3.4.0"
 PADDLEX_VERSION = "3.4.3"
 DEFAULT_MODEL_TIER = "lite"
 SUPPORTED_BACKENDS = ("auto", "paddle_cuda", "onnx_directml", "cpu")
+SUPPORTED_EXECUTION_MODES = ("auto", "inprocess", "subprocess")
 CUDA_LANE_INDEXES = {
     "cu118": "https://www.paddlepaddle.org.cn/packages/stable/cu118/",
     "cu126": "https://www.paddlepaddle.org.cn/packages/stable/cu126/",
     "cu129": "https://www.paddlepaddle.org.cn/packages/stable/cu129/",
 }
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 
 @dataclass(slots=True)
@@ -40,6 +53,7 @@ class GpuEnvironmentReport:
     driver_version: str | None
     driver_cuda_version: str | None
     nvcc_version: str | None
+    compute_capability: str | None
     recommended_cuda_lane: str | None
     lane_reason: str | None
     paddle_version: str | None = None
@@ -183,19 +197,57 @@ def _normalize_major_minor(raw_version: str | None) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2) or 0)
 
 
-def choose_cuda_lane(nvcc_version: str | None, driver_cuda_version: str | None) -> tuple[str | None, str]:
+def _parse_compute_capability(raw_value: str | None) -> tuple[int, int] | None:
+    if not raw_value:
+        return None
+    match = re.match(r"^\s*(\d+)(?:\.(\d+))?", raw_value)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
+
+
+def _format_compute_capability(value: tuple[int, int] | None) -> str:
+    if value is None:
+        return ""
+    return f"{value[0]}.{value[1]}"
+
+
+def choose_cuda_lane(
+    nvcc_version: str | None,
+    driver_cuda_version: str | None,
+    *,
+    compute_capability: str | None = None,
+    gpu_name: str | None = None,
+) -> tuple[str | None, str]:
+    capability = _parse_compute_capability(compute_capability)
+    if sys.platform.startswith("win") and capability is not None:
+        if capability < (6, 1):
+            capability_text = _format_compute_capability(capability)
+            gpu_label = gpu_name or "NVIDIA GPU"
+            return (
+                None,
+                f"Detected {gpu_label} with compute capability {capability_text}. "
+                "Full package NVIDIA support starts at compute capability 6.1, "
+                "so this machine should use DirectML or CPU OCR instead.",
+            )
+        if capability < (8, 0):
+            capability_text = _format_compute_capability(capability)
+            return (
+                "cu118",
+                f"Detected compute capability {capability_text}; prefer Paddle cu118 for pre-Ampere NVIDIA GPUs.",
+            )
     preferred = _normalize_major_minor(nvcc_version) or _normalize_major_minor(driver_cuda_version)
     if preferred is None:
-        return None, "未检测到 CUDA Toolkit 或显卡驱动 CUDA 版本。"
+        return None, "No local CUDA Toolkit version was detected, and the GPU driver did not report a usable max CUDA version."
     major, minor = preferred
-    source = "nvcc" if nvcc_version else "nvidia-smi"
+    source = "local CUDA Toolkit (nvcc)" if nvcc_version else "GPU driver reported max CUDA (nvidia-smi)"
     if major > 12 or (major == 12 and minor >= 9):
-        return "cu129", f"从 {source} 检测到 CUDA {major}.{minor}，选择 Paddle cu129。"
+        return "cu129", f"Using {source} version {major}.{minor}; selecting Paddle cu129."
     if major == 12 and minor >= 6:
-        return "cu126", f"从 {source} 检测到 CUDA {major}.{minor}，选择 Paddle cu126。"
+        return "cu126", f"Using {source} version {major}.{minor}; selecting Paddle cu126."
     if (major == 11 and minor >= 8) or major > 11:
-        return "cu118", f"从 {source} 检测到 CUDA {major}.{minor}，选择 Paddle cu118。"
-    return None, f"检测到 CUDA {major}.{minor}，低于 Paddle 当前支持的 CUDA 11.8。"
+        return "cu118", f"Using {source} version {major}.{minor}; selecting Paddle cu118."
+    return None, f"{source} version {major}.{minor} is below the minimum supported CUDA 11.8."
 
 
 def detect_gpu_environment() -> GpuEnvironmentReport:
@@ -221,7 +273,20 @@ def detect_gpu_environment() -> GpuEnvironmentReport:
         match = re.search(r"release\s+([0-9]+(?:\.[0-9]+)?)", nvcc.stdout)
         if match:
             nvcc_version = match.group(1)
-    lane, reason = choose_cuda_lane(nvcc_version, driver_cuda_version)
+    compute_cap_query = _run_command(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"])
+    compute_capability: str | None = None
+    if compute_cap_query is not None and compute_cap_query.returncode == 0:
+        for line in compute_cap_query.stdout.splitlines():
+            value = line.strip()
+            if value:
+                compute_capability = value
+                break
+    lane, reason = choose_cuda_lane(
+        nvcc_version,
+        driver_cuda_version,
+        compute_capability=compute_capability,
+        gpu_name=gpu_names[0] if gpu_names else None,
+    )
     return GpuEnvironmentReport(
         platform=platform.platform(),
         python_version=platform.python_version(),
@@ -231,6 +296,7 @@ def detect_gpu_environment() -> GpuEnvironmentReport:
         driver_version=driver_version,
         driver_cuda_version=driver_cuda_version,
         nvcc_version=nvcc_version,
+        compute_capability=compute_capability,
         recommended_cuda_lane=lane,
         lane_reason=reason,
     )
@@ -337,9 +403,9 @@ def select_ocr_backend(preferred_backend: object, hardware: HardwareProbeResult 
         return (hardware or probe_hardware()).recommended_backend
     hardware = hardware or probe_hardware()
     if normalized == "paddle_cuda" and not hardware.nvidia_detected:
-        raise RuntimeError("OCR 后端 paddle_cuda 需要 NVIDIA 显卡。")
+        raise RuntimeError("OCR backend paddle_cuda requires an NVIDIA GPU.")
     if normalized == "onnx_directml" and not hardware.directml_available:
-        raise RuntimeError("OCR 后端 onnx_directml 需要 Windows AMD/Intel 显卡和 DirectML。")
+        raise RuntimeError("OCR backend onnx_directml requires a Windows AMD/Intel GPU with DirectML support.")
     return normalized
 
 
@@ -514,21 +580,163 @@ def resolve_model_spec(manifest: RuntimeManifest, backend: str, model_tier: obje
     return spec
 
 
+def normalize_execution_mode(raw_value: object) -> str:
+    value = str(raw_value or "auto").strip().lower()
+    aliases = {
+        "": "auto",
+        "auto": "auto",
+        "inprocess": "inprocess",
+        "local": "inprocess",
+        "subprocess": "subprocess",
+        "worker": "subprocess",
+    }
+    normalized = aliases.get(value)
+    if normalized not in SUPPORTED_EXECUTION_MODES:
+        raise ValueError(f"Unsupported OCR execution mode: {raw_value}")
+    return normalized
+
+
+def _package_root(project_root: str | Path | None = None) -> Path:
+    if project_root is not None:
+        return package_root_from_path(project_root)
+    return Path(__file__).resolve().parents[1]
+
+
+def _load_runtime_manifest_payload(project_root: str | Path | None = None) -> dict[str, Any]:
+    path = _package_root(project_root) / "runtime_manifest.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _manifest_execution_mode(project_root: str | Path | None = None) -> str:
+    payload = _load_runtime_manifest_payload(project_root)
+    return normalize_execution_mode(payload.get("executionMode", "auto"))
+
+
+def _bundled_model_mirror_root(project_root: str | Path | None = None) -> Path:
+    if os.name == "nt":
+        public_root = Path(os.environ.get("PUBLIC", r"C:\Users\Public")).resolve()
+        return public_root / "jixiebijiaoben_runtime" / "bundled_models"
+    return _package_root(project_root) / "runtime" / ".paddlex" / "bundled_models"
+
+
+def _model_cache_key(model_dir: Path, model_name: str) -> str:
+    payload = [str(model_name or "").strip()]
+    for file_name in ("config.json", "inference.json", "inference.pdiparams", "inference.yml"):
+        file_path = model_dir / file_name
+        try:
+            stat = file_path.stat()
+        except OSError:
+            payload.append(f"{file_name}:missing")
+            continue
+        payload.append(f"{file_name}:{stat.st_size}:{stat.st_mtime_ns}")
+    digest = hashlib.sha1("|".join(payload).encode("utf-8")).hexdigest()[:12]
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(model_name or "").strip()).strip("._") or "model"
+    return f"{safe_name}_{digest}"
+
+
+def _copy_model_dir_atomic(source_dir: Path, target_dir: Path) -> None:
+    mirror_root = target_dir.parent
+    mirror_root.mkdir(parents=True, exist_ok=True)
+    temp_root = Path(tempfile.mkdtemp(prefix="model_copy_", dir=mirror_root))
+    temp_target = temp_root / target_dir.name
+    try:
+        shutil.copytree(source_dir, temp_target)
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        temp_target.replace(target_dir)
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def _materialize_ascii_safe_model_dir(model_dir: Path, model_name: str, project_root: str | Path | None = None) -> Path:
+    if os.name != "nt" or str(model_dir).isascii():
+        return model_dir
+    cache_key = _model_cache_key(model_dir, model_name)
+    target_dir = _bundled_model_mirror_root(project_root) / cache_key
+    if model_dir_is_complete(target_dir):
+        return target_dir
+    with _ENGINE_INIT_LOCK:
+        if model_dir_is_complete(target_dir):
+            return target_dir
+        _copy_model_dir_atomic(model_dir, target_dir)
+    return target_dir
+
+
+def _normalize_model_dir_for_paddle(
+    model_dir_value: str | Path | None,
+    model_name: str,
+    project_root: str | Path | None = None,
+) -> str:
+    normalized = str(model_dir_value or "").strip()
+    if not normalized:
+        return ""
+    model_dir = Path(normalized).expanduser()
+    if not model_dir_is_complete(model_dir):
+        return normalized
+    return str(_materialize_ascii_safe_model_dir(model_dir, model_name, project_root))
+
+
+def _resolve_bundled_model_dir(model_name: str, project_root: str | Path | None = None) -> str:
+    normalized = str(model_name or "").strip()
+    if not normalized:
+        return ""
+    model_dir = bundled_paddlex_model_dir(_package_root(project_root), normalized)
+    if not model_dir_is_complete(model_dir):
+        return ""
+    return _normalize_model_dir_for_paddle(model_dir, normalized, project_root)
+
+
+def _serialize_prediction_payload(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _serialize_prediction_payload(dataclasses.asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _serialize_prediction_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_serialize_prediction_payload(item) for item in value]
+    if isinstance(value, set):
+        return [_serialize_prediction_payload(item) for item in value]
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, Path):
+        return str(value)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return _serialize_prediction_payload(to_dict())
+        except Exception:
+            pass
+    return str(value)
+
+
 def validate_paddle_gpu_runtime() -> GpuEnvironmentReport:
     report = detect_gpu_environment()
     if not report.gpu_names:
-        raise RuntimeError("未检测到可用 NVIDIA 显卡，无法使用 paddle_cuda OCR 后端。")
+        raise RuntimeError("No usable NVIDIA GPU was detected; paddle_cuda OCR backend cannot be used.")
     try:
         import paddle
     except ImportError as exc:
-        raise RuntimeError("当前 Python 环境没有安装 Paddle GPU 运行时。") from exc
+        raise RuntimeError("The current Python environment does not have Paddle GPU runtime installed.") from exc
     report.paddle_version = getattr(paddle, "__version__", None)
     report.paddle_compiled_with_cuda = bool(paddle.is_compiled_with_cuda())
     if not report.paddle_compiled_with_cuda:
-        raise RuntimeError(f"当前 Paddle {report.paddle_version or '<unknown>'} 不是 GPU 版本。")
+        raise RuntimeError(f"Current Paddle {report.paddle_version or '<unknown>'} is not a GPU build.")
     report.paddle_cuda_device_count = int(paddle.device.cuda.device_count())
     if report.paddle_cuda_device_count < 1:
-        raise RuntimeError("Paddle GPU 已安装，但没有枚举到可用 CUDA 设备。")
+        raise RuntimeError("Paddle GPU is installed, but no usable CUDA device was enumerated.")
     report.paddle_current_device = str(paddle.device.get_device())
     return report
 
@@ -586,6 +794,8 @@ class PaddleOcrRuntimeEngine:
 
     def _build_kwargs(self, device: str) -> dict[str, Any]:
         model_spec = resolve_model_spec(self.manifest, self.backend, self.model_tier)
+        detection_model_name = self.config.get("text_detection_model_name") or model_spec.det_model_name
+        recognition_model_name = self.config.get("text_recognition_model_name") or model_spec.rec_model_name
         kwargs: dict[str, Any] = {
             "lang": self.config.get("lang", "ch"),
             "use_doc_orientation_classify": bool(self.config.get("use_doc_orientation_classify", False)),
@@ -593,14 +803,14 @@ class PaddleOcrRuntimeEngine:
             "use_textline_orientation": bool(self.config.get("use_angle_cls", False)),
             "device": device,
         }
-        kwargs["text_detection_model_name"] = self.config.get("text_detection_model_name") or model_spec.det_model_name
-        kwargs["text_recognition_model_name"] = self.config.get("text_recognition_model_name") or model_spec.rec_model_name
-        for source_key, target_key in (
-            ("text_detection_model_dir", "text_detection_model_dir"),
-            ("text_recognition_model_dir", "text_recognition_model_dir"),
-        ):
-            if self.config.get(source_key):
-                kwargs[target_key] = self.config[source_key]
+        kwargs["text_detection_model_name"] = detection_model_name
+        kwargs["text_recognition_model_name"] = recognition_model_name
+        detection_dir = _normalize_model_dir_for_paddle(self.config.get("text_detection_model_dir"), detection_model_name) or _resolve_bundled_model_dir(model_spec.det_model_name)
+        recognition_dir = _normalize_model_dir_for_paddle(self.config.get("text_recognition_model_dir"), recognition_model_name) or _resolve_bundled_model_dir(model_spec.rec_model_name)
+        if detection_dir:
+            kwargs["text_detection_model_dir"] = detection_dir
+        if recognition_dir:
+            kwargs["text_recognition_model_dir"] = recognition_dir
         return {key: value for key, value in kwargs.items() if value not in ("", None)}
 
     def _get_engine(self) -> tuple[Any, str]:
@@ -620,7 +830,7 @@ class PaddleOcrRuntimeEngine:
             try:
                 from paddleocr import PaddleOCR  # type: ignore
             except ImportError as exc:
-                raise RuntimeError("缺少 paddleocr，请先运行 `python install_runtime.py --backend cpu|paddle_cuda`。") from exc
+                raise RuntimeError("Missing packaged PaddleOCR runtime. Rebuild the full package.") from exc
             try:
                 with suppress_native_output():
                     engine = PaddleOCR(**self._build_kwargs(device))
@@ -698,10 +908,10 @@ class OnnxDirectMLOcrRuntimeEngine:
                 import onnxruntime as ort  # type: ignore
                 from rapidocr_onnxruntime import RapidOCR  # type: ignore
             except ImportError as exc:
-                raise RuntimeError("缺少 DirectML OCR 依赖，请先运行 `python install_runtime.py --backend onnx_directml`。") from exc
+                raise RuntimeError("Missing packaged DirectML OCR runtime. Rebuild the full package.") from exc
             providers = list(ort.get_available_providers())
             if "DmlExecutionProvider" not in providers:
-                raise RuntimeError(f"当前 onnxruntime 没有 DirectML Provider，可用 Provider: {providers}")
+                raise RuntimeError(f"onnxruntime does not expose the DirectML provider. Providers: {providers}")
             self._engine = self._instantiate_rapidocr(RapidOCR, {"providers": ["DmlExecutionProvider", "CPUExecutionProvider"]})
             return self._engine
 
@@ -759,6 +969,147 @@ class ResilientRuntimeEngine:
             return fallback.predict(image_array, **kwargs)
 
 
+class SubprocessOcrRuntimeEngine:
+    def __init__(self, *, backend: str, model_tier: str, manifest: RuntimeManifest, config: dict[str, Any]) -> None:
+        self.backend = backend
+        self.model_tier = model_tier
+        self.manifest = manifest
+        self.config = dict(config)
+        self._process: subprocess.Popen[str] | None = None
+        self._lock = threading.RLock()
+
+    def _runtime_python_path(self) -> Path:
+        root = _package_root()
+        candidate = runtime_python(root, backend_runtime_name(self.backend), gui=False)
+        if candidate.is_file():
+            return candidate
+        raise RuntimeError(f"Missing OCR runtime python for backend: {self.backend}")
+
+    def _subprocess_config(self) -> dict[str, Any]:
+        allowed_keys = {
+            "lang",
+            "use_angle_cls",
+            "use_doc_orientation_classify",
+            "use_doc_unwarping",
+            "text_detection_model_name",
+            "text_recognition_model_name",
+            "text_detection_model_dir",
+            "text_recognition_model_dir",
+            "det_db_thresh",
+            "rec_thresh",
+        }
+        payload = {key: self.config[key] for key in allowed_keys if key in self.config}
+        payload["backend"] = self.backend
+        payload["model_tier"] = self.model_tier
+        payload["_execution_mode"] = "inprocess"
+        return payload
+
+    def _start_process(self) -> subprocess.Popen[str]:
+        if self._process is not None and self._process.poll() is None:
+            return self._process
+        root = _package_root()
+        python_exe = self._runtime_python_path()
+        command = [
+            str(python_exe),
+            "-s",
+            "-u",
+            str(root / "ocr_subprocess_entry.py"),
+            "--root",
+            str(root),
+            "--backend",
+            self.backend,
+            "--model-tier",
+            self.model_tier,
+            "--config-json",
+            json.dumps(self._subprocess_config(), ensure_ascii=False),
+        ]
+        startupinfo = None
+        creationflags = 0
+        env = dict(os.environ)
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONNOUSERSITE"] = "1"
+        env["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+        if sys.platform.startswith("win"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self._process = subprocess.Popen(
+            command,
+            cwd=root,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            env=env,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
+        )
+        return self._process
+
+    def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            process = self._start_process()
+            if process.stdin is None or process.stdout is None:
+                raise RuntimeError("OCR subprocess pipes are unavailable.")
+            process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            process.stdin.flush()
+            line = process.stdout.readline()
+            if not line:
+                stderr_output = ""
+                if process.stderr is not None:
+                    stderr_output = process.stderr.read().strip()
+                raise RuntimeError(f"OCR subprocess exited unexpectedly. {stderr_output}".strip())
+            response = json.loads(line)
+            if not isinstance(response, dict):
+                raise RuntimeError("OCR subprocess returned an invalid response payload.")
+            if not bool(response.get("ok", False)):
+                raise RuntimeError(str(response.get("error", "OCR subprocess request failed.")))
+            return response
+
+    def preload(self) -> str:
+        response = self._request({"action": "preload"})
+        return str(response.get("device", "") or "")
+
+    def predict(self, image_array: np.ndarray, **_kwargs: Any) -> list[dict[str, Any]]:
+        root = _package_root()
+        temp_dir = root / "runtime" / "tmp" / "ocr_requests"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="ocr_", suffix=".npy", dir=temp_dir, delete=False) as handle:
+                temp_path = handle.name
+            np.save(temp_path, np.ascontiguousarray(image_array))
+            response = self._request({"action": "predict", "image_path": temp_path})
+            result = response.get("result", [])
+            return result if isinstance(result, list) else []
+        finally:
+            if temp_path:
+                with contextlib.suppress(OSError):
+                    Path(temp_path).unlink()
+
+    def close(self) -> None:
+        with self._lock:
+            process = self._process
+            self._process = None
+            if process is None:
+                return
+            try:
+                if process.poll() is None and process.stdin is not None and process.stdout is not None:
+                    process.stdin.write(json.dumps({"action": "shutdown"}) + "\n")
+                    process.stdin.flush()
+            except OSError:
+                pass
+            with contextlib.suppress(Exception):
+                process.terminate()
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self.close()
+
+
 def _effective_backend_config(config: dict[str, Any]) -> tuple[str, str]:
     preferred = config.get("backend", config.get("ocr_backend", "auto"))
     installed_state = load_installed_runtime_state()
@@ -774,6 +1125,22 @@ def _effective_backend_config(config: dict[str, Any]) -> tuple[str, str]:
     return backend, model_tier
 
 
+def _effective_execution_mode(config: dict[str, Any]) -> str:
+    explicit = normalize_execution_mode(config.get("_execution_mode", config.get("ocr_execution_mode", config.get("execution_mode", "auto"))))
+    if explicit != "auto":
+        return explicit
+    installed_state = load_installed_runtime_state()
+    state_mode = str(installed_state.get("execution_mode", "") or "").strip().lower()
+    if state_mode in {"inprocess", "subprocess"}:
+        return state_mode
+    if getattr(sys, "frozen", False) and has_packaged_runtime_layout(_package_root()):
+        return "subprocess"
+    manifest_mode = _manifest_execution_mode(_package_root())
+    if manifest_mode != "auto" and has_packaged_runtime_layout(_package_root()):
+        return manifest_mode
+    return "inprocess"
+
+
 def _create_engine_for_backend(
     backend: str,
     model_tier: str,
@@ -787,7 +1154,7 @@ def _create_engine_for_backend(
     raise RuntimeError(f"Unsupported OCR backend: {backend}")
 
 
-def create_ocr_runtime_engine(config: dict[str, Any]) -> Any:
+def create_local_runtime_engine(config: dict[str, Any]) -> Any:
     manifest = load_runtime_manifest()
     backend, model_tier = _effective_backend_config(config)
     engine = _create_engine_for_backend(backend, model_tier, manifest, config)
@@ -800,6 +1167,33 @@ def create_ocr_runtime_engine(config: dict[str, Any]) -> Any:
             primary_backend=backend,
             model_tier=model_tier,
             fallback_factory=lambda: _create_engine_for_backend("cpu", model_tier, manifest, fallback_config),
+        )
+    return engine
+
+
+def create_ocr_runtime_engine(config: dict[str, Any]) -> Any:
+    execution_mode = _effective_execution_mode(config)
+    if execution_mode == "inprocess":
+        return create_local_runtime_engine(config)
+
+    manifest = load_runtime_manifest()
+    backend, model_tier = _effective_backend_config(config)
+    engine = SubprocessOcrRuntimeEngine(backend=backend, model_tier=model_tier, manifest=manifest, config=config)
+    if backend == "paddle_cuda":
+        fallback_config = dict(config)
+        fallback_config["backend"] = "cpu"
+        fallback_config["ocr_backend"] = "cpu"
+        fallback_config["_execution_mode"] = "subprocess"
+        return ResilientRuntimeEngine(
+            engine,
+            primary_backend=backend,
+            model_tier=model_tier,
+            fallback_factory=lambda: SubprocessOcrRuntimeEngine(
+                backend="cpu",
+                model_tier=model_tier,
+                manifest=manifest,
+                config=fallback_config,
+            ),
         )
     return engine
 
@@ -817,6 +1211,9 @@ def get_ocr_runtime_engine(config: dict[str, Any]) -> Any:
         in {
             "backend",
             "ocr_backend",
+            "execution_mode",
+            "ocr_execution_mode",
+            "_execution_mode",
             "model_tier",
             "modelTier",
             "lang",

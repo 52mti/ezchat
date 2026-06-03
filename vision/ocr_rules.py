@@ -71,6 +71,12 @@ def looks_like_reward_text(text: str) -> bool:
     return bool(re.search(r"\+?\s*0\.\d+", compact))
 
 
+def looks_like_distance_text(text: str) -> bool:
+    compact = normalize_ocr_text(text).replace(" ", "").lower()
+    compact = compact.translate(str.maketrans({"ｋ": "k", "ｍ": "m", "Ｋ": "k", "Ｍ": "m"}))
+    return bool(re.fullmatch(r"\d+(?:\.\d+)?(?:km|m|公里|米)(?:内|以内|附近|左右)?", compact))
+
+
 def find_keyword(text: str, keywords: tuple[str, ...]) -> str | None:
     for keyword in keywords:
         if keyword and keyword in text:
@@ -539,13 +545,18 @@ def build_dialogue_result(
                 )
             )
 
+    user_name_top_ratio = float(rules.get("user_name_top_ratio", 0.12))
+    user_name_center_x_min_ratio = float(rules.get("user_name_center_x_min_ratio", 0.0))
+    user_name_center_x_max_ratio = float(rules.get("user_name_center_x_max_ratio", 1.0))
     name_candidates = [
         item["text"]
         for item in rule_items
-        if item["center_y"] <= image_height * 0.12
+        if item["center_y"] <= image_height * user_name_top_ratio
+        and image_width * user_name_center_x_min_ratio <= item["center_x"] <= image_width * user_name_center_x_max_ratio
         and 2 <= len(item["text"]) <= 16
         and contains_cjk(item["text"])
         and not looks_like_time_text(item["text"])
+        and not looks_like_distance_text(item["text"])
     ]
     return {
         "user_name": name_candidates[0] if name_candidates else "",

@@ -58,6 +58,7 @@ def test_huanyou_app_scrolls_on_each_chat_without_new_greeting(monkeypatch):
     monkeypatch.setattr(huanyou_app.steps, "send_reply", lambda robot, config, reporter=None: 1)
     monkeypatch.setattr(huanyou_app.steps, "click_next_message", lambda robot, config, image=None, reporter=None: True)
     next_calls: list[int] = []
+    go_back_click_counts: list[int] = []
 
     def fake_next_message(robot, config, expected_name=None, image=None, reporter=None):
         next_calls.append(1)
@@ -66,7 +67,11 @@ def test_huanyou_app_scrolls_on_each_chat_without_new_greeting(monkeypatch):
         raise huanyou_app.steps.StepUnavailable("next message button was not found")
 
     monkeypatch.setattr(huanyou_app.steps, "click_next_message_until_changed", fake_next_message)
-    monkeypatch.setattr(huanyou_app.steps, "go_back", lambda robot, config, reporter=None: None)
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "go_back",
+        lambda robot, config, reporter=None, **kwargs: go_back_click_counts.append(kwargs.get("click_count", 1)),
+    )
 
     app = huanyou_app.HuanyouApp(robot, {}, reply_provider=lambda message: "回复")
     app.set_status_callback(events.append)
@@ -87,6 +92,9 @@ def test_huanyou_app_scrolls_on_each_chat_without_new_greeting(monkeypatch):
         message == "dialogue_ocr_last_message" and payload.get("content") == "最近在忙什么"
         for _level, message, payload in logs
     )
+
+
+    assert go_back_click_counts == [2]
 
 
 def test_huanyou_app_keeps_chat_when_next_name_is_unconfirmed(monkeypatch):
@@ -136,7 +144,7 @@ def test_huanyou_app_keeps_chat_when_next_name_is_unconfirmed(monkeypatch):
         "click_next_message_until_changed",
         lambda robot, config, expected_name=None, image=None, reporter=None: (image or b"next_image", "", 1),
     )
-    monkeypatch.setattr(huanyou_app.steps, "go_back", lambda robot, config, reporter=None: go_back_calls.append(1))
+    monkeypatch.setattr(huanyou_app.steps, "go_back", lambda robot, config, reporter=None, **kwargs: go_back_calls.append(1))
 
     app = huanyou_app.HuanyouApp(robot, {}, reply_provider=lambda message: "reply")
 
@@ -298,7 +306,7 @@ def test_huanyou_app_does_not_retract_when_reply_was_skipped(monkeypatch):
         "click_next_message_until_changed",
         lambda robot, config, expected_name=None, image=None, reporter=None: (image or b"next_image", "other", 1),
     )
-    monkeypatch.setattr(huanyou_app.steps, "go_back", lambda robot, config, reporter=None: go_back_calls.append(1))
+    monkeypatch.setattr(huanyou_app.steps, "go_back", lambda robot, config, reporter=None, **kwargs: go_back_calls.append(kwargs.get("click_count", 1)))
 
     app = huanyou_app.HuanyouApp(robot, {}, reply_provider=lambda message: huanyou_app.ReplyAction(skip=True))
 
@@ -364,7 +372,50 @@ def test_retract_input_box_clicks_center_with_jitter(monkeypatch):
     assert robot.clicks == [(0.52, 0.29)]
 
 
-def test_go_back_clicks_first_back_template_twice(monkeypatch):
+def test_focus_input_box_waits_after_click(monkeypatch):
+    robot = FakeRobot()
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(huanyou_app.steps, "capture_after_popups", lambda *args, **kwargs: b"image")
+    monkeypatch.setattr(huanyou_app.steps, "_template_center", lambda image, config, key, group: (0.9, 0.854))
+    monkeypatch.setattr(huanyou_app.steps.time, "sleep", sleeps.append)
+
+    huanyou_app.steps.focus_input_box(robot, {"input_box_focus_settle_seconds": 1.2})
+
+    assert robot.clicks == [(0.4, 0.854)]
+    assert sleeps == [1.2]
+
+
+def test_play_voice_reply_reports_when_microphone_missing(monkeypatch):
+    robot = FakeRobot()
+    events: list[tuple[str, str, str | None]] = []
+    now = [0.0]
+
+    monkeypatch.setattr(huanyou_app.steps, "capture_after_popups", lambda *args, **kwargs: b"image")
+    monkeypatch.setattr(huanyou_app.steps, "_template_center", lambda image, config, key, group: None)
+    monkeypatch.setattr(huanyou_app.steps.time, "monotonic", lambda: now[0])
+
+    def fake_sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    monkeypatch.setattr(huanyou_app.steps.time, "sleep", fake_sleep)
+
+    try:
+        huanyou_app.steps.play_voice_reply(
+            robot,
+            "reply",
+            {"step_timeout": 1, "tts_retry_attempts": 0},
+            reporter=lambda step, label, log_label=None: events.append((step, label, log_label)),
+        )
+    except huanyou_app.steps.StepUnavailable as exc:
+        assert str(exc) == "microphone button was not found"
+    else:
+        raise AssertionError("expected microphone lookup failure")
+
+    assert any(step == "microphone_not_found" and "麦克风按钮未找到" in str(log_label) for step, _label, log_label in events)
+
+
+def test_go_back_clicks_first_back_template_once_by_default(monkeypatch):
     robot = FakeRobot()
 
     monkeypatch.setattr(huanyou_app.steps.time, "sleep", lambda seconds: None)
@@ -387,7 +438,7 @@ def test_go_back_clicks_first_back_template_twice(monkeypatch):
 
     huanyou_app.steps.go_back(robot, {})
 
-    assert robot.clicks == [(0.3, 0.4), (0.3, 0.4)]
+    assert robot.clicks == [(0.3, 0.4)]
 
 
 def test_go_back_clicks_second_back_template_once(monkeypatch):
@@ -414,6 +465,32 @@ def test_go_back_clicks_second_back_template_once(monkeypatch):
     huanyou_app.steps.go_back(robot, {})
 
     assert robot.clicks == [(0.3, 0.4)]
+
+
+def test_go_back_clicks_twice_when_requested(monkeypatch):
+    robot = FakeRobot()
+
+    monkeypatch.setattr(huanyou_app.steps.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(huanyou_app.steps, "ensure_send_cleared", lambda robot, config, reporter=None: 0)
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "capture_after_popups",
+        lambda robot, config, label="screen", max_dismiss=2, reporter=None: label,
+    )
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "_matches_screen",
+        lambda image, config, key: image == "after_go_back",
+    )
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "_template_center_with_path",
+        lambda image, config, key, group: (0.3, 0.4, Path("btn_杩斿洖鎸夐挳.jpg")),
+    )
+
+    huanyou_app.steps.go_back(robot, {}, click_count=2)
+
+    assert robot.clicks == [(0.3, 0.4), (0.3, 0.4)]
 
 
 def test_click_next_message_until_changed_retries_same_contact(monkeypatch):
@@ -488,7 +565,7 @@ def test_huanyou_app_skips_scroll_when_new_greeting_exists(monkeypatch):
         "consume_new_greetings",
         lambda robot, config, image=None, expected_name=None, reporter=None: (image or b"image", 1, True),
     )
-    monkeypatch.setattr(huanyou_app.steps, "go_back", lambda robot, config, reporter=None: None)
+    monkeypatch.setattr(huanyou_app.steps, "go_back", lambda robot, config, reporter=None, **kwargs: None)
 
     app = huanyou_app.HuanyouApp(robot, {}, reply_provider=lambda message: "回复")
 
@@ -541,7 +618,7 @@ def test_huanyou_app_scrolls_after_consuming_new_greetings(monkeypatch):
         raise huanyou_app.steps.StepUnavailable("next message button was not found")
 
     monkeypatch.setattr(huanyou_app.steps, "click_next_message_until_changed", fake_next_message)
-    monkeypatch.setattr(huanyou_app.steps, "go_back", lambda robot, config, reporter=None: None)
+    monkeypatch.setattr(huanyou_app.steps, "go_back", lambda robot, config, reporter=None, **kwargs: None)
 
     app = huanyou_app.HuanyouApp(robot, {}, reply_provider=lambda message: "回复")
     app.run_once()
@@ -588,7 +665,11 @@ def test_huanyou_step_unavailable_does_not_reset_robot(monkeypatch):
 
     assert robot.reset_count == 0
     assert app.status.last_error == "dialogue OCR did not return a sender1 message"
-    assert any(message == "huanyou_step_unavailable" for _level, message, _payload in logs)
+    assert any(
+        message.startswith("huanyou_step_unavailable:")
+        and payload.get("error") == "dialogue OCR did not return a sender1 message"
+        for _level, message, payload in logs
+    )
 
 
 def test_find_unread_target_selects_highest_favorability_among_unread(monkeypatch):
