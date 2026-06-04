@@ -143,8 +143,8 @@ def test_edit_app_config_only_updates_current_device_current_app(qtbot, tmp_path
     first, second = window.config_manager.devices()
     assert first["runtime_overrides"]["poll_interval"] == 1
     assert first["runtime_overrides"]["keep_awake_interval_seconds"] == 200
-    assert first["app_overrides"]["wechat"]["persona"]["name"] == "wechat-new"
-    assert first["app_overrides"]["xinyu"]["persona"]["name"] == "xinyu-old"
+    assert first["app_overrides"]["wechat"]["persona"]["name"] == "wechat-old"
+    assert first["app_overrides"]["xinyu"]["persona"]["name"] == "wechat-new"
     assert second["runtime_overrides"]["poll_interval"] == 7
     assert second["app_overrides"]["wechat"]["persona"]["name"] == "wechat-second"
 

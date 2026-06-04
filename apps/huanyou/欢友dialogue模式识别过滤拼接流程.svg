@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1560" height="1780" viewBox="0 0 1560 1780" role="img" aria-labelledby="title desc">
+  <title id="title">欢友 dialogue 模式识别、过滤、拼接流程</title>
+  <desc id="desc">欢友 dialogue OCR 后处理流程，描述聊天页 OCR 文字块过滤、sender 判断、按行与气泡拼接、用户名识别以及最终 dialogues 输出。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#233943"/>
+    </marker>
+    <filter id="shadow" x="-8%" y="-8%" width="116%" height="125%">
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#17313a" flood-opacity="0.16"/>
+    </filter>
+    <style>
+      .bg { fill: #f4efe7; }
+      .title { font: 700 34px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #17333b; }
+      .subtitle { font: 400 15px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #596b70; }
+      .node { filter: url(#shadow); stroke-width: 2; }
+      .start { fill: #1f5a64; stroke: #173f47; }
+      .ocr { fill: #e9f7ef; stroke: #3e8a70; }
+      .filter { fill: #fff0ee; stroke: #c7564d; }
+      .sender { fill: #f0ebff; stroke: #7b65c8; }
+      .merge { fill: #fff5dc; stroke: #d49a2d; }
+      .result { fill: #edf2ff; stroke: #6175c7; }
+      .debug { fill: #ffffff; stroke: #c4b7a2; }
+      .text { font: 700 16px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #17333b; text-anchor: middle; dominant-baseline: middle; }
+      .sub { font: 400 13px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #4f6268; text-anchor: middle; dominant-baseline: middle; }
+      .white { fill: #ffffff; }
+      .edge { fill: none; stroke: #233943; stroke-width: 2.4; marker-end: url(#arrow); }
+      .edge-soft { fill: none; stroke: #6d7d83; stroke-width: 2; stroke-dasharray: 7 7; marker-end: url(#arrow); }
+      .label { font: 700 13px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #233943; paint-order: stroke; stroke: #f4efe7; stroke-width: 5; stroke-linejoin: round; }
+      .note { font: 400 13px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #56676c; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1560" height="1780"/>
+  <text class="title" x="780" y="52" text-anchor="middle">欢友 dialogue 模式识别、过滤、拼接流程</text>
+  <text class="subtitle" x="780" y="82" text-anchor="middle">代码来源：vision/ocr_rules.py build_dialogue_result()，规则来源：apps/huanyou/ocr_config.py DIALOGUE_OCR_MODE</text>
+
+  <g>
+    <rect class="node start" x="70" y="130" width="310" height="78" rx="24"/>
+    <text class="text white" x="225" y="160">输入聊天页截图</text>
+    <text class="sub white" x="225" y="184">CHAT_AREA_REGION / dialogue mode</text>
+  </g>
+  <g>
+    <rect class="node ocr" x="70" y="258" width="310" height="118" rx="18"/>
+    <text class="text" x="225" y="288">预处理 + OCR</text>
+    <text class="sub" x="225" y="314">original / scale=2 / portrait</text>
+    <text class="sub" x="225" y="336">OCR 输出 text + bounds + confidence</text>
+    <text class="sub" x="225" y="358">region 坐标归一化回整屏比例</text>
+  </g>
+  <g>
+    <rect class="node ocr" x="70" y="426" width="310" height="132" rx="18"/>
+    <text class="text" x="225" y="456">生成 rule_items</text>
+    <text class="sub" x="225" y="484">文字清洗 normalize_ocr_text</text>
+    <text class="sub" x="225" y="506">比例坐标转像素 min/max/center</text>
+    <text class="sub" x="225" y="528">采样周边颜色：饱和度 / hue / 蓝色比例</text>
+  </g>
+
+  <g>
+    <rect class="node filter" x="610" y="130" width="370" height="190" rx="18"/>
+    <text class="text" x="795" y="160">块级基础过滤 invalid_reason</text>
+    <text class="sub" x="795" y="188">低置信度 / 文字框太矮</text>
+    <text class="sub" x="795" y="210">时间 / debug / 奖励 / 非聊天关键词</text>
+    <text class="sub" x="795" y="232">顶部 user_name 候选只用于名字，不进对话</text>
+    <text class="sub" x="795" y="254">太靠右 / 太宽 / 单字低置信度</text>
+    <text class="sub" x="795" y="276">右侧窄非中文 / 非中文非 emoji</text>
+    <text class="sub" x="795" y="298">过滤项进入 debug.excluded</text>
+  </g>
+  <g>
+    <rect class="node sender" x="610" y="382" width="370" height="172" rx="18"/>
+    <text class="text" x="795" y="412">sender 判断</text>
+    <text class="sub" x="795" y="440">欢友 method=bubble_color</text>
+    <text class="sub" x="795" y="462">先看紫/蓝气泡颜色：sender2=自己</text>
+    <text class="sub" x="795" y="484">颜色不明确时按 center_x 兜底</text>
+    <text class="sub" x="795" y="506">sender1=对方，业务读取 sender1 最后一条</text>
+    <text class="sub" x="795" y="528">保留到 item.sender</text>
+  </g>
+  <g>
+    <rect class="node merge" x="610" y="616" width="370" height="142" rx="18"/>
+    <text class="text" x="795" y="646">按行分组</text>
+    <text class="sub" x="795" y="674">_group_by_line(line_gap=24)</text>
+    <text class="sub" x="795" y="696">_line_text() 按 y/x 排序拼同一行</text>
+    <text class="sub" x="795" y="718">line_and_below 命中后当前行及以下丢弃</text>
+    <text class="sub" x="795" y="740">示例：输入框、推荐灵感以下不算聊天</text>
+  </g>
+  <g>
+    <rect class="node merge" x="610" y="820" width="370" height="160" rx="18"/>
+    <text class="text" x="795" y="850">多行气泡拼接</text>
+    <text class="sub" x="795" y="878">按 center_y / min_x 顺序遍历</text>
+    <text class="sub" x="795" y="900">sender 相同</text>
+    <text class="sub" x="795" y="922">vertical_gap &lt;= name_gap_ratio * 高度</text>
+    <text class="sub" x="795" y="944">水平重叠或 center_gap 足够近</text>
+    <text class="sub" x="795" y="966">满足则合并为同一条消息</text>
+  </g>
+
+  <g>
+    <rect class="node filter" x="1138" y="130" width="340" height="132" rx="18"/>
+    <text class="text" x="1308" y="160">合并后整句过滤</text>
+    <text class="sub" x="1308" y="188">line_excluded_keywords 命中丢弃</text>
+    <text class="sub" x="1308" y="210">如认证、礼物、金币奖励、共同点</text>
+    <text class="sub" x="1308" y="232">被丢弃内容进入 debug.excluded</text>
+  </g>
+  <g>
+    <rect class="node result" x="1138" y="320" width="340" height="146" rx="18"/>
+    <text class="text" x="1308" y="350">输出 dialogues</text>
+    <text class="sub" x="1308" y="378">[{ sender, content }]</text>
+    <text class="sub" x="1308" y="400">content 由 segments 排序拼接</text>
+    <text class="sub" x="1308" y="422">sender1=对方，sender2=自己</text>
+    <text class="sub" x="1308" y="444">read_message 取 sender1 最后一条</text>
+  </g>
+  <g>
+    <rect class="node result" x="1138" y="536" width="340" height="154" rx="18"/>
+    <text class="text" x="1308" y="566">识别 user_name</text>
+    <text class="sub" x="1308" y="594">直接从原始 rule_items 顶部找</text>
+    <text class="sub" x="1308" y="616">center_y &lt;= 0.09 * 高度</text>
+    <text class="sub" x="1308" y="638">center_x 在 0.3~0.7</text>
+    <text class="sub" x="1308" y="660">中文 2~16 字，排除时间和数字+km</text>
+  </g>
+  <g>
+    <rect class="node result" x="1138" y="760" width="340" height="150" rx="18"/>
+    <text class="text" x="1308" y="790">最终 result</text>
+    <text class="sub" x="1308" y="818">user_name: 顶部聊天对象名</text>
+    <text class="sub" x="1308" y="840">dialogues: 聊天消息列表</text>
+    <text class="sub" x="1308" y="862">debug.excluded: 过滤明细</text>
+    <text class="sub" x="1308" y="884">ocr_items 仍保留给名字坐标复用</text>
+  </g>
+
+  <g>
+    <rect class="node debug" x="70" y="1040" width="1410" height="250" rx="18"/>
+    <text class="text" x="775" y="1072">欢友 dialogue 关键规则</text>
+    <text class="note" x="104" y="1110">min_confidence=0.30，min_box_height_ratio=0.02，line_gap=24，name_gap_ratio=0.037</text>
+    <text class="note" x="104" y="1138">basic_filter: 过滤时间、debug、奖励、过宽、过右、低置信单字、非中文非 emoji 等噪声</text>
+    <text class="note" x="104" y="1166">sender_detection: bubble_color；紫/蓝饱和气泡判断 sender2，位置作为兜底</text>
+    <text class="note" x="104" y="1194">target_sender=sender1；业务回复时读取 sender1 最后一条，即对方最后一句</text>
+    <text class="note" x="104" y="1222">user_name 使用顶部居中规则，避免读取下面的距离、活动、正文为名字</text>
+    <text class="note" x="104" y="1250">line_and_below_keywords 用于截断输入框/推荐灵感以下的 UI 文案</text>
+  </g>
+
+  <path class="edge" d="M225 208 L225 258"/>
+  <path class="edge" d="M225 376 L225 426"/>
+  <path class="edge" d="M380 492 C480 492 500 225 610 225"/>
+  <text class="label" x="472" y="350">rule_items</text>
+  <path class="edge" d="M795 320 L795 382"/>
+  <path class="edge" d="M795 554 L795 616"/>
+  <path class="edge" d="M795 758 L795 820"/>
+  <path class="edge" d="M980 900 C1068 900 1068 196 1138 196"/>
+  <path class="edge" d="M1308 262 L1308 320"/>
+  <path class="edge" d="M1308 466 L1308 536"/>
+  <path class="edge" d="M1308 690 L1308 760"/>
+  <path class="edge-soft" d="M380 492 C1030 492 1040 610 1138 610"/>
+  <text class="label" x="1000" y="580">原始顶部 OCR 块用于 user_name</text>
+</svg>

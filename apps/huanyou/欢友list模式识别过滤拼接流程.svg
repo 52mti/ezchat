@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1560" height="1740" viewBox="0 0 1560 1740" role="img" aria-labelledby="title desc">
+  <title id="title">欢友 list 模式识别、过滤、拼接流程</title>
+  <desc id="desc">欢友 list OCR 后处理流程，描述从截图预处理、OCR 文字块归一化、列表行过滤、行拼接、未读红点识别到底部导航输出的过程。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#233943"/>
+    </marker>
+    <filter id="shadow" x="-8%" y="-8%" width="116%" height="125%">
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#17313a" flood-opacity="0.16"/>
+    </filter>
+    <style>
+      .bg { fill: #f6f1e8; }
+      .title { font: 700 34px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #17333b; }
+      .subtitle { font: 400 15px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #596b70; }
+      .node { filter: url(#shadow); stroke-width: 2; }
+      .start { fill: #1f5a64; stroke: #173f47; }
+      .ocr { fill: #e9f7ef; stroke: #3e8a70; }
+      .filter { fill: #fff1ec; stroke: #c6654d; }
+      .group { fill: #fff6dc; stroke: #d19a2c; }
+      .result { fill: #eef0ff; stroke: #6575c8; }
+      .debug { fill: #ffffff; stroke: #c4b7a2; }
+      .text { font: 700 16px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #17333b; text-anchor: middle; dominant-baseline: middle; }
+      .sub { font: 400 13px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #4f6268; text-anchor: middle; dominant-baseline: middle; }
+      .white { fill: #ffffff; }
+      .edge { fill: none; stroke: #233943; stroke-width: 2.4; marker-end: url(#arrow); }
+      .edge-soft { fill: none; stroke: #6d7d83; stroke-width: 2; stroke-dasharray: 7 7; marker-end: url(#arrow); }
+      .label { font: 700 13px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #233943; paint-order: stroke; stroke: #f6f1e8; stroke-width: 5; stroke-linejoin: round; }
+      .note { font: 400 13px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #56676c; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1560" height="1740"/>
+  <text class="title" x="780" y="52" text-anchor="middle">欢友 list 模式识别、过滤、拼接流程</text>
+  <text class="subtitle" x="780" y="82" text-anchor="middle">代码来源：vision/ocr_rules.py build_list_result()，规则来源：apps/huanyou/ocr_config.py LIST_OCR_MODE</text>
+
+  <g>
+    <rect class="node start" x="70" y="130" width="300" height="78" rx="24"/>
+    <text class="text white" x="220" y="160">输入截图</text>
+    <text class="sub white" x="220" y="184">message_list region: [0,0.1,1,0.9]</text>
+  </g>
+  <g>
+    <rect class="node ocr" x="70" y="260" width="300" height="118" rx="18"/>
+    <text class="text" x="220" y="290">预处理 + OCR</text>
+    <text class="sub" x="220" y="316">original / scale=2 / portrait</text>
+    <text class="sub" x="220" y="338">Paddle OCR 产生 x,y,w,h,text</text>
+    <text class="sub" x="220" y="360">region 坐标归一化回整屏比例</text>
+  </g>
+  <g>
+    <rect class="node ocr" x="70" y="430" width="300" height="126" rx="18"/>
+    <text class="text" x="220" y="460">生成 rule_items</text>
+    <text class="sub" x="220" y="486">文字清洗 normalize_ocr_text</text>
+    <text class="sub" x="220" y="508">比例坐标转像素 min/max/center</text>
+    <text class="sub" x="220" y="530">采样文字周边颜色指标</text>
+  </g>
+
+  <g>
+    <rect class="node result" x="610" y="130" width="340" height="102" rx="18"/>
+    <text class="text" x="780" y="160">底部导航识别</text>
+    <text class="sub" x="780" y="186">bottom_nav_top_ratio=0.88</text>
+    <text class="sub" x="780" y="208">关键词：交友 / 广场 / 娱乐 / 消息 / 我的</text>
+  </g>
+  <g>
+    <rect class="node filter" x="610" y="286" width="340" height="142" rx="18"/>
+    <text class="text" x="780" y="316">OCR 块级过滤</text>
+    <text class="sub" x="780" y="344">低置信度 / 高度太小</text>
+    <text class="sub" x="780" y="366">超出 main_top/main_bottom</text>
+    <text class="sub" x="780" y="388">太靠右且非未读徽标</text>
+    <text class="sub" x="780" y="410">去重 _dedupe_rule_items</text>
+  </g>
+  <g>
+    <rect class="node group" x="610" y="482" width="340" height="118" rx="18"/>
+    <text class="text" x="780" y="512">按行分组并拆左右</text>
+    <text class="sub" x="780" y="538">_group_by_line(line_gap=24)</text>
+    <text class="sub" x="780" y="560">_build_list_line()</text>
+    <text class="sub" x="780" y="582">left_text / right_items / bounds</text>
+  </g>
+  <g>
+    <rect class="node filter" x="610" y="654" width="340" height="150" rx="18"/>
+    <text class="text" x="780" y="684">行级过滤</text>
+    <text class="sub" x="780" y="712">空 left_text 丢弃</text>
+    <text class="sub" x="780" y="734">底部导航 / 顶部导航行丢弃</text>
+    <text class="sub" x="780" y="756">顶部系统入口丢弃</text>
+    <text class="sub" x="780" y="778">关键词命中进入 debug.excluded</text>
+  </g>
+
+  <g>
+    <rect class="node group" x="1150" y="130" width="330" height="134" rx="18"/>
+    <text class="text" x="1315" y="160">列表行拼接成 raw_rows</text>
+    <text class="sub" x="1315" y="188">识别 header 行：头像右侧昵称</text>
+    <text class="sub" x="1315" y="210">content_gap 以内拼接为内容</text>
+    <text class="sub" x="1315" y="232">新 header 出现则结束上一行</text>
+  </g>
+  <g>
+    <rect class="node filter" x="1150" y="318" width="330" height="156" rx="18"/>
+    <text class="text" x="1315" y="348">row 级过滤</text>
+    <text class="sub" x="1315" y="376">底部导航以下丢弃</text>
+    <text class="sub" x="1315" y="398">提取 name，去附近等后缀</text>
+    <text class="sub" x="1315" y="420">excluded_keywords 排除入口/系统</text>
+    <text class="sub" x="1315" y="442">示例：在线配对 / 小助手 / 小时在线交友</text>
+  </g>
+  <g>
+    <rect class="node group" x="1150" y="528" width="330" height="132" rx="18"/>
+    <text class="text" x="1315" y="558">内容摘要拼接</text>
+    <text class="sub" x="1315" y="586">content_lines 过滤时间文本</text>
+    <text class="sub" x="1315" y="608">_clean_list_content()</text>
+    <text class="sub" x="1315" y="630">content_excluded_keywords 命中整行丢弃</text>
+  </g>
+  <g>
+    <rect class="node result" x="1150" y="714" width="330" height="190" rx="18"/>
+    <text class="text" x="1315" y="744">未读 / 好感度判断</text>
+    <text class="sub" x="1315" y="772">badge_position=left</text>
+    <text class="sub" x="1315" y="794">右侧数字优先作为 favorability</text>
+    <text class="sub" x="1315" y="816">左侧红点视觉检测命中 unread=1</text>
+    <text class="sub" x="1315" y="838">白色数字像素只提高红点置信度</text>
+    <text class="sub" x="1315" y="860">欢友关闭左侧 OCR fallback</text>
+    <text class="sub" x="1315" y="882">unread_count_excluded 可清空未读</text>
+  </g>
+
+  <g>
+    <rect class="node result" x="610" y="972" width="870" height="154" rx="22"/>
+    <text class="text" x="1045" y="1004">输出 result</text>
+    <text class="sub" x="1045" y="1032">message_list: [{ name, favorability, unread_count, content, bounds }]</text>
+    <text class="sub" x="1045" y="1056">bottom_nav: [{ name, bounds }]</text>
+    <text class="sub" x="1045" y="1080">debug.excluded: 被过滤的 item / line / row 与 reason</text>
+  </g>
+  <g>
+    <rect class="node debug" x="70" y="972" width="420" height="250" rx="18"/>
+    <text class="text" x="280" y="1002">欢友关键参数</text>
+    <text class="note" x="96" y="1034">main_top_ratio=0.10, main_bottom_ratio=0.88</text>
+    <text class="note" x="96" y="1060">text_left_min_ratio=0.16, text_right_max_ratio=0.78</text>
+    <text class="note" x="96" y="1086">bottom_nav_top_ratio=0.88</text>
+    <text class="note" x="96" y="1112">row_top_extra_top_ratio=0.012</text>
+    <text class="note" x="96" y="1138">red_badge_min_area=120, min_width/height=16</text>
+    <text class="note" x="96" y="1164">left_badge_enable_ocr_fallback=false</text>
+    <text class="note" x="96" y="1190">left_badge_read_red_badge_number=false</text>
+  </g>
+
+  <path class="edge" d="M220 208 L220 260"/>
+  <path class="edge" d="M220 378 L220 430"/>
+  <path class="edge" d="M370 493 C470 493 500 180 610 180"/>
+  <text class="label" x="462" y="312">rule_items</text>
+  <path class="edge" d="M370 493 C500 493 500 357 610 357"/>
+  <path class="edge" d="M780 428 L780 482"/>
+  <path class="edge" d="M780 600 L780 654"/>
+  <path class="edge" d="M950 729 C1038 729 1038 198 1150 198"/>
+  <path class="edge" d="M1315 264 L1315 318"/>
+  <path class="edge" d="M1315 474 L1315 528"/>
+  <path class="edge" d="M1315 660 L1315 714"/>
+  <path class="edge" d="M1315 904 L1315 972"/>
+  <path class="edge-soft" d="M780 232 C780 900 930 940 1045 972"/>
+  <text class="label" x="845" y="920">bottom_nav 合并到输出</text>
+</svg>

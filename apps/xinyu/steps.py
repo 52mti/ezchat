@@ -84,6 +84,13 @@ BUTTON_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
+def _template_hint(key: str, *, group: str) -> str:
+    aliases = SCREEN_TEMPLATE_ALIASES.get(key, ()) if group == "screens" else BUTTON_TEMPLATE_ALIASES.get(key, ())
+    if aliases:
+        return " / ".join(aliases)
+    return key
+
+
 def _config(config: dict[str, Any] | None) -> dict[str, Any]:
     cfg = _deep_merge(DEFAULT_CONFIG, config or {})
     _disable_dialogue_region_filter(cfg)
@@ -117,7 +124,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def _threshold(config: dict[str, Any]) -> float:
-    return float(config.get("match_threshold", 0.85))
+    return float(config.get("match_threshold", 0.7))
 
 
 def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> dict[str, float] | None:
@@ -235,9 +242,9 @@ def _looks_like_black_screen(image: Any, config: dict[str, Any]) -> bool:
 
 def _raise_if_black_screen(image: Any, config: dict[str, Any]) -> None:
     if _matches_screen(image, config, NO_PHONE_SCREEN):
-        raise NoPhoneScreenError("no phone detected; device is not visible")
+        raise NoPhoneScreenError("检测到无手机界面，请先把手机放回支架")
     if _matches_screen(image, config, BLACK_SCREEN) or _looks_like_black_screen(image, config):
-        raise BlackScreenError("black screen detected; device may be powered off")
+        raise BlackScreenError("检测到黑屏界面，手机可能已熄屏或关机")
 
 
 def _center_from_bounds(bounds: list[float]) -> tuple[float, float]:
@@ -426,34 +433,43 @@ def _click_message_button(
 def ensure_list_screen(robot: Any, config: dict[str, Any] | None = None, reporter: Reporter | None = None) -> Any | None:
     cfg = _config(config)
     _report(reporter, "confirm_xinyu_list", "确认心遇聊天列表")
-    image = capture_after_popups(robot, cfg, label="confirm_list", reporter=reporter)
-    _raise_if_black_screen(image, cfg)
-    if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
-        return image
-    if _matches_screen(image, cfg, CHAT_WINDOW_SCREEN):
-        if not _click_back_once(robot, cfg, image, reporter=reporter):
-            return None
+    initial_image = capture_transform_image(robot, cfg, pre_move=True, label="startup_screen_detect")
+    _raise_if_black_screen(initial_image, cfg)
+    if _matches_screen(initial_image, cfg, CHAT_WINDOW_SCREEN):
+        if not _click_back_once(robot, cfg, initial_image, reporter=reporter):
+            raise StepUnavailable(f"当前在聊天界面，但未找到返回按钮模板：{_template_hint(BACK_BUTTON, group='buttons')}")
         time.sleep(0.4)
         image = capture_after_popups(robot, cfg, label="after_return_from_chat", reporter=reporter)
         _raise_if_black_screen(image, cfg)
         if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
             return image
-    if _matches_screen(image, cfg, MY_SCREEN):
-        if not _click_message_button(robot, cfg, image, reporter=reporter):
-            return None
+        raise StepUnavailable(f"已点击返回按钮，但未回到聊天列表，未匹配到模板：{_template_hint(CHAT_LIST_SCREEN, group='screens')}")
+    elif _matches_screen(initial_image, cfg, MY_SCREEN):
+        if not _click_message_button(robot, cfg, initial_image, reporter=reporter):
+            raise StepUnavailable(f"当前在“我的”界面，但未找到消息按钮模板：{_template_hint(MESSAGE_BUTTON, group='buttons')}")
         time.sleep(0.4)
         image = capture_after_popups(robot, cfg, label="after_message_button", reporter=reporter)
         _raise_if_black_screen(image, cfg)
         if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
             return image
-    if not _click_back_once(robot, cfg, image, reporter=reporter):
-        return None
-    time.sleep(0.4)
-    image = capture_after_popups(robot, cfg, label="after_unknown_back", reporter=reporter)
-    _raise_if_black_screen(image, cfg)
-    if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
-        return image
-    return None
+        raise StepUnavailable(f"已点击消息按钮，但未回到聊天列表，未匹配到模板：{_template_hint(CHAT_LIST_SCREEN, group='screens')}")
+    elif _matches_screen(initial_image, cfg, CHAT_LIST_SCREEN):
+        image = capture_after_popups(robot, cfg, label="confirm_list", reporter=reporter)
+        _raise_if_black_screen(image, cfg)
+        if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
+            return image
+        raise StepUnavailable(f"当前界面疑似聊天列表，但复查后未匹配到模板：{_template_hint(CHAT_LIST_SCREEN, group='screens')}")
+    else:
+        if not _click_back_once(robot, cfg, initial_image, reporter=reporter):
+            raise StepUnavailable(
+                f"当前界面无法识别，且未找到返回按钮模板：{_template_hint(BACK_BUTTON, group='buttons')}"
+            )
+        time.sleep(0.4)
+        image = capture_after_popups(robot, cfg, label="after_unknown_back", reporter=reporter)
+        _raise_if_black_screen(image, cfg)
+        if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
+            return image
+        raise StepUnavailable(f"已尝试点击返回，但未回到聊天列表，未匹配到模板：{_template_hint(CHAT_LIST_SCREEN, group='screens')}")
 
 
 def check_unread_button(
@@ -594,7 +610,7 @@ def read_my_points(
 
     pos = _template_center(image, cfg, MY_BUTTON, group="buttons")
     if pos is None:
-        raise StepUnavailable("my button was not found")
+        raise StepUnavailable(f"未找到“我的”按钮模板：{_template_hint(MY_BUTTON, group='buttons')}")
     _report(reporter, "points_open_my", "打开我的界面", log_label=f"打开我的界面：{format_point(*pos)}")
     click_image_point(robot, *pos)
     time.sleep(0.6)
@@ -602,7 +618,7 @@ def read_my_points(
     image = capture_after_popups(robot, cfg, label="my_screen", reporter=reporter)
     _raise_if_black_screen(image, cfg)
     if not _matches_screen(image, cfg, MY_SCREEN):
-        raise StepUnavailable("my screen template did not match")
+        raise StepUnavailable(f"未匹配到“我的界面”模板：{_template_hint(MY_SCREEN, group='screens')}")
 
     _report(reporter, "points_ocr_read", "积分 OCR 读取")
     ocr_result = _run_ocr_mode(image, cfg, "points", region=None)
@@ -616,12 +632,12 @@ def read_my_points(
     )
 
     if not _click_message_button(robot, cfg, image, reporter=reporter):
-        raise StepUnavailable("message button was not found")
+        raise StepUnavailable(f"未找到“消息”按钮模板：{_template_hint(MESSAGE_BUTTON, group='buttons')}")
     time.sleep(0.6)
     image = capture_after_popups(robot, cfg, label="after_points_message", reporter=reporter)
     _raise_if_black_screen(image, cfg)
     if not _matches_screen(image, cfg, CHAT_LIST_SCREEN):
-        raise StepUnavailable("failed to return to chat list after points read")
+        raise StepUnavailable(f"读取积分后未能返回聊天列表，未匹配到模板：{_template_hint(CHAT_LIST_SCREEN, group='screens')}")
     return points or None
 
 
@@ -639,7 +655,7 @@ def confirm_chat_window(
     image = capture_after_popups(robot, cfg, label="chat_window", reporter=reporter)
     _raise_if_black_screen(image, cfg)
     if not _matches_screen(image, cfg, CHAT_WINDOW_SCREEN):
-        raise StepUnavailable("chat window screen template did not match")
+        raise StepUnavailable(f"未匹配到聊天界面模板：{_template_hint(CHAT_WINDOW_SCREEN, group='screens')}")
     return image
 
 
@@ -668,7 +684,7 @@ def send_new_greeting_if_available(
     image_after_send = capture_after_popups(robot, cfg, label="after_new_greeting", reporter=reporter)
     back_pos = _template_center(image_after_send, cfg, BACK_BUTTON_2, group="buttons")
     if back_pos is None:
-        raise StepUnavailable("back button 2 was not found after new greeting")
+        raise StepUnavailable(f"发送新招呼后未找到返回按钮模板：{_template_hint(BACK_BUTTON_2, group='buttons')}")
     _report(
         reporter,
         "new_greeting_return",
@@ -693,7 +709,7 @@ def read_message(
     ocr_result = _run_ocr_mode(current_image, cfg, "dialogue", region=None)
     items = ocr_result["ocr_items"]
     if not items:
-        raise StepUnavailable("OCR did not return chat text")
+        raise StepUnavailable("聊天详情 OCR 未识别到任何文字")
 
     dialogue_result = ocr_result["result"]
     dialogues = dialogue_result.get("dialogues", [])
@@ -703,7 +719,7 @@ def read_message(
         if str(item.get("sender", "")) == "sender1" and str(item.get("content", "")).strip()
     ]
     if not sender1_messages:
-        raise StepUnavailable("dialogue OCR did not return a sender1 message")
+        raise StepUnavailable("聊天详情 OCR 未识别到左侧对方消息")
 
     fallback_contact = str(target.get("name", "")) if isinstance(target, dict) else ""
     contact = fallback_contact or str(dialogue_result.get("user_name") or items[0]["text"])
@@ -738,7 +754,7 @@ def focus_input_box(
     image = capture_after_popups(robot, cfg, label="input_box", reporter=reporter)
     pos = _template_center(image, cfg, INPUT_BOX_BUTTON, group="buttons")
     if pos is None:
-        raise StepUnavailable("input box button was not found")
+        raise StepUnavailable(f"未找到输入框模板：{_template_hint(INPUT_BOX_BUTTON, group='buttons')}")
     click_point = (pos[0] - 0.5, pos[1])
     _report(reporter, "input_box_click", "点击输入框偏移位置", log_label=f"点击输入框偏移位置：{format_point(*click_point)}")
     click_image_point(robot, *click_point)
@@ -764,7 +780,7 @@ def play_voice_reply(
                 click_image_point(robot, *microphone)
                 break
             if deadline.expired():
-                raise StepUnavailable("microphone button was not found")
+                raise StepUnavailable(f"未找到麦克风按钮模板：{_template_hint(MICROPHONE_BUTTON, group='buttons')}")
             time.sleep(0.4)
 
         try:
@@ -785,7 +801,7 @@ def play_voice_reply(
                 log_label=f"TTS 播放失败，准备重试：{exc}",
             )
             time.sleep(0.4)
-    raise StepUnavailable(f"TTS playback failed after retry: {last_error}") from last_error
+    raise StepUnavailable(f"TTS 播放重试后仍失败：{last_error}") from last_error
 
 
 def input_reply(
@@ -813,14 +829,14 @@ def send_reply(
             if clicked > 0:
                 return clicked
             if deadline.expired():
-                raise StepUnavailable("send button was not found")
+                raise StepUnavailable(f"未找到发送按钮模板：{_template_hint(SEND_BUTTON_KEY, group='buttons')}")
             time.sleep(0.4)
             continue
         _report(reporter, "send_button_click", "点击发送按钮", log_label=f"点击发送按钮：{format_point(*pos)}")
         click_image_point(robot, *pos)
         clicked += 1
         if deadline.expired():
-            raise StepUnavailable("send button did not disappear after click")
+            raise StepUnavailable(f"点击发送后发送按钮仍未消失：{_template_hint(SEND_BUTTON_KEY, group='buttons')}")
         time.sleep(0.4)
 
 
@@ -859,7 +875,7 @@ def go_back(
         pos = _template_center(image, cfg, BACK_BUTTON, group="buttons")
         if pos is None:
             _report(reporter, "back_click", "返回按钮未找到")
-            raise StepUnavailable("back button was not found")
+            raise StepUnavailable(f"未找到返回按钮模板：{_template_hint(BACK_BUTTON, group='buttons')}")
         click_point = pos
         click_times = 2 if attempt == 0 and double_click_on_first_attempt else 1
         if click_times == 2:
@@ -879,5 +895,5 @@ def go_back(
         if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
             return
 
-    raise StepUnavailable("failed to return to chat list")
+    raise StepUnavailable(f"返回后仍未进入聊天列表，未匹配到模板：{_template_hint(CHAT_LIST_SCREEN, group='screens')}")
 

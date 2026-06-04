@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1460" height="2060" viewBox="0 0 1460 2060" role="img" aria-labelledby="title desc">
+  <title id="title">心遇自动化整体运行流程</title>
+  <desc id="desc">心遇自动化从外层 DeviceWorker 调度、列表 OCR 选目标、聊天处理、空闲防熄屏与积分读取，到异常恢复与回到列表的完整流程图。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#24424f"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#16313a" flood-opacity="0.16"/>
+    </filter>
+    <style>
+      .bg { fill: #f4efe5; }
+      .title { font: 700 34px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #17333b; }
+      .subtitle { font: 400 16px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #5c6b70; }
+      .lane-title { font: 700 18px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #17333b; }
+      .node { filter: url(#shadow); stroke-width: 2; }
+      .start { fill: #1f5a64; stroke: #173f47; }
+      .process { fill: #ffffff; stroke: #78909c; }
+      .ocr { fill: #ecf7f2; stroke: #3f8b72; }
+      .action { fill: #fff2d8; stroke: #d09327; }
+      .decision { fill: #ffffff; stroke: #b36a3c; }
+      .warning { fill: #fff0ef; stroke: #c7564d; }
+      .idle { fill: #eef2ff; stroke: #6477c4; }
+      .end { fill: #263943; stroke: #17333b; }
+      .node-text { font: 600 16px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #17333b; text-anchor: middle; dominant-baseline: middle; }
+      .node-sub { font: 400 13px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #4d6067; text-anchor: middle; dominant-baseline: middle; }
+      .white-text { fill: #ffffff; }
+      .small { font-size: 12px; }
+      .edge { fill: none; stroke: #24424f; stroke-width: 2.4; marker-end: url(#arrow); }
+      .edge-soft { fill: none; stroke: #6f7d83; stroke-width: 2; stroke-dasharray: 7 7; marker-end: url(#arrow); }
+      .label { font: 700 13px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #24424f; paint-order: stroke; stroke: #f4efe5; stroke-width: 5; stroke-linejoin: round; }
+      .note { font: 400 13px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #5c6b70; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1460" height="2060"/>
+  <text class="title" x="730" y="56" text-anchor="middle">心遇自动化整体运行流程</text>
+  <text class="subtitle" x="730" y="86" text-anchor="middle">当前代码真实流程：启动首张截图先判界面并优先回聊天列表，然后再做弹窗、list 选目标、聊天处理、TTS 发送、空闲防熄屏与异常恢复</text>
+
+  <rect x="46" y="116" width="330" height="38" rx="19" fill="#e5ecf8" stroke="#b8c4df"/>
+  <text class="lane-title" x="211" y="140" text-anchor="middle">外层调度与空闲维护</text>
+  <rect x="470" y="116" width="430" height="38" rx="19" fill="#e3f3eb" stroke="#a8d0bd"/>
+  <text class="lane-title" x="685" y="140" text-anchor="middle">心遇单轮主流程</text>
+  <rect x="1010" y="116" width="390" height="38" rx="19" fill="#fff0d9" stroke="#dbba83"/>
+  <text class="lane-title" x="1205" y="140" text-anchor="middle">聊天分支与异常分支</text>
+
+  <!-- Main vertical flow -->
+  <g>
+    <rect class="node start" x="545" y="182" width="280" height="64" rx="22"/>
+    <text class="node-text white-text" x="685" y="214">run_once 开始</text>
+  </g>
+  <g>
+    <rect class="node process" x="505" y="290" width="360" height="82" rx="18"/>
+    <text class="node-text" x="685" y="316">启动首张截图先判界面</text>
+    <text class="node-sub" x="685" y="342">先 capture_transform_image(startup_screen_detect)，优先判断当前在列表、聊天、我的还是未知界面</text>
+  </g>
+  <g>
+    <rect class="node process" x="505" y="414" width="360" height="98" rx="18"/>
+    <text class="node-text" x="685" y="440">优先纠偏回聊天列表</text>
+    <text class="node-sub" x="685" y="466">聊天页先返回，我的页先点消息，未知页只靠返回按钮模板纠偏；列表页才继续后续流程</text>
+    <text class="node-sub" x="685" y="488">纠偏后的后续截图才进入 capture_after_popups；黑屏 / 无手机会在首张图或纠偏后直接抛专用异常</text>
+  </g>
+  <g>
+    <rect class="node ocr" x="505" y="554" width="360" height="96" rx="18"/>
+    <text class="node-text" x="685" y="580">popup_check + list OCR 扫描</text>
+    <text class="node-sub" x="685" y="606">读取 message_list / bottom_nav；顶部筛选项和底部导航项不进入 message_list</text>
+    <text class="node-sub" x="685" y="628">回到列表后再跑弹窗关闭和 OCR；未回复入口通过 bottom_nav 定位，再用像素判断是否有红色</text>
+  </g>
+  <g>
+    <path class="node decision" d="M685 692 L845 764 L685 836 L525 764 Z"/>
+    <text class="node-text" x="685" y="756">找到可回复目标？</text>
+    <text class="node-sub" x="685" y="782">未读优先；否则回退到有 content 的非空目标</text>
+  </g>
+  <g>
+    <rect class="node action" x="505" y="878" width="360" height="90" rx="18"/>
+    <text class="node-text" x="685" y="904">记录 target_selected</text>
+    <text class="node-sub" x="685" y="930">保存 name / favorability / unread_count / content，并判断是否是“暂无消息”等空占位</text>
+  </g>
+  <g>
+    <path class="node decision" d="M685 1012 L845 1084 L685 1156 L525 1084 Z"/>
+    <text class="node-text" x="685" y="1076">空目标？</text>
+    <text class="node-sub" x="685" y="1102">name 命中空占位且 content 为空</text>
+  </g>
+  <g>
+    <rect class="node action" x="505" y="1198" width="360" height="88" rx="18"/>
+    <text class="node-text" x="685" y="1224">进入聊天界面</text>
+    <text class="node-sub" x="685" y="1250">点选中行中心，确认聊天模板，记录本轮活动时间</text>
+    <text class="node-sub" x="685" y="1272">若当前是黑屏或无手机，则转入等待态</text>
+  </g>
+  <g>
+    <path class="node decision" d="M685 1328 L845 1400 L685 1472 L525 1400 Z"/>
+    <text class="node-text" x="685" y="1392">有“新招呼”按钮？</text>
+    <text class="node-sub" x="685" y="1418">命中后点击 x+0.2 发送，再返回列表</text>
+  </g>
+  <g>
+    <rect class="node ocr" x="505" y="1514" width="360" height="104" rx="18"/>
+    <text class="node-text" x="685" y="1540">确定输入来源</text>
+    <text class="node-sub" x="685" y="1566">短列表内容直接用 list；content=“你好”优先读 pingtai.txt</text>
+    <text class="node-sub" x="685" y="1588">否则进入 dialogue OCR，读取 sender1 最后一条消息</text>
+    <text class="node-sub" x="685" y="1608">dialogue 已关闭 center_y 边界过滤</text>
+  </g>
+  <g>
+    <rect class="node process" x="505" y="1660" width="360" height="92" rx="18"/>
+    <text class="node-text" x="685" y="1686">request_ai + 点输入框</text>
+    <text class="node-sub" x="685" y="1712">有 greeting_reply 时不请求 AI；否则异步调用 reply_provider，同时先点输入框偏移位置</text>
+    <text class="node-sub" x="685" y="1734">reply_provider 走记忆、outbox 和 AIClient</text>
+  </g>
+  <g>
+    <path class="node decision" d="M685 1794 L845 1866 L685 1938 L525 1866 Z"/>
+    <text class="node-text" x="685" y="1858">action.skip？</text>
+    <text class="node-sub" x="685" y="1884">skip 时直接返回列表并 mark_success</text>
+  </g>
+  <g>
+    <rect class="node action" x="505" y="1976" width="360" height="98" rx="18"/>
+    <text class="node-text" x="685" y="2002">TTS 播放 + 发送</text>
+    <text class="node-sub" x="685" y="2028">必要时再次点输入框；点麦克风、播放 TTS，失败可重试</text>
+    <text class="node-sub" x="685" y="2050">等待 3 秒后持续匹配发送按钮直到消失</text>
+  </g>
+  <g>
+    <rect class="node end" x="535" y="2120" width="300" height="74" rx="22"/>
+    <text class="node-text white-text" x="685" y="2148">返回聊天列表 / 本轮结束</text>
+    <text class="node-sub white-text" x="685" y="2172">sent_callback 标记已发送；发送后的首次返回双击；然后 wait_next_round + mark_success</text>
+  </g>
+
+  <!-- Left lane -->
+  <g>
+    <rect class="node process" x="56" y="196" width="310" height="112" rx="18"/>
+    <text class="node-text" x="211" y="226">DeviceWorker 启动</text>
+    <text class="node-sub" x="211" y="252">创建 AIClient、MessageProcessor、XinyuApp</text>
+    <text class="node-sub" x="211" y="274">绑定 status/log 回调，发出 started</text>
+    <text class="node-sub" x="211" y="294">poll_interval 控制单轮间隔</text>
+  </g>
+  <g>
+    <rect class="node process" x="56" y="356" width="310" height="116" rx="18"/>
+    <text class="node-text" x="211" y="386">运行前门控</text>
+    <text class="node-sub" x="211" y="412">pause 时阻塞；stop 时退出</text>
+    <text class="node-sub" x="211" y="434">许可证过期或校验失败会 pause</text>
+    <text class="node-sub" x="211" y="456">license_api_url 未配置只记 warning</text>
+  </g>
+  <g>
+    <rect class="node idle" x="56" y="724" width="310" height="104" rx="18"/>
+    <text class="node-text" x="211" y="754">暂无消息 / 空目标</text>
+    <text class="node-sub" x="211" y="780">进入空闲维护，不报错、不暂停</text>
+    <text class="node-sub" x="211" y="802">DeviceWorker 对 empty_list_target 使用更慢轮询间隔</text>
+  </g>
+  <g>
+    <rect class="node idle" x="56" y="876" width="310" height="124" rx="18"/>
+    <text class="node-text" x="211" y="906">防熄屏与积分读取</text>
+    <text class="node-sub" x="211" y="932">超过 keep_awake_interval_seconds 时才执行一次 keep_screen_awake</text>
+    <text class="node-sub" x="211" y="954">底部“消息”位置来自 bottom_nav，且 y 必须 ≥ 0.5</text>
+    <text class="node-sub" x="211" y="976">同一轮空闲期首次进入时：我的 → points OCR → 消息</text>
+  </g>
+  <g>
+    <rect class="node idle" x="56" y="1046" width="310" height="96" rx="18"/>
+    <text class="node-text" x="211" y="1076">余额上报</text>
+    <text class="node-sub" x="211" y="1102">读取“我的积分”后，UI 余额显示为 points / 10 的整数部分</text>
+    <text class="node-sub" x="211" y="1124">有真实消息进入主流程后，idle_points_checked 会重置</text>
+  </g>
+  <g>
+    <rect class="node warning" x="56" y="1580" width="310" height="168" rx="18"/>
+    <text class="node-text" x="211" y="1610">通用错误恢复</text>
+    <text class="node-sub" x="211" y="1636">AI 请求失败、输入框/麦克风/发送按钮找不到、TTS 重试失败等</text>
+    <text class="node-sub" x="211" y="1658">BaseApp.on_error：error_count +1，保存 photo/errors 错误截图</text>
+    <text class="node-sub" x="211" y="1680">尝试 robot.reset_device(wait=true)</text>
+    <text class="node-sub" x="211" y="1702">连续错误达到阈值后置 is_circuit_open=true，worker 会 pause</text>
+    <text class="node-sub" x="211" y="1724">用户停止 / 取消不会计入错误</text>
+  </g>
+  <g>
+    <rect class="node end" x="56" y="1810" width="310" height="102" rx="22"/>
+    <text class="node-text white-text" x="211" y="1840">状态回传 UI</text>
+    <text class="node-sub white-text" x="211" y="1866">runtime_step + progress 实时更新</text>
+    <text class="node-sub white-text" x="211" y="1888">每轮结束补一条 tick；circuit open 时发 error 并 paused</text>
+  </g>
+
+  <!-- Right lane -->
+  <g>
+    <rect class="node action" x="1040" y="352" width="330" height="110" rx="18"/>
+    <text class="node-text" x="1205" y="382">未回复入口红色判断</text>
+    <text class="node-sub" x="1205" y="408">先用 bottom_nav 找“未回复”位置</text>
+    <text class="node-sub" x="1205" y="430">有红色：不点；没红色：点一次再重扫 list OCR</text>
+    <text class="node-sub" x="1205" y="450">不占位，不强行猜按钮文字</text>
+  </g>
+  <g>
+    <rect class="node action" x="1040" y="520" width="330" height="112" rx="18"/>
+    <text class="node-text" x="1205" y="550">新招呼分支</text>
+    <text class="node-sub" x="1205" y="576">匹配 btn_新招呼按钮.jpg</text>
+    <text class="node-sub" x="1205" y="598">点击 (x + 0.2, y) 发送新招呼</text>
+    <text class="node-sub" x="1205" y="620">再匹配返回按钮回聊天列表，直接结束本轮</text>
+  </g>
+  <g>
+    <rect class="node ocr" x="1040" y="704" width="330" height="126" rx="18"/>
+    <text class="node-text" x="1205" y="734">dialogue OCR 分支</text>
+    <text class="node-sub" x="1205" y="760">列表内容不足以直回时，读取聊天详情</text>
+    <text class="node-sub" x="1205" y="782">只取 sender1 最后一条非空消息</text>
+    <text class="node-sub" x="1205" y="804">若没读到 sender1，抛出可恢复异常</text>
+    <text class="node-sub" x="1205" y="824">已取消 above_dialogue_region 这类中心区域限制</text>
+  </g>
+  <g>
+    <rect class="node process" x="1040" y="894" width="330" height="124" rx="18"/>
+    <text class="node-text" x="1205" y="924">reply_provider 内部链路</text>
+    <text class="node-sub" x="1205" y="950">先看 outbox 是否已有 pending_send</text>
+    <text class="node-sub" x="1205" y="972">否则查记忆 conversation_id，再请求 AIClient.chat</text>
+    <text class="node-sub" x="1205" y="994">成功后更新记忆，并写入 pending_send</text>
+    <text class="node-sub" x="1205" y="1014">发送成功后 sent_callback 再置为已发送</text>
+  </g>
+  <g>
+    <rect class="node warning" x="1040" y="1082" width="330" height="118" rx="18"/>
+    <text class="node-text" x="1205" y="1112">黑屏 / 无手机等待态</text>
+    <text class="node-sub" x="1205" y="1138">BlackScreenError → black_screen_waiting</text>
+    <text class="node-sub" x="1205" y="1160">NoPhoneScreenError → no_phone_waiting</text>
+    <text class="node-sub" x="1205" y="1182">更新 last_error，但不走通用 error_count / circuit breaker</text>
+  </g>
+  <g>
+    <rect class="node action" x="1040" y="1268" width="330" height="124" rx="18"/>
+    <text class="node-text" x="1205" y="1298">TTS 与发送细节</text>
+    <text class="node-sub" x="1205" y="1324">先点输入框偏移位置，再点麦克风</text>
+    <text class="node-sub" x="1205" y="1346">TTS 失败会重新点麦克风并重播</text>
+    <text class="node-sub" x="1205" y="1368">发送按钮只要还在就继续点，直到消失</text>
+    <text class="node-sub" x="1205" y="1388">发送后的首次回列表 go_back 才双击</text>
+  </g>
+  <g>
+    <rect class="node process" x="1040" y="1458" width="330" height="114" rx="18"/>
+    <text class="node-text" x="1205" y="1488">当前几个关键例外</text>
+    <text class="node-sub" x="1205" y="1514">启动首张图不先跑弹窗，而是先判定界面并优先回聊天列表</text>
+    <text class="node-sub" x="1205" y="1536">聊天界面截图后不再检测弹窗，但正常聊天步骤继续</text>
+    <text class="node-sub" x="1205" y="1558">list 只要读到有效 content，即使未读点漏识别，也能进入回复；API key BOM 也已统一清洗</text>
+  </g>
+
+  <!-- Main arrows -->
+  <path class="edge" d="M685 246 L685 290"/>
+  <path class="edge" d="M685 372 L685 414"/>
+  <path class="edge" d="M685 512 L685 554"/>
+  <path class="edge" d="M685 650 L685 692"/>
+  <path class="edge" d="M685 836 L685 878"/>
+  <path class="edge" d="M685 968 L685 1012"/>
+  <path class="edge" d="M685 1156 L685 1198"/>
+  <path class="edge" d="M685 1286 L685 1328"/>
+  <path class="edge" d="M685 1472 L685 1514"/>
+  <path class="edge" d="M685 1618 L685 1660"/>
+  <path class="edge" d="M685 1752 L685 1794"/>
+  <path class="edge" d="M685 1938 L685 1976"/>
+  <path class="edge" d="M685 2074 L685 2120"/>
+
+  <!-- Worker arrows -->
+  <path class="edge" d="M211 308 L211 356"/>
+  <path class="edge-soft" d="M366 414 C430 414 430 214 545 214"/>
+  <text class="label" x="390" y="304">通过门控后进入主流程</text>
+  <path class="edge-soft" d="M366 776 C430 776 430 764 525 764"/>
+  <text class="label" x="384" y="752">无目标</text>
+  <path class="edge" d="M211 828 L211 876"/>
+  <path class="edge" d="M211 1000 L211 1046"/>
+  <path class="edge-soft" d="M366 1094 C430 1094 430 2148 535 2148"/>
+  <text class="label" x="384" y="1274">空闲维护后等待下一轮</text>
+  <path class="edge" d="M211 1748 L211 1810"/>
+
+  <!-- Decision branches -->
+  <path class="edge-soft" d="M845 764 L1040 764"/>
+  <text class="label" x="912" y="746">需要读详情 / 侧边规则</text>
+  <path class="edge-soft" d="M845 1084 L1040 1084"/>
+  <text class="label" x="916" y="1066">空目标等待态</text>
+  <path class="edge-soft" d="M845 1400 L1040 576"/>
+  <text class="label" x="918" y="1088">有新招呼</text>
+  <path class="edge-soft" d="M845 1866 L1040 1866 L1040 2148 L835 2148"/>
+  <text class="label" x="924" y="1846">skip</text>
+
+  <!-- Right lane arrows -->
+  <path class="edge-soft" d="M865 462 L1040 462"/>
+  <text class="label" x="926" y="444">未回复入口检测</text>
+  <path class="edge-soft" d="M865 1566 L1040 766"/>
+  <text class="label" x="934" y="1238">需要 dialogue OCR</text>
+  <path class="edge-soft" d="M865 1706 L1040 956"/>
+  <text class="label" x="930" y="1600">请求 AI</text>
+  <path class="edge-soft" d="M865 2026 L1040 1330"/>
+  <text class="label" x="926" y="1808">TTS / 发送细节</text>
+  <path class="edge-soft" d="M1205 632 L1205 704"/>
+  <path class="edge-soft" d="M1205 830 L1205 894"/>
+  <path class="edge-soft" d="M1205 1018 L1205 1082"/>
+  <path class="edge-soft" d="M1205 1200 L1205 1268"/>
+  <path class="edge-soft" d="M1205 1392 L1205 1458"/>
+
+  <!-- Error links -->
+  <path class="edge-soft" d="M505 1706 L366 1706"/>
+  <path class="edge-soft" d="M505 2026 L366 1664"/>
+  <path class="edge-soft" d="M1040 956 L366 1624"/>
+  <path class="edge-soft" d="M1040 1138 L865 1138"/>
+  <text class="label" x="934" y="1120">专用等待态，不走通用熔断</text>
+
+  <!-- Final loop -->
+  <path class="edge-soft" d="M685 2194 C685 2240 211 2240 211 1912"/>
+  <path class="edge-soft" d="M211 1912 C211 1968 685 1968 685 182"/>
+  <text class="label" x="326" y="2224">DeviceWorker 按轮询间隔进入下一轮</text>
+</svg>

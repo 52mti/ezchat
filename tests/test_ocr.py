@@ -228,6 +228,45 @@ def test_ocr_predict_calls_are_serialized_across_threads():
     assert [result[0]["text"] for result in results] == ["threadsafe", "threadsafe"]
 
 
+def test_ocr_predict_concurrency_can_be_configured():
+    image = Image.new("RGB", (100, 50), "white")
+    entered = threading.Barrier(2)
+
+    class SlowPredictEngine:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def predict(self, image, **kwargs):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                entered.wait(timeout=1)
+                time.sleep(0.03)
+                return [
+                    {
+                        "dt_polys": [
+                            np.array([[10, 20], [30, 20], [30, 40], [10, 40]], dtype=np.float32),
+                        ],
+                        "rec_texts": ["parallel"],
+                        "rec_scores": [0.99],
+                    }
+                ]
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    engine = SlowPredictEngine()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: ocr(image, {"engine": engine, "max_concurrency": 2}), range(2)))
+
+    assert engine.max_active == 2
+    assert [result[0]["text"] for result in results] == ["parallel", "parallel"]
+
+
 def test_ocr_engine_initialization_is_serialized_across_threads(monkeypatch):
     image = Image.new("RGB", (100, 50), "white")
     active = 0

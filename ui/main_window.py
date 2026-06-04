@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
 )
 from PIL import Image
 
-from apps import get_registered_apps
+from apps import get_default_app_name, get_registered_apps, resolve_app_name
 from apps.defaults import DEFAULT_RUNTIME_CONFIG, with_app_defaults
 from apps.visual_assets import (
     CUSTOM_BACK_BUTTON,
@@ -68,6 +68,8 @@ PERSONA_PRESETS: tuple[tuple[str, str], ...] = (
     ("特别素", "REMOVED-BEARER-TOKEN"),
     ("心遇优化版", "REMOVED-BEARER-TOKEN"),
     ("漂流瓶引诱", "REMOVED-BEARER-TOKEN"),
+    ("引导视频（概率）", "REMOVED-BEARER-TOKEN"),
+    ("引导视频（纯）", "REMOVED-BEARER-TOKEN"),
 )
 CUSTOM_PERSONA_LABEL = "自定义"
 
@@ -170,7 +172,7 @@ def _ocr_mode_label(config_manager: ConfigManager) -> str:
 
     devices = config_manager.get("devices", default=[])
     device = devices[0] if isinstance(devices, list) and devices and isinstance(devices[0], dict) else {}
-    app_name = str(device.get("selected_app", "wechat") or "wechat")
+    app_name = resolve_app_name(device.get("selected_app", None))
     device_ip = str(device.get("ip", "") or "")
     app_config = config_manager.get_app_config(device_ip, app_name, _app_default_config(app_name))
     ocr_config = app_config.get("ocr", {}) if isinstance(app_config.get("ocr", {}), dict) else {}
@@ -437,6 +439,11 @@ class NoWheelDoubleSpinBox(QDoubleSpinBox):
         super().keyPressEvent(event)
 
 
+class NoWheelComboBox(QComboBox):
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        event.ignore()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config_manager: ConfigManager | None = None) -> None:
         super().__init__()
@@ -474,6 +481,13 @@ class MainWindow(QMainWindow):
         self.save_apikey_button = self._button("保存", "primary")
         self.save_apikey_button.clicked.connect(self._save_apikey)
         top_bar.addWidget(self.save_apikey_button)
+        top_bar.addSpacing(8)
+        top_bar.addWidget(QLabel("OCR并发"))
+        self.ocr_concurrency_input = NoWheelSpinBox()
+        self.ocr_concurrency_input.setRange(1, 16)
+        self.ocr_concurrency_input.setFixedWidth(72)
+        self.ocr_concurrency_input.setValue(int(self.config_manager.get("global", "ocr_max_concurrency", default=1) or 1))
+        top_bar.addWidget(self.ocr_concurrency_input)
         top_bar.addSpacing(12)
         top_bar.addWidget(QLabel("设备 IP"))
         self.device_ip_input = QLineEdit()
@@ -610,10 +624,10 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, COL_STATUS, self._status_item("stopped"))
             self.table.setItem(row, COL_AVG_REPLY_SECONDS, self._avg_reply_item())
             self.table.setItem(row, COL_UNATTENDED_SECONDS, self._unattended_item(self._unattended_seconds_for_device(str(device.get("ip", "")))))
-            app_select = QComboBox()
+            app_select = NoWheelComboBox()
             for key, app_cls in app_names.items():
                 app_select.addItem(app_cls.name, key)
-            selected = str(device.get("selected_app", "wechat"))
+            selected = resolve_app_name(device.get("selected_app", None))
             index = app_select.findData(selected)
             if index >= 0:
                 app_select.setCurrentIndex(index)
@@ -775,8 +789,8 @@ class MainWindow(QMainWindow):
     def _selected_app_for_row(self, row: int) -> str:
         widget = self.table.cellWidget(row, COL_RUNNING_APP)
         if isinstance(widget, QComboBox):
-            return str(widget.currentData())
-        return "wechat"
+            return resolve_app_name(widget.currentData())
+        return get_default_app_name()
 
     def _checked_rows(self) -> list[int]:
         rows: list[int] = []
@@ -874,10 +888,10 @@ class MainWindow(QMainWindow):
 
     def _save_apikey(self) -> None:
         value = self.apikey_input.text().strip()
-        if not value or value.startswith("****"):
-            return
-        self.config_manager.set("global", "apikey", value=value)
-        self.apikey_input.setText(mask_secret(value))
+        if value and not value.startswith("****"):
+            self.config_manager.set("global", "apikey", value=value)
+            self.apikey_input.setText(mask_secret(value))
+        self.config_manager.set("global", "ocr_max_concurrency", value=self.ocr_concurrency_input.value())
 
     def _add_device(self) -> None:
         device_ip = self.device_ip_input.text().strip()
@@ -888,7 +902,7 @@ class MainWindow(QMainWindow):
                 "ip": device_ip,
                 "license_key": "",
                 "license_expires": "",
-                "selected_app": "wechat",
+                "selected_app": get_default_app_name(),
                 "persona": {},
                 "contact_personas": {},
                 "app_overrides": self._default_app_overrides(),
@@ -917,7 +931,7 @@ class MainWindow(QMainWindow):
                     "ip": device_ip,
                     "license_key": "",
                     "license_expires": "",
-                    "selected_app": "wechat",
+                    "selected_app": get_default_app_name(),
                     "persona": {},
                     "contact_personas": {},
                     "app_overrides": self._default_app_overrides(),
@@ -1069,6 +1083,11 @@ class MainWindow(QMainWindow):
 
     def _format_log_event(self, event: WorkerEvent) -> str:
         payload = event.payload or {}
+        if event.level == "status" and event.message == "tick":
+            return f"[{event.level}] {event.device_ip}: 心跳"
+        if event.level == "status" and event.message.startswith("progress:"):
+            detail = event.message.split(":", 1)[1].strip()
+            return f"[{event.level}] {event.device_ip}: 进度：{detail}"
         if event.message == "runtime_step":
             detail = str(payload.get("detail", "") or payload.get("step", "") or "")
             return f"[{event.level}] {event.device_ip}: {detail}"
@@ -1107,6 +1126,29 @@ class MainWindow(QMainWindow):
             return f"[{event.level}] {event.device_ip}: 心遇余额 {payload.get('balance', '')}"
         if event.message == "xinyu_balance_failed":
             return f"[{event.level}] {event.device_ip}: 心遇余额读取失败 {payload.get('error', '')}"
+        if event.message == "检测到黑屏":
+            return f"[{event.level}] {event.device_ip}: 检测到黑屏 {payload.get('error', '')}"
+        if event.message == "检测到无手机":
+            return f"[{event.level}] {event.device_ip}: 检测到无手机 {payload.get('error', '')}"
+        if event.message == "防熄屏失败":
+            return f"[{event.level}] {event.device_ip}: 防熄屏失败 {payload.get('error', '')}"
+        if event.message == "心遇重复选中同一会话":
+            name = str(payload.get("name", "") or "")
+            content = str(payload.get("content", "") or "")
+            unread_count = payload.get("unread_count", "")
+            return f"[{event.level}] {event.device_ip}: 心遇重复选中 [{name}] 未读 {unread_count} 内容：{content}"
+        if event.message == "心遇复用待发送回复":
+            contact = str(payload.get("contact", "") or "")
+            content = str(payload.get("content", "") or "")
+            return f"[{event.level}] {event.device_ip}: 心遇复用待发送回复 [{contact}] {content}"
+        if event.message == "心遇发送按钮被连续点击":
+            contact = str(payload.get("contact", "") or "")
+            clicks = payload.get("clicks", "")
+            return f"[{event.level}] {event.device_ip}: 心遇发送按钮连续点击 [{contact}] {clicks} 次"
+        if event.message == "心遇发送后未能返回列表":
+            contact = str(payload.get("contact", "") or "")
+            content = str(payload.get("content", "") or "")
+            return f"[{event.level}] {event.device_ip}: 心遇发送后未能返回列表 [{contact}] {content}"
         if event.message == "huanyou_balance":
             return f"[{event.level}] {event.device_ip}: 欢友余额 {payload.get('balance', '')}"
         if event.message == "huanyou_balance_failed":
@@ -1133,6 +1175,25 @@ class MainWindow(QMainWindow):
             if error:
                 detail += f"：{error}"
             return f"[{event.level}] {event.device_ip}: {labels[event.message]}{detail}"
+        if event.message == "using pending reply":
+            contact = str(payload.get("contact", "") or "")
+            content = str(payload.get("content", "") or "")
+            return f"[{event.level}] {event.device_ip}: 复用待发送回复 [{contact}] {content}"
+        generic_labels = {
+            "started": "已启动",
+            "stopping": "停止中",
+            "stopped": "已停止",
+            "resumed": "已恢复",
+            "paused": "已暂停",
+            "circuit open": "熔断已触发",
+            "device removed": "设备已移除",
+            "license expired": "许可证已过期",
+            "license_api_url not configured; skipping online license check": "未配置许可证校验地址，已跳过在线校验",
+        }
+        if event.message in generic_labels:
+            detail = str(payload.get("detail", "") or "")
+            suffix = f"：{detail}" if detail else ""
+            return f"[{event.level}] {event.device_ip}: {generic_labels[event.message]}{suffix}"
         return f"[{event.level}] {event.device_ip}: {event.message}"
 
     def _drain_events(self) -> None:
@@ -1248,7 +1309,7 @@ class _LegacyAppConfigDialog(QDialog):
         self.match_threshold = QDoubleSpinBox()
         self.match_threshold.setRange(0.1, 1.0)
         self.match_threshold.setSingleStep(0.01)
-        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.85)))
+        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.7)))
         layout.addRow("模板阈值", self.match_threshold)
 
         ocr = overrides.get("ocr", {}) if isinstance(overrides.get("ocr", {}), dict) else {}
@@ -2145,7 +2206,7 @@ class AppConfigDialog(QDialog):
         self.match_threshold = NoWheelDoubleSpinBox()
         self.match_threshold.setRange(0.1, 1.0)
         self.match_threshold.setSingleStep(0.01)
-        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.85)))
+        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.7)))
         form.addRow("模板阈值", self.match_threshold)
 
         ocr = overrides.get("ocr", {}) if isinstance(overrides.get("ocr", {}), dict) else {}

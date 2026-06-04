@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 from apps.wechat.config import DEFAULT_CONFIG as WECHAT_DEFAULT_CONFIG
 from services.config_manager import ConfigManager
@@ -28,6 +29,7 @@ def test_config_manager_has_global_greetings_dir_default(tmp_path):
     manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
 
     assert manager.get("global", "greetings_dir") == "runtime/greetings"
+    assert manager.get("global", "ocr_max_concurrency") == 1
     assert "greetings_dir" not in manager.get_app_config("1.1.1.1", "wechat", {})
 
 
@@ -246,7 +248,7 @@ def test_config_manager_migrates_and_backs_up_old_schema(tmp_path):
     device = manager.find_device("1.1.1.1")
 
     assert manager.get("schema_version") == 3
-    assert device["selected_app"] == "wechat"
+    assert device["selected_app"] == "xinyu"
     assert (tmp_path / "config.json.bak").exists()
 
 
@@ -280,6 +282,17 @@ def test_config_manager_updates_app_runtime_and_persona_scopes_independently(tmp
     assert device["runtime_overrides"]["poll_interval"] == 6
     assert merged["match_threshold"] == 0.91
     assert merged["persona"]["name"] == "bot"
+
+
+def test_config_manager_migrates_old_default_match_threshold_to_point_seven(tmp_path):
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    app_dir = tmp_path / "apps" / "xinyu"
+    app_dir.mkdir(parents=True)
+    (app_dir / "config.json").write_text('{"match_threshold": 0.85}', encoding="utf-8")
+
+    config = manager.get_app_config("1.1.1.1", "xinyu", {})
+
+    assert config["match_threshold"] == 0.7
 
 
 def test_config_manager_updates_device_app_offsets_independently(tmp_path):
@@ -363,6 +376,31 @@ def test_config_manager_add_device_sorts_and_rejects_duplicates(tmp_path):
 
     devices = manager.devices()
     assert [device["ip"] for device in devices] == ["192.168.1.3", "192.168.1.20"]
+
+
+def test_config_manager_concurrent_device_updates_do_not_overwrite_each_other(tmp_path):
+    config_path = tmp_path / "config.json"
+    outbox_path = tmp_path / "outbox.json"
+    manager = ConfigManager(config_path, outbox_path)
+    for index in range(20):
+        manager.add_device({"ip": f"192.168.1.{index + 1}", "selected_app": "wechat"})
+
+    def update(index: int) -> None:
+        local_manager = ConfigManager(config_path, outbox_path)
+        local_manager.update_device(
+            f"192.168.1.{index + 1}",
+            {"license_expires": f"2099-01-{index + 1:02d}"},
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(update, range(20)))
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    expires_by_ip = {device["ip"]: device.get("license_expires") for device in saved["devices"]}
+
+    assert len(expires_by_ip) == 20
+    for index in range(20):
+        assert expires_by_ip[f"192.168.1.{index + 1}"] == f"2099-01-{index + 1:02d}"
 
 
 def test_config_manager_remove_device(tmp_path):

@@ -63,7 +63,7 @@ def test_base_app_opens_circuit_after_recover_limit():
     app.on_error(RuntimeError("two"))
 
     assert app.get_status()["is_circuit_open"] is True
-    assert "recover failed" in app.get_status()["last_error"]
+    assert "设备复位失败" in app.get_status()["last_error"]
 
 
 def test_base_app_error_capture_is_saved_under_photo(tmp_path, monkeypatch):

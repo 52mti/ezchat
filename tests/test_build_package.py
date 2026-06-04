@@ -59,14 +59,28 @@ def test_bundled_dependency_specs_exclude_shared_runtime_packages(tmp_path):
 def test_copy_sources_keeps_app_config_json_but_excludes_root_config_json(tmp_path):
     root = tmp_path / "repo"
     package_root = tmp_path / "package"
-    (root / "apps" / "wechat").mkdir(parents=True)
-    (root / "apps" / "wechat" / "config.json").write_text('{"app": "wechat"}', encoding="utf-8")
+    (root / "apps" / "xinyu").mkdir(parents=True)
+    (root / "apps" / "xinyu" / "config.json").write_text('{"app": "xinyu"}', encoding="utf-8")
     (root / "config.json").write_text('{"secret": true}', encoding="utf-8")
 
     build._copy_sources(root, package_root)
 
-    assert (package_root / "apps" / "wechat" / "config.json").read_text(encoding="utf-8") == '{"app": "wechat"}'
+    assert (package_root / "apps" / "xinyu" / "config.json").read_text(encoding="utf-8") == '{"app": "xinyu"}'
     assert not (package_root / "config.json").exists()
+
+
+def test_copy_sources_excludes_deprecated_wechat_app(tmp_path):
+    root = tmp_path / "repo"
+    package_root = tmp_path / "package"
+    (root / "apps" / "wechat").mkdir(parents=True)
+    (root / "apps" / "wechat" / "app.py").write_text("legacy\n", encoding="utf-8")
+    (root / "apps" / "xinyu").mkdir(parents=True)
+    (root / "apps" / "xinyu" / "app.py").write_text("supported\n", encoding="utf-8")
+
+    build._copy_sources(root, package_root)
+
+    assert not (package_root / "apps" / "wechat").exists()
+    assert (package_root / "apps" / "xinyu" / "app.py").is_file()
 
 
 def test_write_customer_update_archive_excludes_full_runtimes_and_models(tmp_path):
@@ -95,6 +109,31 @@ def test_write_customer_update_archive_excludes_full_runtimes_and_models(tmp_pat
     assert all(not name.startswith(f"{build.PACKAGE_NAME}/models/ocr/") for name in names)
 
 
+def test_write_customer_update_archive_excludes_app_customer_config_assets(tmp_path):
+    package_root = tmp_path / build.PACKAGE_NAME
+    dist_root = tmp_path / "dist"
+    app_root = package_root / "apps" / "xinyu"
+    (app_root / "templates" / "buttons").mkdir(parents=True)
+    (app_root / "app.py").write_text("APP = 'xinyu'\n", encoding="utf-8")
+    (app_root / "steps.py").write_text("STEPS = []\n", encoding="utf-8")
+    (app_root / "config.py").write_text("NAME = 'xinyu'\n", encoding="utf-8")
+    (app_root / "config.json").write_text('{"persona": "custom"}', encoding="utf-8")
+    (app_root / "ocr_config.py").write_text("RULES = {}\n", encoding="utf-8")
+    (app_root / "templates" / "buttons" / "btn_返回按钮.jpg").write_bytes(b"image")
+
+    archive_path = build._write_customer_update_archive(package_root, dist_root)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        names = set(archive.namelist())
+
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/app.py" in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/steps.py" in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/config.py" in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/config.json" not in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/ocr_config.py" not in names
+    assert all(not name.startswith(f"{build.PACKAGE_NAME}/apps/xinyu/templates/") for name in names)
+
+
 def test_write_full_package_archive_includes_runtime_state_and_photo_dir(tmp_path):
     package_root = tmp_path / build.PACKAGE_NAME
     dist_root = tmp_path / "dist"
@@ -112,6 +151,25 @@ def test_write_full_package_archive_includes_runtime_state_and_photo_dir(tmp_pat
     assert f"{build.PACKAGE_NAME}/main.py" in names
     assert f"{build.PACKAGE_NAME}/photo/" in names
     assert f"{build.PACKAGE_NAME}/runtime/install_state.json" in names
+
+
+def test_write_full_package_archive_includes_app_customer_config_assets(tmp_path):
+    package_root = tmp_path / build.PACKAGE_NAME
+    dist_root = tmp_path / "dist"
+    app_root = package_root / "apps" / "xinyu"
+    (app_root / "templates" / "buttons").mkdir(parents=True)
+    (app_root / "config.json").write_text('{"persona": "default"}', encoding="utf-8")
+    (app_root / "ocr_config.py").write_text("RULES = {}\n", encoding="utf-8")
+    (app_root / "templates" / "buttons" / "btn_返回按钮.jpg").write_bytes(b"image")
+
+    archive_path = build._write_full_package_archive(package_root, dist_root)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        names = set(archive.namelist())
+
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/config.json" in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/ocr_config.py" in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/templates/buttons/btn_返回按钮.jpg" in names
 
 
 def test_copy_executable_aliases_creates_ascii_alias(tmp_path):
@@ -264,8 +322,8 @@ def test_runtime_cache_key_changes_with_cuda_lane(tmp_path):
 def test_package_cache_key_changes_with_source_update(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
-    (root / "apps" / "wechat").mkdir(parents=True)
-    (root / "apps" / "wechat" / "app.py").write_text("print('a')\n", encoding="utf-8")
+    (root / "apps" / "xinyu").mkdir(parents=True)
+    (root / "apps" / "xinyu" / "app.py").write_text("print('a')\n", encoding="utf-8")
     (root / "vision").mkdir()
     (root / "vision" / "ocr.py").write_text("print('ocr')\n", encoding="utf-8")
     (root / "services").mkdir()
@@ -289,7 +347,7 @@ def test_package_cache_key_changes_with_source_update(tmp_path):
         path.write_text(content, encoding="utf-8")
 
     key_a = build._package_cache_key(root, model_tier="lite", nvidia_cuda_lane="cu118", include_full_payload=False)
-    (root / "apps" / "wechat" / "app.py").write_text("print('b')\n", encoding="utf-8")
+    (root / "apps" / "xinyu" / "app.py").write_text("print('b')\n", encoding="utf-8")
     key_b = build._package_cache_key(root, model_tier="lite", nvidia_cuda_lane="cu118", include_full_payload=False)
 
     assert key_a != key_b

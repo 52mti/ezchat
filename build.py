@@ -88,6 +88,9 @@ PACKAGE_CACHE_EXTRA_INPUTS = (
     "build.py",
     "runtime_builder.py",
 )
+DEPRECATED_PACKAGE_PATHS = (
+    "apps/wechat",
+)
 
 
 def _requirements_specs(root: Path) -> list[str]:
@@ -170,8 +173,25 @@ def _relative_matches_prefix(relative: str, prefix: str) -> bool:
     return relative == normalized or relative.startswith(normalized + "/")
 
 
-def _archive_excludes(relative: str, *, exclude_runtime_state: bool, exclude_full_runtimes: bool) -> bool:
+def _is_app_customer_config_asset(relative: str) -> bool:
+    parts = relative.split("/")
+    if len(parts) < 3 or parts[0] != "apps":
+        return False
+    if parts[2] in {"config.json", "ocr_config.py"}:
+        return True
+    return len(parts) >= 3 and parts[2] == "templates"
+
+
+def _archive_excludes(
+    relative: str,
+    *,
+    exclude_runtime_state: bool,
+    exclude_full_runtimes: bool,
+    exclude_app_customer_config_assets: bool,
+) -> bool:
     if exclude_runtime_state and relative == "runtime/install_state.json":
+        return True
+    if exclude_app_customer_config_assets and _is_app_customer_config_asset(relative):
         return True
     if exclude_full_runtimes and (
         _relative_matches_prefix(relative, "runtime/app")
@@ -189,24 +209,46 @@ def _archive_excludes(relative: str, *, exclude_runtime_state: bool, exclude_ful
     return relative.endswith((".pyc", ".pyo"))
 
 
-def _iter_archive_dirs(package_root: Path, *, exclude_runtime_state: bool, exclude_full_runtimes: bool) -> Iterator[str]:
+def _iter_archive_dirs(
+    package_root: Path,
+    *,
+    exclude_runtime_state: bool,
+    exclude_full_runtimes: bool,
+    exclude_app_customer_config_assets: bool,
+) -> Iterator[str]:
     for path in sorted(package_root.rglob("*")):
         if not path.is_dir():
             continue
         relative = path.relative_to(package_root).as_posix()
         if not relative:
             continue
-        if _archive_excludes(relative, exclude_runtime_state=exclude_runtime_state, exclude_full_runtimes=exclude_full_runtimes):
+        if _archive_excludes(
+            relative,
+            exclude_runtime_state=exclude_runtime_state,
+            exclude_full_runtimes=exclude_full_runtimes,
+            exclude_app_customer_config_assets=exclude_app_customer_config_assets,
+        ):
             continue
         yield f"{PACKAGE_NAME}/{relative}/"
 
 
-def _iter_archive_files(package_root: Path, *, exclude_runtime_state: bool, exclude_full_runtimes: bool) -> Iterator[tuple[Path, str]]:
+def _iter_archive_files(
+    package_root: Path,
+    *,
+    exclude_runtime_state: bool,
+    exclude_full_runtimes: bool,
+    exclude_app_customer_config_assets: bool,
+) -> Iterator[tuple[Path, str]]:
     for path in sorted(package_root.rglob("*")):
         if not path.is_file():
             continue
         relative = path.relative_to(package_root).as_posix()
-        if _archive_excludes(relative, exclude_runtime_state=exclude_runtime_state, exclude_full_runtimes=exclude_full_runtimes):
+        if _archive_excludes(
+            relative,
+            exclude_runtime_state=exclude_runtime_state,
+            exclude_full_runtimes=exclude_full_runtimes,
+            exclude_app_customer_config_assets=exclude_app_customer_config_assets,
+        ):
             continue
         yield path, f"{PACKAGE_NAME}/{relative}"
 
@@ -218,6 +260,7 @@ def _write_archive(
     *,
     exclude_runtime_state: bool,
     exclude_full_runtimes: bool,
+    exclude_app_customer_config_assets: bool,
 ) -> Path:
     dist_root.mkdir(parents=True, exist_ok=True)
     archive_path = dist_root / f"{PACKAGE_NAME}{suffix}.zip"
@@ -226,12 +269,14 @@ def _write_archive(
             package_root,
             exclude_runtime_state=exclude_runtime_state,
             exclude_full_runtimes=exclude_full_runtimes,
+            exclude_app_customer_config_assets=exclude_app_customer_config_assets,
         ):
             archive.writestr(arcname, "")
         for path, arcname in _iter_archive_files(
             package_root,
             exclude_runtime_state=exclude_runtime_state,
             exclude_full_runtimes=exclude_full_runtimes,
+            exclude_app_customer_config_assets=exclude_app_customer_config_assets,
         ):
             compression = zipfile.ZIP_STORED if path.suffix.lower() in _STORED_SUFFIXES else zipfile.ZIP_DEFLATED
             archive.write(path, arcname, compress_type=compression)
@@ -245,6 +290,7 @@ def _write_full_package_archive(package_root: Path, dist_root: Path) -> Path:
         "_full",
         exclude_runtime_state=False,
         exclude_full_runtimes=False,
+        exclude_app_customer_config_assets=False,
     )
 
 
@@ -255,6 +301,7 @@ def _write_customer_update_archive(package_root: Path, dist_root: Path) -> Path:
         "_update",
         exclude_runtime_state=True,
         exclude_full_runtimes=True,
+        exclude_app_customer_config_assets=True,
     )
 
 
@@ -283,6 +330,10 @@ def _copy_sources(root: Path, package_root: Path) -> None:
         if not source.exists():
             continue
         _copy_item(source, package_root / relative)
+    for relative in DEPRECATED_PACKAGE_PATHS:
+        deprecated_path = package_root / relative
+        if deprecated_path.exists():
+            _remove_path(deprecated_path)
     for skeleton in RUNTIME_SKELETON_DIRS:
         (package_root / skeleton).mkdir(parents=True, exist_ok=True)
     (package_root / "runtime" / ".paddlex").mkdir(parents=True, exist_ok=True)

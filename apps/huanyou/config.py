@@ -24,7 +24,7 @@ DEFAULT_CONFIG = {
         "buttons": "apps/huanyou/templates/buttons",
         "screens": "apps/huanyou/templates/screens",
     },
-    "match_threshold": 0.85,
+    "match_threshold": 0.7,
     **DEFAULT_RUNTIME_CONFIG,
     "step_timeout": 10,
     "persona": dict(DEFAULT_PERSONA_CONFIG),

@@ -136,6 +136,46 @@ def load_installed_runtime_state(project_root: str | Path | None = None) -> dict
     return payload
 
 
+def _state_runtime_python(state: dict[str, Any], backend: str | None = None) -> Path | None:
+    normalized_backend = str(backend or "").strip().lower()
+    state_backend = str(state.get("backend", "") or "").strip().lower()
+    if normalized_backend and state_backend and normalized_backend != state_backend:
+        return None
+    runtime_name = str(state.get("runtime_name", "") or "").strip().lower()
+    package_mode = str(state.get("package_mode", "") or "").strip().lower()
+    python_executable = str(state.get("python_executable", "") or "").strip()
+    runtime_path = str(state.get("runtime_path", "") or "").strip()
+    legacy_hint = (
+        runtime_name in {"legacy", ".runtime_env"}
+        or package_mode == "legacy"
+        or ".runtime_env" in python_executable.replace("\\", "/")
+    )
+    candidates: list[Path] = []
+    if python_executable:
+        candidates.append(Path(python_executable))
+    if legacy_hint and runtime_path:
+        runtime_dir_path = Path(runtime_path)
+        if os.name == "nt":
+            candidates.extend(
+                [
+                    runtime_dir_path / "python.exe",
+                    runtime_dir_path / "Scripts" / "python.exe",
+                    runtime_dir_path / "pythonw.exe",
+                    runtime_dir_path / "Scripts" / "pythonw.exe",
+                ]
+            )
+        else:
+            candidates.append(runtime_dir_path / "bin" / "python")
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve()
+        except OSError:
+            resolved = candidate
+        if resolved.is_file():
+            return resolved
+    return None
+
+
 def _resolve_executable(command_name: str) -> str | None:
     executable = shutil.which(command_name)
     if executable:
@@ -983,6 +1023,9 @@ class SubprocessOcrRuntimeEngine:
         candidate = runtime_python(root, backend_runtime_name(self.backend), gui=False)
         if candidate.is_file():
             return candidate
+        state_python = _state_runtime_python(load_installed_runtime_state(root), self.backend)
+        if state_python is not None:
+            return state_python
         raise RuntimeError(f"Missing OCR runtime python for backend: {self.backend}")
 
     def _subprocess_config(self) -> dict[str, Any]:
@@ -1029,7 +1072,22 @@ class SubprocessOcrRuntimeEngine:
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONNOUSERSITE"] = "1"
+        env["PIP_USER"] = "0"
         env["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+        cache_home = str(load_installed_runtime_state(root).get("cache_home", "") or "").strip()
+        if cache_home:
+            env["PADDLE_PDX_CACHE_HOME"] = cache_home
+            env["PADDLEX_HOME"] = cache_home
+        runtime_dir_path = python_exe.parent
+        if runtime_dir_path.name.lower() == "scripts":
+            runtime_dir_path = runtime_dir_path.parent
+        scripts_dir = runtime_dir_path / "Scripts"
+        path_parts = [str(runtime_dir_path)]
+        if scripts_dir.is_dir():
+            path_parts.append(str(scripts_dir))
+        existing_path = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join([*path_parts, existing_path] if existing_path else path_parts)
+        env.pop("PYTHONPATH", None)
         if sys.platform.startswith("win"):
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -1114,10 +1172,16 @@ def _effective_backend_config(config: dict[str, Any]) -> tuple[str, str]:
     preferred = config.get("backend", config.get("ocr_backend", "auto"))
     installed_state = load_installed_runtime_state()
     installed_backend = str(installed_state.get("backend", "") or "").strip().lower()
-    if normalize_ocr_backend(preferred) == "auto" and installed_backend in {"paddle_cuda", "onnx_directml", "cpu"}:
-        backend = installed_backend
+    preferred_backend = normalize_ocr_backend(preferred)
+    if preferred_backend == "auto" and installed_backend in {"paddle_cuda", "onnx_directml", "cpu"}:
+        fallback_from = str(installed_state.get("fallback_from", "") or "").strip().lower()
+        if installed_backend == "cpu" and fallback_from == "paddle_cuda":
+            detected_backend = select_ocr_backend("auto")
+            backend = detected_backend if detected_backend == "paddle_cuda" else installed_backend
+        else:
+            backend = installed_backend
     else:
-        backend = select_ocr_backend(preferred)
+        backend = select_ocr_backend(preferred_backend)
     model_tier = str(config.get("model_tier", config.get("modelTier", "auto")) or "auto").strip().lower()
     if model_tier == "auto":
         installed_tier = str(installed_state.get("model_tier", "") or "").strip().lower()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 from functools import lru_cache
@@ -9,7 +10,8 @@ import numpy as np
 
 from .screen import ImageInput, crop_region, load_image, normalize_box
 
-_OCR_NATIVE_CALL_LOCK = threading.RLock()
+_OCR_NATIVE_CALL_CONDITION = threading.Condition()
+_OCR_NATIVE_ACTIVE_CALLS = 0
 _OCR_ENGINE_INIT_LOCK = threading.RLock()
 
 
@@ -193,6 +195,34 @@ def _runtime_predict_kwargs(config: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
+def _ocr_max_concurrency(config: dict[str, Any]) -> int:
+    for key in ("max_concurrency", "ocr_max_concurrency"):
+        if key not in config:
+            continue
+        try:
+            value = int(config.get(key) or 1)
+        except (TypeError, ValueError):
+            value = 1
+        return min(16, max(1, value))
+    return 1
+
+
+@contextlib.contextmanager
+def _ocr_native_call_slot(max_concurrency: int):
+    global _OCR_NATIVE_ACTIVE_CALLS
+    limit = min(16, max(1, int(max_concurrency or 1)))
+    with _OCR_NATIVE_CALL_CONDITION:
+        while _OCR_NATIVE_ACTIVE_CALLS >= limit:
+            _OCR_NATIVE_CALL_CONDITION.wait()
+        _OCR_NATIVE_ACTIVE_CALLS += 1
+    try:
+        yield
+    finally:
+        with _OCR_NATIVE_CALL_CONDITION:
+            _OCR_NATIVE_ACTIVE_CALLS -= 1
+            _OCR_NATIVE_CALL_CONDITION.notify_all()
+
+
 @lru_cache(maxsize=8)
 def _cached_paddle_engine(cache_key: str) -> Any:
     from paddleocr import PaddleOCR  # type: ignore
@@ -215,12 +245,12 @@ def _get_paddle_engine(config: dict[str, Any]) -> Any:
 
 
 def _predict_with_lock(engine: Any, image: np.ndarray, config: dict[str, Any]) -> Any:
-    with _OCR_NATIVE_CALL_LOCK:
+    with _ocr_native_call_slot(_ocr_max_concurrency(config)):
         return engine.predict(image, **_runtime_predict_kwargs(config))
 
 
 def _legacy_ocr_with_lock(engine: Any, image: Any, config: dict[str, Any]) -> Any:
-    with _OCR_NATIVE_CALL_LOCK:
+    with _ocr_native_call_slot(_ocr_max_concurrency(config)):
         return engine.ocr(image, cls=config.get("cls", True))
 
 

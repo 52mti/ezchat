@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1480" height="1880" viewBox="0 0 1480 1880" role="img" aria-labelledby="title desc">
+  <title id="title">心遇 dialogue 模式识别 / 过滤 / 拼接流程</title>
+  <desc id="desc">展示心遇 dialogue OCR 模式从原始 OCR 框、基础过滤、左右消息判断、按行分组、气泡拼接、对话输出，到心遇读取左侧最后一条消息的完整链路。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#24424f"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#16313a" flood-opacity="0.16"/>
+    </filter>
+    <style>
+      .bg { fill: #f4efe5; }
+      .title { font: 700 34px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #17333b; }
+      .subtitle { font: 400 16px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #5c6b70; }
+      .lane-title { font: 700 18px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #17333b; }
+      .node { filter: url(#shadow); stroke-width: 2; }
+      .start { fill: #1f5a64; stroke: #173f47; }
+      .process { fill: #ffffff; stroke: #78909c; }
+      .ocr { fill: #ecf7f2; stroke: #3f8b72; }
+      .action { fill: #fff2d8; stroke: #d09327; }
+      .decision { fill: #ffffff; stroke: #b36a3c; }
+      .warning { fill: #fff0ef; stroke: #c7564d; }
+      .idle { fill: #eef2ff; stroke: #6477c4; }
+      .end { fill: #263943; stroke: #17333b; }
+      .node-text { font: 600 16px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #17333b; text-anchor: middle; dominant-baseline: middle; }
+      .node-sub { font: 400 13px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #4d6067; text-anchor: middle; dominant-baseline: middle; }
+      .white-text { fill: #ffffff; }
+      .edge { fill: none; stroke: #24424f; stroke-width: 2.4; marker-end: url(#arrow); }
+      .edge-soft { fill: none; stroke: #6f7d83; stroke-width: 2; stroke-dasharray: 7 7; marker-end: url(#arrow); }
+      .label { font: 700 13px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #24424f; paint-order: stroke; stroke: #f4efe5; stroke-width: 5; stroke-linejoin: round; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1480" height="1880"/>
+  <text class="title" x="740" y="56" text-anchor="middle">心遇 dialogue 模式识别 / 过滤 / 拼接流程</text>
+  <text class="subtitle" x="740" y="86" text-anchor="middle">对应 apps/xinyu/ocr_config.py 的 dialogue 配置与 vision/ocr_rules.py 中 build_dialogue_result 的真实处理顺序</text>
+
+  <rect x="54" y="116" width="320" height="38" rx="19" fill="#e5ecf8" stroke="#b8c4df"/>
+  <text class="lane-title" x="214" y="140" text-anchor="middle">原始识别与基础过滤</text>
+  <rect x="450" y="116" width="470" height="38" rx="19" fill="#e3f3eb" stroke="#a8d0bd"/>
+  <text class="lane-title" x="685" y="140" text-anchor="middle">按行分组与气泡拼接</text>
+  <rect x="1010" y="116" width="410" height="38" rx="19" fill="#fff0d9" stroke="#dbba83"/>
+  <text class="lane-title" x="1215" y="140" text-anchor="middle">输出结构与心遇后处理</text>
+
+  <!-- Main chain -->
+  <g>
+    <rect class="node start" x="540" y="182" width="290" height="64" rx="22"/>
+    <text class="node-text white-text" x="685" y="214">进入 dialogue 模式识别</text>
+  </g>
+  <g>
+    <rect class="node ocr" x="505" y="288" width="360" height="98" rx="18"/>
+    <text class="node-text" x="685" y="314">1. OCR 原始框转识别条目</text>
+    <text class="node-sub" x="685" y="340">和 list 一样先统一旋转、清洗文本、计算上下左右与中心点坐标</text>
+    <text class="node-sub" x="685" y="362">同时记录背景颜色特征，供消息归属判断与调试使用</text>
+  </g>
+  <g>
+    <rect class="node process" x="505" y="428" width="360" height="146" rx="18"/>
+    <text class="node-text" x="685" y="454">2. 基础识别条目过滤</text>
+    <text class="node-sub" x="685" y="480">剔除：low_confidence、box_too_short、time_text、debug_text、reward_text</text>
+    <text class="node-sub" x="685" y="502">还会看：ocr_result_excluded_keywords、too_far_right、too_wide、low_confidence_single_char</text>
+    <text class="node-sub" x="685" y="524">以及 right_narrow_non_cjk、non_cjk 等规则</text>
+    <text class="node-sub" x="685" y="546">命中过滤的框会标记为合并前排除，并写进调试排除列表</text>
+  </g>
+  <g>
+    <rect class="node action" x="505" y="616" width="360" height="96" rx="18"/>
+    <text class="node-text" x="685" y="642">3. 判断消息归属</text>
+    <text class="node-sub" x="685" y="668">心遇当前按位置判断，把文本框分成左侧消息和右侧消息</text>
+    <text class="node-sub" x="685" y="690">每个候选框会保留归属标记，再进入后续分组</text>
+  </g>
+  <g>
+    <rect class="node process" x="505" y="754" width="360" height="90" rx="18"/>
+    <text class="node-text" x="685" y="780">4. 按行分组</text>
+    <text class="node-sub" x="685" y="806">按纵向距离分组，把同一高度附近的框归成一行</text>
+    <text class="node-sub" x="685" y="828">每一组再按顺序拼成一行文本</text>
+  </g>
+  <g>
+    <rect class="node decision" x="555" y="888" width="260" height="90" rx="20"/>
+    <text class="node-text" x="685" y="916">4.5 行级截断？</text>
+    <text class="node-sub" x="685" y="942">命中 line_and_below_keywords 时，当前行和它下面所有行都不再算聊天内容</text>
+  </g>
+  <g>
+    <rect class="node action" x="505" y="1018" width="360" height="124" rx="18"/>
+    <text class="node-text" x="685" y="1044">5. 候选框拼成聊天气泡</text>
+    <text class="node-sub" x="685" y="1070">遍历过滤后的框，只有归属相同、上下距离够近、横向列位置接近时才并到同一气泡</text>
+    <text class="node-sub" x="685" y="1092">拼接时保留原始片段，并持续更新边界</text>
+    <text class="node-sub" x="685" y="1114">这一步决定多行同一气泡会不会被并成一条对话</text>
+  </g>
+  <g>
+    <rect class="node action" x="505" y="1184" width="360" height="110" rx="18"/>
+    <text class="node-text" x="685" y="1210">6. 气泡生成对话列表</text>
+    <text class="node-sub" x="685" y="1236">对每个气泡按从上到下、从左到右顺序拼出完整内容</text>
+    <text class="node-sub" x="685" y="1258">再检查行级排除词；命中则整条对话丢弃</text>
+    <text class="node-sub" x="685" y="1280">保留下来的条目输出为消息归属与消息内容</text>
+  </g>
+  <g>
+    <rect class="node end" x="520" y="1336" width="330" height="78" rx="22"/>
+    <text class="node-text white-text" x="685" y="1364">dialogue 结构化输出</text>
+    <text class="node-sub white-text" x="685" y="1388">输出用户名、对话列表和调试排除结果</text>
+  </g>
+
+  <!-- Left lane -->
+  <g>
+    <rect class="node process" x="64" y="242" width="300" height="122" rx="18"/>
+    <text class="node-text" x="214" y="272">心遇 dialogue 配置重点</text>
+    <text class="node-sub" x="214" y="298">min_confidence=0.30，min_box_height_ratio=0.02</text>
+    <text class="node-sub" x="214" y="320">行分组间距 24，气泡合并间距 70</text>
+    <text class="node-sub" x="214" y="342">当前按左右位置判断消息归属</text>
+  </g>
+  <g>
+    <rect class="node idle" x="64" y="420" width="300" height="168" rx="18"/>
+    <text class="node-text" x="214" y="450">这版心遇最关键的改动</text>
+    <text class="node-sub" x="214" y="476">已关闭纵向中心区域限制</text>
+    <text class="node-sub" x="214" y="498">也就是说不会再因为对话区域上方或下方限制而丢内容</text>
+    <text class="node-sub" x="214" y="520">之前你看到的合并前排除 + 对话区域上方，已经属于旧路径</text>
+    <text class="node-sub" x="214" y="542">现在如果还有丢失，更多是其他基础过滤条件命中</text>
+    <text class="node-sub" x="214" y="564">比如短框、非中文噪声、过度靠右等</text>
+  </g>
+  <g>
+    <rect class="node warning" x="64" y="642" width="300" height="164" rx="18"/>
+    <text class="node-text" x="214" y="672">常见过滤原因</text>
+    <text class="node-sub" x="214" y="698">1. box_too_short：高度太矮</text>
+    <text class="node-sub" x="214" y="720">2. too_far_right / too_wide：位置或宽度异常</text>
+    <text class="node-sub" x="214" y="742">3. low_confidence_single_char：单字低置信</text>
+    <text class="node-sub" x="214" y="764">4. right_narrow_non_cjk / non_cjk：像噪声、时间、图标文字</text>
+    <text class="node-sub" x="214" y="786">这些都会进入调试排除列表，方便排查</text>
+  </g>
+  <g>
+    <rect class="node process" x="64" y="860" width="300" height="132" rx="18"/>
+    <text class="node-text" x="214" y="890">行级排除两种方式</text>
+    <text class="node-sub" x="214" y="916">普通行级排除：只丢当前这条合并后的对话</text>
+    <text class="node-sub" x="214" y="938">向下截断排除：命中后，从当前行开始到下面所有行都截断</text>
+    <text class="node-sub" x="214" y="960">这常用于输入框提示词、推荐灵感等非聊天内容</text>
+    <text class="node-sub" x="214" y="982">如果你发现后半段聊天突然没了，要先看这里</text>
+  </g>
+
+  <!-- Right lane -->
+  <g>
+    <rect class="node process" x="1045" y="258" width="340" height="116" rx="18"/>
+    <text class="node-text" x="1215" y="288">7. 提取用户名</text>
+    <text class="node-sub" x="1215" y="314">最终会从顶部区域额外扫一遍候选文字</text>
+    <text class="node-sub" x="1215" y="336">要求足够靠上、长度合适、包含中文、且不像时间或距离</text>
+    <text class="node-sub" x="1215" y="358">取第一个合格候选作为用户名</text>
+  </g>
+  <g>
+    <rect class="node action" x="1045" y="416" width="340" height="154" rx="18"/>
+    <text class="node-text" x="1215" y="446">8. 心遇读取方式</text>
+    <text class="node-sub" x="1215" y="472">自动化会从对话列表中筛出左侧消息且内容非空的条目</text>
+    <text class="node-sub" x="1215" y="494">只取左侧消息的最后一条，组装成联系人、内容、时间等字段</text>
+    <text class="node-sub" x="1215" y="516">如果左侧消息一条都没有，就会抛出步骤不可用异常</text>
+    <text class="node-sub" x="1215" y="538">这就是心遇进入详情页后真正送给 AI 的内容来源</text>
+  </g>
+  <g>
+    <rect class="node action" x="1045" y="620" width="340" height="150" rx="18"/>
+    <text class="node-text" x="1215" y="650">9. 左右消息的含义</text>
+    <text class="node-sub" x="1215" y="676">对心遇当前规则来说，左边气泡通常判成对方消息，右边气泡通常判成自己消息</text>
+    <text class="node-sub" x="1215" y="698">所以“取左侧最后一条”本质上是在取对方最后一句</text>
+    <text class="node-sub" x="1215" y="720">如果聊天界面左右布局变了，最先要检查的是归属判断规则与分界线</text>
+    <text class="node-sub" x="1215" y="742">不是先去改 AI 或发送逻辑</text>
+  </g>
+  <g>
+    <rect class="node warning" x="1045" y="822" width="340" height="184" rx="18"/>
+    <text class="node-text" x="1215" y="852">你最常遇到的两类丢消息</text>
+    <text class="node-sub" x="1215" y="878">1. item 还没进入 merged，就被基础过滤掉了</text>
+    <text class="node-sub" x="1215" y="900">先看合并前排除，对应短框、非中文噪声、过度靠右等</text>
+    <text class="node-sub" x="1215" y="922">2. item 保住了，但在行级或 dialogue 级被截断 / 排除</text>
+    <text class="node-sub" x="1215" y="944">再看是不是命中了向下截断、截断后排除或普通行级排除</text>
+    <text class="node-sub" x="1215" y="966">所以排查顺序要先看合并前排除，再看行级排除</text>
+    <text class="node-sub" x="1215" y="988">不要一上来就改左右消息判断</text>
+  </g>
+  <g>
+    <rect class="node idle" x="1045" y="1060" width="340" height="150" rx="18"/>
+    <text class="node-text" x="1215" y="1090">调试建议</text>
+    <text class="node-sub" x="1215" y="1116">1. 先看调试排除列表里的原因分布</text>
+    <text class="node-sub" x="1215" y="1138">2. 再看最终对话列表里的左右消息顺序</text>
+    <text class="node-sub" x="1215" y="1160">3. 最后再核对读取阶段取的是不是左侧最后一条</text>
+    <text class="node-sub" x="1215" y="1182">这样能最快判断问题在过滤、拼接还是读取阶段</text>
+  </g>
+
+  <!-- Arrows -->
+  <path class="edge" d="M685 246 L685 288"/>
+  <path class="edge" d="M685 386 L685 428"/>
+  <path class="edge" d="M685 574 L685 616"/>
+  <path class="edge" d="M685 712 L685 754"/>
+  <path class="edge" d="M685 844 L685 888"/>
+  <path class="edge" d="M685 978 L685 1018"/>
+  <path class="edge" d="M685 1142 L685 1184"/>
+  <path class="edge" d="M685 1294 L685 1336"/>
+
+  <path class="edge-soft" d="M505 338 L364 302"/>
+  <path class="edge-soft" d="M505 512 L364 724"/>
+  <path class="edge-soft" d="M505 932 L364 932"/>
+  <path class="edge-soft" d="M865 352 L1045 316"/>
+  <path class="edge-soft" d="M850 1366 L1045 494"/>
+  <path class="edge-soft" d="M850 1366 L1045 696"/>
+  <text class="label" x="918" y="948">输出对话列表后进入心遇读取</text>
+</svg>

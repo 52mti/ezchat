@@ -338,6 +338,20 @@ def build_dialogue_result(
     line_excluded = _keywords(rules["line_excluded_keywords"])
     line_and_below = _keywords(rules["line_and_below_keywords"])
     excluded_entries: list[dict[str, Any]] = []
+    user_name_top_ratio = float(rules.get("user_name_top_ratio", 0.12))
+    user_name_center_x_min_ratio = float(rules.get("user_name_center_x_min_ratio", 0.0))
+    user_name_center_x_max_ratio = float(rules.get("user_name_center_x_max_ratio", 1.0))
+
+    def is_user_name_candidate(item: dict[str, Any]) -> bool:
+        text = item["text"]
+        return (
+            item["center_y"] <= image_height * user_name_top_ratio
+            and image_width * user_name_center_x_min_ratio <= item["center_x"] <= image_width * user_name_center_x_max_ratio
+            and 2 <= len(text) <= 16
+            and contains_cjk(text)
+            and not looks_like_time_text(text)
+            and not looks_like_distance_text(text)
+        )
 
     def invalid_reason(item: dict[str, Any]) -> str | None:
         text = item["text"]
@@ -358,6 +372,8 @@ def build_dialogue_result(
             return "reward_text"
         if find_keyword(text, result_excluded):
             return "ocr_keyword"
+        if is_user_name_candidate(item):
+            return "user_name"
         if basic["enable_max_x_filter"] and item["max_x"] >= image_width * float(basic["max_x_ratio"]):
             return "too_far_right"
         if basic["enable_max_width_filter"] and item["width"] > image_width * float(basic["max_width_ratio"]):
@@ -545,18 +561,10 @@ def build_dialogue_result(
                 )
             )
 
-    user_name_top_ratio = float(rules.get("user_name_top_ratio", 0.12))
-    user_name_center_x_min_ratio = float(rules.get("user_name_center_x_min_ratio", 0.0))
-    user_name_center_x_max_ratio = float(rules.get("user_name_center_x_max_ratio", 1.0))
     name_candidates = [
         item["text"]
         for item in rule_items
-        if item["center_y"] <= image_height * user_name_top_ratio
-        and image_width * user_name_center_x_min_ratio <= item["center_x"] <= image_width * user_name_center_x_max_ratio
-        and 2 <= len(item["text"]) <= 16
-        and contains_cjk(item["text"])
-        and not looks_like_time_text(item["text"])
-        and not looks_like_distance_text(item["text"])
+        if is_user_name_candidate(item)
     ]
     return {
         "user_name": name_candidates[0] if name_candidates else "",
@@ -830,6 +838,9 @@ def _detect_red_badge_bounds(
     min_aspect_ratio = float(rules.get("red_badge_min_aspect_ratio", 0.55))
     max_aspect_ratio = float(rules.get("red_badge_max_aspect_ratio", 1.8))
     min_circularity = float(rules.get("red_badge_min_circularity", 0.30))
+    enable_white_digit_bonus = bool(rules.get("red_badge_enable_white_digit_bonus", False))
+    white_digit_min_pixels = int(rules.get("red_badge_white_digit_min_pixels", 6))
+    white_digit_bonus_multiplier = float(rules.get("red_badge_white_digit_bonus_multiplier", 1.35))
     mask1 = cv2.inRange(hsv, np.array([0, red_saturation_min, red_value_min]), np.array([14, 255, 255]))
     mask2 = cv2.inRange(hsv, np.array([165, red_saturation_min, red_value_min]), np.array([180, 255, 255]))
     mask = cv2.bitwise_or(mask1, mask2)
@@ -856,6 +867,21 @@ def _detect_red_badge_bounds(
         if circularity < min_circularity:
             continue
         score = area * circularity
+        if enable_white_digit_bonus and white_digit_min_pixels > 0:
+            badge_hsv = hsv[y : y + height, x : x + width]
+            white_mask = cv2.inRange(
+                badge_hsv,
+                np.array([0, 0, int(rules.get("red_badge_white_digit_value_min", 160))]),
+                np.array([180, int(rules.get("red_badge_white_digit_saturation_max", 80)), 255]),
+            )
+            local_contour = contour - np.array([[[x, y]]])
+            contour_mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.drawContours(contour_mask, [local_contour], -1, 255, thickness=cv2.FILLED)
+            white_mask = cv2.bitwise_and(white_mask, contour_mask)
+            white_pixels = int(cv2.countNonZero(white_mask))
+            if white_pixels >= white_digit_min_pixels:
+                white_ratio = white_pixels / max(1, width * height)
+                score *= white_digit_bonus_multiplier + min(1.0, white_ratio * 10.0)
         if score > best_score:
             best_score = score
             best_box = (
@@ -1125,6 +1151,8 @@ def build_list_result(
     top_nav_top = image_height * float(rules["top_nav_top_ratio"])
     top_nav_bottom = image_height * float(rules["top_nav_bottom_ratio"])
     enable_red_badge_detection = bool(rules.get("enable_red_badge_detection", True))
+    left_badge_enable_ocr_fallback = bool(rules.get("left_badge_enable_ocr_fallback", True))
+    left_badge_read_red_badge_number = bool(rules.get("left_badge_read_red_badge_number", True))
     bottom_nav = _build_bottom_nav_result(rule_items, image_size, rules)
     bottom_nav_names = [item["name"] for item in bottom_nav]
     image_array = np.array(load_image(source_image).convert("RGB")) if source_image is not None else None
@@ -1347,7 +1375,11 @@ def build_list_result(
         row_lines = [header_line, *row["content_lines"]]
         next_top = raw_rows[index + 1]["header_line"]["min_y"] if index + 1 < len(raw_rows) else int(image_height * 0.93)
         row_left = max(0, min(line["min_x"] for line in row_lines) - 16)
-        row_top = max(0, header_line["min_y"] - 12)
+        if "row_top_extra_top_ratio" in rules:
+            row_top_extra = int(round(image_height * float(rules["row_top_extra_top_ratio"])))
+        else:
+            row_top_extra = 12
+        row_top = max(0, header_line["min_y"] - row_top_extra)
         row_right = min(image_width, max(max(line["max_x"] for line in row_lines) + 16, image_width - 32))
         detection_row_bottom = min(image_height, max(row["last_max_y"] + 16, next_top - 12))
         content_bottom = row["last_max_y"] + 12
@@ -1459,6 +1491,7 @@ def build_list_result(
             and not unread_candidates
             and not suppress_unread_count
             and not (left_red_badge_force_default and left_red_badge_bounds is not None)
+            and left_badge_enable_ocr_fallback
             and ocr_config is not None
             and source_image is not None
         ):
@@ -1476,6 +1509,7 @@ def build_list_result(
             badge_position == "left"
             and not suppress_unread_count
             and enable_red_badge_detection
+            and left_badge_read_red_badge_number
             and image_array is not None
             and ocr_config is not None
         ):

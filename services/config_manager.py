@@ -10,6 +10,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from apps import resolve_app_name
+
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "schema_version": 1,
@@ -21,6 +23,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "chat_bearer": "",
         "credits_bearer": "",
         "greetings_dir": "runtime/greetings",
+        "ocr_max_concurrency": 1,
         "persona": {
             "requestPersona": "",
             "name": "",
@@ -173,6 +176,15 @@ def _normalize_app_configs(app_configs: dict[str, Any]) -> None:
             _normalize_huanyou_dialogue_rules(str(app_name), app_config)
 
 
+def _normalize_match_threshold(app_config: dict[str, Any]) -> None:
+    try:
+        threshold = float(app_config.get("match_threshold"))
+    except (TypeError, ValueError):
+        return
+    if threshold == 0.85:
+        app_config["match_threshold"] = 0.7
+
+
 def _load_json_dict(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -249,6 +261,7 @@ def _load_app_override_file(app_config_root: Path, app_name: str) -> dict[str, A
     app_level, _, _ = _split_override_scopes(payload)
     _normalize_app_templates(app_name, app_level)
     _normalize_huanyou_dialogue_rules(app_name, app_level)
+    _normalize_match_threshold(app_level)
     return app_level
 
 
@@ -368,6 +381,25 @@ class ConfigManager:
     def _atomic_write(self, path: Path, data: dict[str, Any]) -> None:
         _atomic_write_json(path, data)
 
+    def _config_for_disk(self) -> dict[str, Any]:
+        data = copy.deepcopy(self._config)
+        global_config = data.get("global", {})
+        if isinstance(global_config, dict):
+            global_config.pop("apikey", None)
+        return data
+
+    def _write_config(self) -> None:
+        self._atomic_write(self.config_path, self._config_for_disk())
+
+    def _reload_config_for_write(self) -> None:
+        self._config = self._load_json(self.config_path, DEFAULT_CONFIG)
+        self._normalize_loaded_device_scopes()
+        self._move_config_apikey_to_env()
+        self._apply_environment_overrides()
+
+    def _reload_outbox_for_write(self) -> None:
+        self._outbox = self._load_json(self.outbox_path, DEFAULT_OUTBOX)
+
     def _backup_file(self, path: Path) -> Path | None:
         if not path.exists():
             return None
@@ -382,7 +414,7 @@ class ConfigManager:
         if config_version < CURRENT_SCHEMA_VERSION or legacy_apps_present:
             self._backup_file(self.config_path)
             self._config = self._migrate_config(self._config, config_version, CURRENT_SCHEMA_VERSION)
-            self._atomic_write(self.config_path, self._config)
+            self._write_config()
         if outbox_version < CURRENT_SCHEMA_VERSION:
             self._backup_file(self.outbox_path)
             self._outbox = self._migrate_outbox(self._outbox, outbox_version, CURRENT_SCHEMA_VERSION)
@@ -409,7 +441,7 @@ class ConfigManager:
             }:
                 changed = True
         if changed:
-            self._atomic_write(self.config_path, self._config)
+            self._write_config()
 
     def _move_config_apikey_to_env(self) -> None:
         global_config = self._config.get("global", {})
@@ -418,7 +450,7 @@ class ConfigManager:
         file_apikey = _normalize_secret_value(global_config.pop("apikey", ""))
         if file_apikey and not os.getenv("CHATBOT_APIKEY") and not _read_local_apikey(self.config_path):
             _write_local_apikey(self.config_path, file_apikey)
-        self._atomic_write(self.config_path, self._config)
+        self._write_config()
 
     def _migrate_config(
         self,
@@ -447,7 +479,7 @@ class ConfigManager:
             for device in migrated["devices"]:
                 if not isinstance(device, dict):
                     continue
-                device.setdefault("selected_app", "wechat")
+                device.setdefault("selected_app", resolve_app_name(None))
                 device.setdefault("persona", {})
                 device.setdefault("contact_personas", {})
                 runtime_overrides = device.get("runtime_overrides", {})
@@ -516,6 +548,7 @@ class ConfigManager:
 
     def update_device(self, device_ip: str, updates: dict[str, Any]) -> None:
         with self._lock:
+            self._reload_config_for_write()
             devices = self._config.setdefault("devices", [])
             if not isinstance(devices, list):
                 raise ValueError("devices must be a list")
@@ -531,7 +564,7 @@ class ConfigManager:
                         _apply_scoped_app_overrides(self.app_config_root, device, scoped_app_overrides)
                     _normalize_device_scopes(device)
                     self._config["devices"] = _normalize_devices(devices)
-                    self._atomic_write(self.config_path, self._config)
+                    self._write_config()
                     return
             new_device = {"ip": device_ip, **raw_updates}
             if isinstance(runtime_updates, dict):
@@ -541,13 +574,14 @@ class ConfigManager:
             _normalize_device_scopes(new_device)
             devices.append(new_device)
             self._config["devices"] = _normalize_devices(devices)
-            self._atomic_write(self.config_path, self._config)
+            self._write_config()
 
     def add_device(self, device: dict[str, Any]) -> bool:
         device_ip = str(device.get("ip", "")).strip()
         if not device_ip:
             raise ValueError("device ip is required")
         with self._lock:
+            self._reload_config_for_write()
             devices = self._config.setdefault("devices", [])
             if not isinstance(devices, list):
                 raise ValueError("devices must be a list")
@@ -558,7 +592,7 @@ class ConfigManager:
             _normalize_device_scopes(new_device)
             devices.append(new_device)
             self._config["devices"] = _normalize_devices(devices)
-            self._atomic_write(self.config_path, self._config)
+            self._write_config()
             return True
 
     def remove_device(self, device_ip: str) -> bool:
@@ -566,6 +600,7 @@ class ConfigManager:
         if not device_ip:
             return False
         with self._lock:
+            self._reload_config_for_write()
             devices = self._config.get("devices", [])
             if not isinstance(devices, list):
                 return False
@@ -577,7 +612,7 @@ class ConfigManager:
             if len(remaining) == len(devices):
                 return False
             self._config["devices"] = _normalize_devices(remaining)
-            self._atomic_write(self.config_path, self._config)
+            self._write_config()
             return True
 
     def get_app_config(
@@ -654,11 +689,12 @@ class ConfigManager:
         if not keys:
             raise ValueError("at least one key is required")
         with self._lock:
+            self._reload_config_for_write()
             if keys == ("global", "apikey"):
                 apikey = str(value or "").strip()
                 _write_local_apikey(self.config_path, apikey)
                 self._config.setdefault("global", {}).pop("apikey", None)
-                self._atomic_write(self.config_path, self._config)
+                self._write_config()
                 if apikey:
                     self._config.setdefault("global", {})["apikey"] = apikey
                 return
@@ -668,13 +704,14 @@ class ConfigManager:
                 if not isinstance(current, dict):
                     raise ValueError(f"cannot set nested key under non-dict: {key}")
             current[keys[-1]] = value
-            self._atomic_write(self.config_path, self._config)
+            self._write_config()
 
     def save_outbox_entry(self, entry: dict[str, Any]) -> None:
         fingerprint = entry.get("message_fingerprint")
         if not fingerprint:
             raise ValueError("outbox entry requires message_fingerprint")
         with self._lock:
+            self._reload_outbox_for_write()
             messages = self._outbox.setdefault("messages", [])
             for index, existing in enumerate(messages):
                 if existing.get("message_fingerprint") == fingerprint:

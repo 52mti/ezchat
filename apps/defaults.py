@@ -8,6 +8,7 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "poll_interval": 1,
     "keep_awake_interval_seconds": 200,
     "exclude_ocr_wait_from_step_timeout": True,
+    "ocr_max_concurrency": 1,
 }
 
 DEFAULT_REQUEST_PERSONA_ID = "REMOVED-BEARER-TOKEN"
@@ -23,6 +24,7 @@ DEFAULT_PERSONA_CONFIG: dict[str, Any] = {
 
 DEFAULT_APP_CONFIG: dict[str, Any] = {
     **DEFAULT_RUNTIME_CONFIG,
+    "match_threshold": 0.7,
     "persona": DEFAULT_PERSONA_CONFIG,
 }
 

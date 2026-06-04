@@ -71,7 +71,7 @@ class MessageProcessor:
 
         existing = find_outbox_entry(self.config_manager.load_outbox(), fingerprint)
         if existing and existing.get("pending_send") and existing.get("pending_reply_text"):
-            self._log("info", "using pending reply", {"fingerprint": fingerprint})
+            self._log("info", "using pending reply", {"fingerprint": fingerprint, "contact": contact, "content": content})
             return ReplyAction(
                 text=str(existing["pending_reply_text"]),
                 message_fingerprint=fingerprint,

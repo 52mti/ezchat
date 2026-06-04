@@ -33,6 +33,128 @@ def test_effective_backend_config_prefers_installed_runtime_state(tmp_path, monk
     assert model_tier == "lite"
 
 
+def test_effective_backend_config_retries_gpu_after_cpu_fallback_state(tmp_path, monkeypatch):
+    state_path = tmp_path / "runtime" / "install_state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "installed",
+                "validation": "ok",
+                "backend": "cpu",
+                "fallback_from": "paddle_cuda",
+                "model_tier": "lite",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(runtime_module, "_runtime_state_path", lambda project_root=None: state_path)
+    monkeypatch.setattr(runtime_module, "select_ocr_backend", lambda preferred_backend, hardware=None: "paddle_cuda")
+
+    backend, model_tier = runtime_module._effective_backend_config({"backend": "auto", "model_tier": "auto"})
+
+    assert backend == "paddle_cuda"
+    assert model_tier == "lite"
+
+
+def test_subprocess_runtime_uses_legacy_state_python_when_backend_runtime_missing(tmp_path, monkeypatch):
+    state_path = tmp_path / "runtime" / "install_state.json"
+    state_path.parent.mkdir(parents=True)
+    legacy_python = tmp_path / ".runtime_env" / "Scripts" / "python.exe"
+    legacy_python.parent.mkdir(parents=True)
+    legacy_python.write_text("python", encoding="utf-8")
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "installed",
+                "validation": "ok",
+                "backend": "paddle_cuda",
+                "runtime_name": "legacy",
+                "python_executable": str(legacy_python),
+                "runtime_path": str(legacy_python.parents[1]),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(runtime_module, "_runtime_state_path", lambda project_root=None: state_path)
+    monkeypatch.setattr(runtime_module, "_package_root", lambda project_root=None: tmp_path)
+    monkeypatch.setattr(runtime_module, "runtime_python", lambda root, runtime_name, gui=False: tmp_path / "runtime" / runtime_name / "python.exe")
+
+    engine = runtime_module.SubprocessOcrRuntimeEngine(
+        backend="paddle_cuda",
+        model_tier="lite",
+        manifest=runtime_module.load_runtime_manifest(),
+        config={},
+    )
+
+    assert engine._runtime_python_path() == legacy_python
+
+
+def test_subprocess_runtime_start_uses_backend_env_and_cache_home(tmp_path, monkeypatch):
+    state_path = tmp_path / "runtime" / "install_state.json"
+    state_path.parent.mkdir(parents=True)
+    cache_home = tmp_path / "runtime" / ".paddlex"
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "installed",
+                "validation": "ok",
+                "backend": "paddle_cuda",
+                "cache_home": str(cache_home),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    runtime_python = tmp_path / "runtime" / "ocr_nvidia" / "python.exe"
+    scripts_dir = runtime_python.parent / "Scripts"
+    scripts_dir.mkdir(parents=True)
+    runtime_python.write_text("python", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = list(command)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProcess()
+
+    monkeypatch.setattr(runtime_module, "_runtime_state_path", lambda project_root=None: state_path)
+    monkeypatch.setattr(runtime_module, "_package_root", lambda project_root=None: tmp_path)
+    monkeypatch.setattr(runtime_module, "runtime_python", lambda root, runtime_name, gui=False: runtime_python)
+    monkeypatch.setattr(runtime_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(runtime_module.subprocess, "STARTUPINFO", lambda: type("StartupInfo", (), {"dwFlags": 0})())
+    monkeypatch.setattr(runtime_module.subprocess, "STARTF_USESHOWWINDOW", 1, raising=False)
+
+    engine = runtime_module.SubprocessOcrRuntimeEngine(
+        backend="paddle_cuda",
+        model_tier="lite",
+        manifest=runtime_module.load_runtime_manifest(),
+        config={},
+    )
+
+    process = engine._start_process()
+    env = captured["env"]
+
+    assert process is not None
+    assert captured["command"][0] == str(runtime_python)
+    assert env["PADDLE_PDX_CACHE_HOME"] == str(cache_home)
+    assert env["PADDLEX_HOME"] == str(cache_home)
+    assert env["PYTHONNOUSERSITE"] == "1"
+    assert str(runtime_python.parent) in env["PATH"]
+    assert str(scripts_dir) in env["PATH"]
+
+
 def test_load_installed_runtime_state_rejects_invalid_status(tmp_path, monkeypatch):
     state_path = tmp_path / "runtime" / "install_state.json"
     state_path.parent.mkdir(parents=True)

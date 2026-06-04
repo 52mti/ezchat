@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -58,8 +59,11 @@ def _preload_ocr_runtime() -> str:
         return ""
     if str(state.get("validation", "")).strip().lower() != "ok":
         return ""
+    backend = state.get("backend", "auto")
+    if str(backend).strip().lower() == "cpu" and str(state.get("fallback_from", "") or "").strip().lower() == "paddle_cuda":
+        backend = "auto"
     config = {
-        "backend": state.get("backend", "auto"),
+        "backend": backend,
         "model_tier": state.get("model_tier", "auto"),
     }
     execution_mode = str(state.get("execution_mode", "") or "").strip()
@@ -76,11 +80,15 @@ def main() -> int:
     cleanup_old_error_captures(retention_days=_log_retention_days(config_manager), max_files=200)
     try:
         _preload_ocr_runtime()
+    except Exception:
+        logging.getLogger(__name__).exception("OCR runtime preload failed; continuing startup")
+    try:
         return run_app(sys.argv)
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
-        _show_startup_error(f"OCR runtime preload failed: {exc}")
+        logging.getLogger(__name__).exception("Main UI startup failed")
+        _show_startup_error(f"Main UI startup failed: {exc}")
         return 1
 
 

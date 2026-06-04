@@ -131,7 +131,7 @@ class BaseApp:
             self.recover_error_count = 0
         except Exception as recover_exc:
             self.recover_error_count += 1
-            self.status.last_error = f"{self.status.last_error}; recover failed: {recover_exc}"
+            self.status.last_error = f"{self.status.last_error}；设备复位失败：{recover_exc}"
             if self.recover_error_count >= self.recover_failure_limit:
                 self.status.is_circuit_open = True
 

@@ -42,6 +42,7 @@ class XinyuApp(BaseApp):
         self.sent_callback = sent_callback
         self.last_activity_at = time.monotonic()
         self.idle_points_checked = False
+        self._last_selected_signature: tuple[str, str, int] | None = None
 
     def _mark_activity(self) -> None:
         self.last_activity_at = time.monotonic()
@@ -62,7 +63,7 @@ class XinyuApp(BaseApp):
             try:
                 did_keep_awake = steps.keep_screen_awake(self.robot, self.config, reporter=reporter)
             except Exception as keep_awake_exc:
-                self.emit_runtime_log("warning", "keep_awake_failed", {"error": str(keep_awake_exc)})
+                self.emit_runtime_log("warning", "防熄屏失败", {"error": str(keep_awake_exc)})
             else:
                 if did_keep_awake:
                     self._mark_activity()
@@ -74,7 +75,7 @@ class XinyuApp(BaseApp):
         try:
             points = steps.read_my_points(self.robot, self.config, reporter=reporter)
         except Exception as points_exc:
-            self.emit_runtime_log("warning", "xinyu_balance_failed", {"error": str(points_exc)})
+            self.emit_runtime_log("warning", "心遇余额读取失败", {"error": str(points_exc)})
             return
         if points:
             balance = self._balance_from_points(points)
@@ -141,6 +142,22 @@ class XinyuApp(BaseApp):
                     "content": target.get("content", ""),
                 },
             )
+            target_signature = (
+                str(target.get("name", "") or "").strip(),
+                self._clean_content(target.get("content", "")),
+                int(target.get("unread_count") or 0),
+            )
+            if self._last_selected_signature == target_signature:
+                self.emit_runtime_log(
+                    "warning",
+                    "心遇重复选中同一会话",
+                    {
+                        "name": target_signature[0],
+                        "content": target_signature[1],
+                        "unread_count": target_signature[2],
+                    },
+                )
+            self._last_selected_signature = target_signature
             if self._is_empty_list_target(target):
                 reporter("empty_list_target", "暂无消息，本轮不进入聊天")
                 self._run_idle_maintenance(reporter)
@@ -211,6 +228,15 @@ class XinyuApp(BaseApp):
                 finally:
                     executor.shutdown(wait=False, cancel_futures=True)
                 action = raw_action if isinstance(raw_action, ReplyAction) else ReplyAction(text=str(raw_action))
+                if action.reason == "pending_send":
+                    self.emit_runtime_log(
+                        "warning",
+                        "心遇复用待发送回复",
+                        {
+                            "contact": message.get("contact", ""),
+                            "content": message.get("content", ""),
+                        },
+                    )
 
             self.emit_runtime_log(
                 "info",
@@ -229,7 +255,7 @@ class XinyuApp(BaseApp):
                 self.mark_success()
                 return
             if not action.text:
-                raise RuntimeError("reply provider returned empty text")
+                raise RuntimeError("回复内容为空，未生成可发送文本")
 
             if not input_focused:
                 steps.focus_input_box(self.robot, self.config, reporter=reporter)
@@ -238,11 +264,31 @@ class XinyuApp(BaseApp):
             self._mark_activity()
             send_clicks = steps.send_reply(self.robot, self.config, reporter=reporter)
             self.emit_runtime_log("info", "xinyu_send_clicks", {"clicks": send_clicks})
+            if send_clicks > 1:
+                self.emit_runtime_log(
+                    "warning",
+                    "心遇发送按钮被连续点击",
+                    {
+                        "contact": message.get("contact", ""),
+                        "clicks": send_clicks,
+                    },
+                )
             self._mark_activity()
             if self.sent_callback:
                 reporter("mark_sent", "记录发送结果")
                 self.sent_callback(action, message)
-            steps.go_back(self.robot, self.config, double_click_on_first_attempt=True, reporter=reporter)
+            try:
+                steps.go_back(self.robot, self.config, double_click_on_first_attempt=True, reporter=reporter)
+            except Exception:
+                self.emit_runtime_log(
+                    "warning",
+                    "心遇发送后未能返回列表",
+                    {
+                        "contact": message.get("contact", ""),
+                        "content": message.get("content", ""),
+                    },
+                )
+                raise
             self._mark_activity()
             reporter("wait_next_round", "等待下一轮扫描")
             self.record_reply_round(time.monotonic() - round_started_at)
@@ -252,12 +298,12 @@ class XinyuApp(BaseApp):
             self.status.last_error = str(exc)
             self.status.is_circuit_open = False
             self.recover_error_count = 0
-            self.emit_runtime_log("warning", "no_phone_detected", {"error": str(exc)})
+            self.emit_runtime_log("warning", "检测到无手机", {"error": str(exc)})
         except steps.BlackScreenError as exc:
             self.set_runtime_step("black_screen_waiting", "黑屏异常，等待用户亮屏")
             self.status.last_error = str(exc)
             self.status.is_circuit_open = False
             self.recover_error_count = 0
-            self.emit_runtime_log("warning", "black_screen_detected", {"error": str(exc)})
+            self.emit_runtime_log("warning", "检测到黑屏", {"error": str(exc)})
         except Exception as exc:
             self.on_error(exc)

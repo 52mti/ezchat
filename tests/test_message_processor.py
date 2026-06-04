@@ -89,6 +89,34 @@ def test_message_processor_replies_for_repeated_message(tmp_path):
     assert ai.calls == 2
 
 
+def test_message_processor_logs_pending_reply_with_contact_and_content(tmp_path):
+    config = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    ai = FakeAI()
+    logs = []
+    processor = MessageProcessor(
+        device={"ip": "1.1.1.1"},
+        app_name="wechat",
+        config_manager=config,
+        ai_client=ai,  # type: ignore[arg-type]
+        memory_store=MemoryStore(tmp_path / "memory"),
+        logger=lambda level, message, payload=None: logs.append((level, message, payload)),
+    )
+    message = {"contact": "张三", "content": "你好", "message_time": "12:00"}
+    action = processor.prepare_reply(message)
+    assert action.text == "回复"
+
+    second = processor.prepare_reply(message)
+
+    assert second.reason == "pending_send"
+    assert any(
+        msg == "using pending reply"
+        and payload is not None
+        and payload.get("contact") == "张三"
+        and payload.get("content") == "你好"
+        for _, msg, payload in logs
+    )
+
+
 def test_message_processor_uses_app_scoped_persona(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(

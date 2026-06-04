@@ -43,7 +43,7 @@ def _config(tmp_path: Path) -> dict[str, object]:
 
 def test_xinyu_read_my_points_clicks_my_reads_points_and_returns_message(monkeypatch, tmp_path):
     config = _config(tmp_path)
-    robot = FakeRobot(["list", "my", "list"])
+    robot = FakeRobot(["list", "list", "my", "list"])
     seen_modes: list[str] = []
 
     def fake_match(image, template, threshold=0.85):

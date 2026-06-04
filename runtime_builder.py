@@ -911,6 +911,45 @@ def _install_package_specs(
         _run_checked_command(command, stage=stage, cwd=_package_root(), env=env)
 
 
+def _uninstall_conflicting_paddle_backend(python_exe: Path, backend_key: str, *, dry_run: bool) -> None:
+    if backend_key == "paddle_cuda":
+        specs = ["paddlepaddle"]
+    elif backend_key == "cpu":
+        specs = ["paddlepaddle-gpu"]
+    else:
+        return
+    command = [str(python_exe), "-m", "pip", "uninstall", "-y", *specs]
+    if dry_run:
+        print(" ".join(command))
+        return
+    completed = subprocess.run(
+        command,
+        cwd=_package_root(),
+        env=_pip_env(python_exe),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        check=False,
+    )
+    if completed.returncode not in {0, 1}:
+        log_path = _write_command_log(
+            stage=f"uninstall_conflicting_{specs[0]}",
+            command=command,
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+        raise CommandExecutionError(
+            f"uninstall_conflicting_{specs[0]}",
+            command,
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            log_path,
+        )
+
+
 def _pip_install_specs(
     python_exe: Path,
     specs: list[str],
@@ -1215,6 +1254,7 @@ def _install_backend_runtime(
     _install_common_dependencies(python_exe=python_executable, manifest=manifest, dry_run=dry_run)
     if backend_key in {"paddle_cuda", "cpu"}:
         _install_shared_runtime_dependencies(python_exe=python_executable, manifest=manifest, dry_run=dry_run)
+        _uninstall_conflicting_paddle_backend(python_executable, backend_key, dry_run=dry_run)
     _install_package_specs(python_exe=python_executable, package_specs=runtime_plan, dry_run=dry_run)
 
     ocr_device = ""

@@ -42,6 +42,11 @@ class HuanyouApp(BaseApp):
         self._input_box_opened = False
         self.idle_points_checked = False
         self.idle_waiting = False
+        self._last_step_detail = ""
+
+    def _reporter(self, step: str, label: str, log_label: str | None = None) -> None:
+        self._last_step_detail = str(log_label or label or step)
+        self.set_runtime_step(step, label, log_label=log_label)
 
     def _mark_activity(self) -> None:
         self.last_activity_at = time.monotonic()
@@ -83,7 +88,7 @@ class HuanyouApp(BaseApp):
         reporter: Callable[..., None],
         image: Any | None = None,
         expected_name: str | None = None,
-    ) -> tuple[Any, bool]:
+    ) -> tuple[Any, bool, bool]:
         chat_image = image if image is not None else steps.confirm_chat_window(self.robot, self.config, reporter=reporter)
         chat_image, quick_greeting_count, stopped_without_next = steps.consume_new_greetings(
             self.robot,
@@ -96,7 +101,7 @@ class HuanyouApp(BaseApp):
             self.emit_runtime_log("info", "huanyou_new_greetings", {"count": quick_greeting_count})
             self._mark_activity()
         if stopped_without_next:
-            return chat_image, True
+            return chat_image, True, bool(quick_greeting_count)
 
         time.sleep(float(self.config.get("chat_window_scroll_settle_seconds", 0.6) or 0.6))
         swipe_start, swipe_end = steps.scroll_chat_window(self.robot, self.config, reporter=reporter)
@@ -110,7 +115,7 @@ class HuanyouApp(BaseApp):
         )
         self._mark_activity()
         chat_image = steps.confirm_chat_window(self.robot, self.config, reporter=reporter)
-        return chat_image, False
+        return chat_image, False, bool(quick_greeting_count)
 
     def _greeting_path(self) -> Path:
         runtime = self.config.get("runtime", {})
@@ -219,17 +224,43 @@ class HuanyouApp(BaseApp):
             self.sent_callback(action, message)
         return True
 
+    def _advance_to_next_chat(
+        self,
+        reporter: Callable[..., None],
+        *,
+        current_name: str,
+    ) -> tuple[Any, str, int, tuple[float, float] | None]:
+        chat_image, next_name, next_clicks, next_name_point = steps.click_next_message_until_changed(
+            self.robot,
+            self.config,
+            expected_name=current_name,
+            reporter=reporter,
+        )
+        self.emit_runtime_log(
+            "info",
+            "huanyou_next_chat_verified",
+            {
+                "previous_name": current_name,
+                "current_name": next_name,
+                "clicks": next_clicks,
+            },
+        )
+        return chat_image, next_name, next_clicks, next_name_point
+
     def _handle_step_unavailable(self, exc: steps.StepUnavailable) -> None:
         self.status.error_count += 1
         self.status.last_error = str(exc)
         self._save_error_capture()
         self.recover_error_count = 0
+        step_detail = self._last_step_detail or self.status.current_step_label or self.status.current_step
+        message = f"欢友步骤不可用：{step_detail} -> {exc}" if step_detail else f"欢友步骤不可用：{exc}"
         self.emit_runtime_log(
             "warning",
-            f"huanyou_step_unavailable: {exc}",
+            message,
             {
                 "step": self.status.current_step,
                 "label": self.status.current_step_label,
+                "detail": step_detail,
                 "error": str(exc),
             },
         )
@@ -240,7 +271,7 @@ class HuanyouApp(BaseApp):
         if self.status.is_circuit_open:
             return
         try:
-            reporter = self.set_runtime_step
+            reporter = self._reporter
             if self.idle_waiting:
                 target = steps.rescan_unread_target(self.robot, self.config, reporter=reporter)
             else:
@@ -278,12 +309,15 @@ class HuanyouApp(BaseApp):
             self._mark_activity()
 
             current_target = dict(target)
-            chat_image, stopped_without_next = self._prepare_chat_window(reporter, expected_name=current_name)
+            chat_image, stopped_without_next, advanced_by_greetings = self._prepare_chat_window(reporter, expected_name=current_name)
             if stopped_without_next:
                 steps.go_back(self.robot, self.config, reporter=reporter)
                 self.record_reply_round(time.monotonic() - round_started_at)
                 self.mark_success()
                 return
+            if advanced_by_greetings:
+                current_name = steps.read_chat_contact_name(self.robot, self.config, image=chat_image, reporter=reporter) or current_name
+                current_target["name"] = current_name
 
             while True:
                 message = steps.read_message(self.robot, self.config, current_target, image=chat_image, reporter=reporter)
@@ -297,14 +331,12 @@ class HuanyouApp(BaseApp):
                 input_box_opened = self._send_action(reporter, action, message)
 
                 try:
-                    chat_image, next_name, next_clicks = steps.click_next_message_until_changed(
-                        self.robot,
-                        self.config,
-                        expected_name=current_name,
-                        reporter=reporter,
+                    chat_image, next_name, _next_clicks, next_name_point = self._advance_to_next_chat(
+                        reporter,
+                        current_name=current_name,
                     )
                 except steps.StepUnavailable as exc:
-                    if "next message button was not found" not in str(exc):
+                    if "下一条按钮" not in str(exc):
                         raise
                     self.emit_runtime_log(
                         "info",
@@ -318,19 +350,14 @@ class HuanyouApp(BaseApp):
                     self.mark_success()
                     return
 
-                self.emit_runtime_log(
-                    "info",
-                    "huanyou_next_chat_verified",
-                    {
-                        "previous_name": current_name,
-                        "current_name": next_name,
-                        "clicks": next_clicks,
-                    },
-                )
-
                 prepare_image = chat_image
                 if input_box_opened:
-                    retract_x, retract_y = steps.retract_input_box(self.robot, self.config, reporter=reporter)
+                    retract_x, retract_y = steps.retract_input_box(
+                        self.robot,
+                        self.config,
+                        reporter=reporter,
+                        click_point=next_name_point,
+                    )
                     self.emit_runtime_log(
                         "info",
                         "huanyou_input_box_retracted",
@@ -345,7 +372,7 @@ class HuanyouApp(BaseApp):
                     current_name = next_name
                 current_target = dict(current_target)
                 current_target["name"] = current_name
-                chat_image, stopped_without_next = self._prepare_chat_window(
+                chat_image, stopped_without_next, advanced_by_greetings = self._prepare_chat_window(
                     reporter,
                     image=prepare_image,
                     expected_name=None,
@@ -357,6 +384,21 @@ class HuanyouApp(BaseApp):
                     self.record_reply_round(time.monotonic() - round_started_at)
                     self.mark_success()
                     return
+                if advanced_by_greetings:
+                    current_name = steps.read_chat_contact_name(self.robot, self.config, image=chat_image, reporter=reporter) or current_name
+                    current_target["name"] = current_name
+        except steps.NoPhoneScreenError as exc:
+            self.set_runtime_step("no_phone_waiting", "无手机异常，停止进程")
+            self.status.last_error = str(exc)
+            self.status.is_circuit_open = True
+            self.recover_error_count = 0
+            self.emit_runtime_log("warning", "no_phone_detected", {"error": str(exc)})
+        except steps.BlackScreenError as exc:
+            self.set_runtime_step("black_screen_waiting", "黑屏异常，等待亮屏")
+            self.status.last_error = str(exc)
+            self.status.is_circuit_open = False
+            self.recover_error_count = 0
+            self.emit_runtime_log("warning", "black_screen_detected", {"error": str(exc)})
         except steps.StepUnavailable as exc:
             self._handle_step_unavailable(exc)
         except Exception as exc:

@@ -171,6 +171,81 @@ def test_xinyu_ensure_list_screen_raises_on_no_phone_screen(monkeypatch, tmp_pat
     assert robot.clicks == []
 
 
+def test_xinyu_ensure_list_screen_prioritizes_returning_to_list_before_popup_scan(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["chat", "list"])
+    capture_labels: list[str] = []
+
+    def fake_capture(robot, config, pre_move=True, label="screen"):
+        capture_labels.append(label)
+        return robot.get_transform_image()
+
+    monkeypatch.setattr(steps, "capture_transform_image", fake_capture)
+    monkeypatch.setattr(
+        steps,
+        "capture_after_popups",
+        lambda robot, config, label="screen", max_dismiss=2, reporter=None: (
+            capture_labels.append(label) or robot.get_transform_image()
+        ),
+    )
+    monkeypatch.setattr(
+        steps,
+        "_matches_screen",
+        lambda image, config, key: (image == "chat" and key == steps.CHAT_WINDOW_SCREEN)
+        or (image == "list" and key == steps.CHAT_LIST_SCREEN),
+    )
+    monkeypatch.setattr(
+        steps,
+        "_template_center",
+        lambda image, config, key, group="buttons": (0.15, 0.15)
+        if image == "chat" and key == steps.BACK_BUTTON and group == "buttons"
+        else None,
+    )
+
+    image = steps.ensure_list_screen(robot, config)
+
+    assert image == "list"
+    assert capture_labels[0] == "startup_screen_detect"
+    assert "confirm_list" not in capture_labels
+    assert robot.clicks == [pytest.approx((0.15, 0.15))]
+
+
+def test_xinyu_ensure_list_screen_reports_back_clicked_but_not_returned(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["chat", "still_chat"])
+
+    monkeypatch.setattr(steps, "capture_transform_image", lambda robot, cfg, pre_move=True, label="screen": robot.get_transform_image())
+    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None: robot.get_transform_image())
+    monkeypatch.setattr(
+        steps,
+        "_matches_screen",
+        lambda image, config, key: (image == "chat" and key == steps.CHAT_WINDOW_SCREEN)
+        or (image == "still_chat" and key == steps.CHAT_WINDOW_SCREEN),
+    )
+    monkeypatch.setattr(
+        steps,
+        "_template_center",
+        lambda image, config, key, group="buttons": (0.15, 0.15)
+        if image == "chat" and key == steps.BACK_BUTTON and group == "buttons"
+        else None,
+    )
+    monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(steps.StepUnavailable, match="已点击返回按钮，但未回到聊天列表"):
+        steps.ensure_list_screen(robot, config)
+
+
+def test_xinyu_ensure_list_screen_reports_unknown_screen_back_failure(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["unknown"])
+
+    monkeypatch.setattr(steps, "capture_transform_image", lambda robot, cfg, pre_move=True, label="screen": robot.get_transform_image())
+    monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
+
+    with pytest.raises(steps.StepUnavailable, match="当前界面无法识别，且未找到返回按钮模板"):
+        steps.ensure_list_screen(robot, config)
+
+
 def test_xinyu_app_black_screen_reports_waiting_without_circuit(monkeypatch, tmp_path):
     config = _config(tmp_path)
     robot = FakeRobot(["black"])
@@ -192,7 +267,7 @@ def test_xinyu_app_black_screen_reports_waiting_without_circuit(monkeypatch, tmp
     assert app.status.current_step == "black_screen_waiting"
     assert app.status.current_step_label == "黑屏异常，等待用户亮屏"
     assert logs[-1][0] == "warning"
-    assert logs[-1][1] == "black_screen_detected"
+    assert logs[-1][1] == "检测到黑屏"
 
 
 def test_xinyu_app_no_phone_reports_waiting_without_circuit(monkeypatch, tmp_path):
@@ -218,7 +293,7 @@ def test_xinyu_app_no_phone_reports_waiting_without_circuit(monkeypatch, tmp_pat
     assert app.status.current_step == "no_phone_waiting"
     assert app.status.current_step_label == "无手机异常，等待用户放回手机"
     assert logs[-1][0] == "warning"
-    assert logs[-1][1] == "no_phone_detected"
+    assert logs[-1][1] == "检测到无手机"
 
 
 def test_xinyu_unread_red_pixel_detection_accepts_pink_red_badge():
@@ -357,7 +432,8 @@ def test_xinyu_unknown_screen_does_not_click_default_back(monkeypatch, tmp_path)
 
     monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
 
-    assert steps.ensure_list_screen(robot, config) is None
+    with pytest.raises(steps.StepUnavailable, match="当前界面无法识别，且未找到返回按钮模板"):
+        steps.ensure_list_screen(robot, config)
     assert robot.clicks == []
 
 
@@ -368,9 +444,31 @@ def test_xinyu_go_back_requires_matched_back_button(monkeypatch, tmp_path):
     monkeypatch.setattr(steps, "ensure_send_cleared", lambda robot, config, reporter=None: 0)
     monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
 
-    with pytest.raises(steps.StepUnavailable, match="back button was not found"):
+    with pytest.raises(steps.StepUnavailable, match="未找到返回按钮模板"):
         steps.go_back(robot, config)
     assert robot.clicks == []
+
+
+def test_xinyu_input_box_error_is_reported_in_chinese(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["chat"])
+
+    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None: "chat")
+    monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
+
+    with pytest.raises(steps.StepUnavailable, match="未找到输入框模板"):
+        steps.focus_input_box(robot, config)
+
+
+def test_xinyu_chat_window_error_is_reported_in_chinese(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list"])
+
+    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None: "list")
+    monkeypatch.setattr(steps, "_matches_screen", lambda image, config, key: False)
+
+    with pytest.raises(steps.StepUnavailable, match="未匹配到聊天界面模板"):
+        steps.confirm_chat_window(robot, config)
 
 
 def test_xinyu_list_selects_highest_favorability_target(monkeypatch, tmp_path):
@@ -633,6 +731,56 @@ def test_xinyu_app_logs_list_content_used_for_reply(monkeypatch, tmp_path):
         and status.get("current_step_log_label") == "使用列表内容作为对话输入：在吗"
         for status in statuses
     )
+
+
+def test_xinyu_app_logs_duplicate_selection(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list", "chat", "chat", "chat", "list", "list", "chat", "chat", "chat", "list"])
+    target = {"name": "白嫖", "content": "在吗", "favorability": 44, "unread_count": 1, "bounds": [0.1, 0.2, 0.3, 0.4], "x": 0.2, "y": 0.3}
+    logs: list[tuple[str, str, dict | None]] = []
+
+    monkeypatch.setattr(xinyu_app.steps, "find_unread_target", lambda robot, config, reporter=None: dict(target))
+    monkeypatch.setattr(xinyu_app.steps, "enter_chat", lambda robot, x, y: robot.move_click(x, y))
+    monkeypatch.setattr(xinyu_app.steps, "confirm_chat_window", lambda robot, config, reporter=None: "chat")
+    monkeypatch.setattr(xinyu_app.steps, "send_new_greeting_if_available", lambda robot, config, image=None, reporter=None: False)
+    monkeypatch.setattr(xinyu_app.steps, "build_list_message", lambda target, content: {"contact": target["name"], "content": content})
+    monkeypatch.setattr(xinyu_app.steps, "focus_input_box", lambda robot, config, reporter=None: None)
+    monkeypatch.setattr(xinyu_app.steps, "play_voice_reply", lambda robot, text, config, reporter=None: None)
+    monkeypatch.setattr(xinyu_app.steps, "send_reply", lambda robot, config, reporter=None: 1)
+    monkeypatch.setattr(xinyu_app.steps, "go_back", lambda robot, config, reporter=None, double_click_on_first_attempt=False: None)
+
+    app = xinyu_app.XinyuApp(robot, config, reply_provider=lambda message: "AI回复")
+    app.set_log_callback(lambda level, message, payload=None: logs.append((level, message, payload)))
+    app.run_once()
+    app.run_once()
+
+    assert any(message == "心遇重复选中同一会话" for _, message, _ in logs)
+
+
+def test_xinyu_app_logs_multi_send_clicks(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list", "chat", "chat", "chat", "list"])
+    logs: list[tuple[str, str, dict | None]] = []
+
+    monkeypatch.setattr(
+        xinyu_app.steps,
+        "find_unread_target",
+        lambda robot, config, reporter=None: {"name": "白嫖", "content": "在吗", "favorability": 44, "unread_count": 1, "bounds": [0.1, 0.2, 0.3, 0.4], "x": 0.2, "y": 0.3},
+    )
+    monkeypatch.setattr(xinyu_app.steps, "enter_chat", lambda robot, x, y: robot.move_click(x, y))
+    monkeypatch.setattr(xinyu_app.steps, "confirm_chat_window", lambda robot, config, reporter=None: "chat")
+    monkeypatch.setattr(xinyu_app.steps, "send_new_greeting_if_available", lambda robot, config, image=None, reporter=None: False)
+    monkeypatch.setattr(xinyu_app.steps, "build_list_message", lambda target, content: {"contact": target["name"], "content": content})
+    monkeypatch.setattr(xinyu_app.steps, "focus_input_box", lambda robot, config, reporter=None: None)
+    monkeypatch.setattr(xinyu_app.steps, "play_voice_reply", lambda robot, text, config, reporter=None: None)
+    monkeypatch.setattr(xinyu_app.steps, "send_reply", lambda robot, config, reporter=None: 3)
+    monkeypatch.setattr(xinyu_app.steps, "go_back", lambda robot, config, reporter=None, double_click_on_first_attempt=False: None)
+
+    app = xinyu_app.XinyuApp(robot, config, reply_provider=lambda message: "AI回复")
+    app.set_log_callback(lambda level, message, payload=None: logs.append((level, message, payload)))
+    app.run_once()
+
+    assert any(message == "心遇发送按钮被连续点击" for _, message, _ in logs)
 
 
 def test_xinyu_app_skip_reply_still_focuses_input_box_before_back(monkeypatch, tmp_path):

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from apps import get_registered_apps
+from apps import get_registered_apps, resolve_app_name
 from apps.defaults import with_app_defaults
 from apps.visual_assets import back_button_template_paths
 from lgb.lgb import RobotInterface
@@ -46,9 +46,25 @@ class DeviceWorker(threading.Thread):
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()
-        app_name = str(device.get("selected_app", "wechat"))
+        app_registry = get_registered_apps()
+        requested_app_name = str(device.get("selected_app", "") or "").strip()
+        if requested_app_name in app_registry:
+            app_name = requested_app_name
+        else:
+            app_name = resolve_app_name(requested_app_name)
+            if app_name not in app_registry:
+                app_name = next(iter(app_registry))
         self.app_name = app_name
         self.app_config = with_app_defaults(app_config or self.config_manager.get_app_config(str(device["ip"]), app_name, {}))
+        global_config = self.config_manager.get("global", default={})
+        try:
+            ocr_max_concurrency = int(global_config.get("ocr_max_concurrency", 1) or 1)
+        except (TypeError, ValueError):
+            ocr_max_concurrency = 1
+        self.app_config["ocr_max_concurrency"] = min(16, max(1, ocr_max_concurrency))
+        ocr_config = self.app_config.get("ocr", {})
+        if isinstance(ocr_config, dict):
+            ocr_config["max_concurrency"] = self.app_config["ocr_max_concurrency"]
         runtime_context = self.app_config.setdefault("_runtime", {})
         if isinstance(runtime_context, dict):
             runtime_context["device_ip"] = str(device["ip"])
@@ -59,7 +75,6 @@ class DeviceWorker(threading.Thread):
             setattr(self.robot, "_codex_should_stop", self._stop_event.is_set)
         except Exception:
             pass
-        global_config = self.config_manager.get("global", default={})
         self.ai_client = AIClient(
             api_base=str(global_config.get("chat_api_base", "http://liaotianbao.icu")),
             chat_bearer=str(global_config.get("chat_bearer", "")),
@@ -79,7 +94,7 @@ class DeviceWorker(threading.Thread):
             memory_store=self.memory_store,
             logger=self._emit,
         )
-        app_cls = get_registered_apps()[app_name]
+        app_cls = app_registry[app_name]
         self.app = app_cls(
             self.robot,
             self.app_config,
