@@ -340,7 +340,7 @@ def test_config_manager_updates_app_runtime_and_persona_scopes_independently(tmp
     assert merged["persona"]["name"] == "bot"
 
 
-def test_config_manager_migrates_old_default_match_threshold_to_point_seven(tmp_path):
+def test_config_manager_keeps_saved_match_threshold(tmp_path):
     manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
     app_dir = tmp_path / "apps" / "xinyu"
     app_dir.mkdir(parents=True)
@@ -348,7 +348,7 @@ def test_config_manager_migrates_old_default_match_threshold_to_point_seven(tmp_
 
     config = manager.get_app_config("1.1.1.1", "xinyu", {})
 
-    assert config["match_threshold"] == 0.7
+    assert config["match_threshold"] == 0.85
 
 
 def test_config_manager_updates_device_app_offsets_independently(tmp_path):

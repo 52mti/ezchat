@@ -121,7 +121,7 @@ def test_write_archives_can_include_timestamp_suffix(tmp_path):
     assert archive_path.is_file()
 
 
-def test_write_customer_update_archive_keeps_app_json_configs(tmp_path):
+def test_write_customer_update_archive_keeps_app_json_configs_and_templates(tmp_path):
     package_root = tmp_path / build.PACKAGE_NAME
     dist_root = tmp_path / "dist"
     app_root = package_root / "apps" / "xinyu"
@@ -147,7 +147,7 @@ def test_write_customer_update_archive_keeps_app_json_configs(tmp_path):
     assert f"{build.PACKAGE_NAME}/apps/xinyu/ocr_config.py" not in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/dialogue_ocr_config.json" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/list_ocr_config.json" in names
-    assert all(not name.startswith(f"{build.PACKAGE_NAME}/apps/xinyu/templates/") for name in names)
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/templates/buttons/btn_返回按钮.jpg" in names
 
 
 def test_write_full_package_archive_includes_runtime_state_and_photo_dir(tmp_path):
@@ -298,6 +298,9 @@ def test_write_full_package_runtime_state_uses_auto_backend(tmp_path):
     assert payload["backend"] == "auto"
     assert payload["execution_mode"] == "subprocess"
     assert payload["package_mode"] == "full"
+    assert payload["cache_home"] == "runtime/.paddlex"
+    assert payload["python_executable"] == "runtime/app/python.exe"
+    assert payload["runtime_path"] == "runtime/app"
     assert payload["installed_backends"] == ["cpu", "paddle_cuda", "onnx_directml"]
 
 

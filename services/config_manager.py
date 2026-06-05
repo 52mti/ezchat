@@ -179,15 +179,6 @@ def _normalize_app_configs(app_configs: dict[str, Any]) -> None:
             _normalize_huanyou_dialogue_rules(str(app_name), app_config)
 
 
-def _normalize_match_threshold(app_config: dict[str, Any]) -> None:
-    try:
-        threshold = float(app_config.get("match_threshold"))
-    except (TypeError, ValueError):
-        return
-    if threshold == 0.85:
-        app_config["match_threshold"] = 0.7
-
-
 def _load_json_dict(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -285,7 +276,6 @@ def _load_app_override_file(app_config_root: Path, app_name: str) -> dict[str, A
     app_level, _, _ = _split_override_scopes(payload)
     _normalize_app_templates(app_name, app_level)
     _normalize_huanyou_dialogue_rules(app_name, app_level)
-    _normalize_match_threshold(app_level)
     return app_level
 
 

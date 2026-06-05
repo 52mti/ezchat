@@ -126,7 +126,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def _threshold(config: dict[str, Any]) -> float:
-    return float(config.get("match_threshold", 0.7))
+    return float(config.get("match_threshold", 0.85))
 
 
 def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> dict[str, float] | None:

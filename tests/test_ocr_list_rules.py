@@ -453,15 +453,16 @@ def test_detect_red_badge_bounds_prefers_white_digit_candidate_for_huanyou():
     rules = _huanyou_rules(
         red_badge_enable_white_digit_bonus=True,
         red_badge_require_white_digit=True,
+        red_badge_enable_relative_white_digit=False,
         red_badge_white_digit_min_pixels=4,
         red_badge_white_digit_bonus_multiplier=2.0,
         left_badge_max_ratio=0.35,
     )
     image = Image.new("RGB", (560, 997), "white")
     pixels = image.load()
-    for x in range(82, 110):
-        for y in range(134, 162):
-            if (x - 96) ** 2 + (y - 148) ** 2 <= 14 ** 2:
+    for x in range(88, 105):
+        for y in range(140, 157):
+            if (x - 96) ** 2 + (y - 148) ** 2 <= 8 ** 2:
                 pixels[x, y] = (220, 40, 40)
     for x in range(146, 170):
         for y in range(136, 160):
@@ -562,8 +563,9 @@ def test_huanyou_list_rules_filter_online_match_and_reward_rows():
         _item("在线配对", 128, 260, 260, 298),
         _item("风中行者", 128, 260, 315, 348),
         _item("小时在线交友", 128, 320, 330, 368),
-        _item("微风", 128, 210, 390, 428),
-        _item("心情不好，能陪我聊会吗？", 128, 420, 445, 478),
+        _item("福利多多活动", 128, 320, 335, 372),
+        _item("微风", 128, 210, 470, 508),
+        _item("心情不好，能陪我聊会吗？", 128, 420, 525, 558),
     ]
 
     result = build_list_result(items, (560, 997), rules)

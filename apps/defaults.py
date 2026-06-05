@@ -24,7 +24,7 @@ DEFAULT_PERSONA_CONFIG: dict[str, Any] = {
 
 DEFAULT_APP_CONFIG: dict[str, Any] = {
     **DEFAULT_RUNTIME_CONFIG,
-    "match_threshold": 0.7,
+    "match_threshold": 0.85,
     "persona": DEFAULT_PERSONA_CONFIG,
 }
 

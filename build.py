@@ -183,7 +183,7 @@ def _is_app_customer_config_asset(relative: str) -> bool:
         or parts[2].endswith("_ocr_config.py")
     ):
         return True
-    return len(parts) >= 3 and parts[2] == "templates"
+    return False
 
 
 def _archive_excludes(
@@ -434,10 +434,10 @@ def _write_full_package_runtime_state(package_root: Path, *, model_tier: str, nv
         "package_mode": "full",
         "runtime_name": "app",
         "cuda_lane": nvidia_cuda_lane,
-        "cache_home": str((package_root / "runtime" / ".paddlex").resolve()),
+        "cache_home": "runtime/.paddlex",
         "status": "installed",
-        "python_executable": str((package_root / "runtime" / "app" / "python.exe").resolve()),
-        "runtime_path": str((package_root / "runtime" / "app").resolve()),
+        "python_executable": "runtime/app/python.exe",
+        "runtime_path": "runtime/app",
         "message": "Full package runtimes assembled by build.py",
         "validation": "ok",
         "validation_error": "",

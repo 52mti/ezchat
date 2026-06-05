@@ -54,11 +54,26 @@ def _load_runtime_state(root: Path) -> dict[str, object] | None:
 def _cache_home_from_state(root: Path, state: dict[str, object]) -> Path:
     configured = str(state.get("cache_home", "") or "").strip()
     if configured:
-        return Path(configured).expanduser().resolve()
+        candidate = Path(configured).expanduser()
+        if not candidate.is_absolute():
+            return (root / candidate).resolve()
+        normalized = str(candidate).replace("\\", "/").lower()
+        if "/dist/_staging/" not in normalized and _path_anchor_exists(candidate):
+            return candidate.resolve()
     if os.name == "nt":
         public_root = Path(os.environ.get("PUBLIC", r"C:\Users\Public")).resolve()
         return public_root / "jixiebijiaoben_runtime" / ".paddlex"
     return root / "runtime" / ".paddlex"
+
+
+def _path_anchor_exists(path: Path) -> bool:
+    anchor = path.anchor
+    if not anchor:
+        return True
+    try:
+        return Path(anchor).exists()
+    except OSError:
+        return False
 
 
 def _bundled_models_ready(root: Path, state: dict[str, object]) -> bool:

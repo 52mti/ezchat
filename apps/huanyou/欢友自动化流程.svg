@@ -36,7 +36,7 @@
 
   <rect class="bg" x="0" y="0" width="1760" height="2380"/>
   <text class="title" x="880" y="54" text-anchor="middle">欢友自动化整体运行流程</text>
-  <text class="subtitle" x="880" y="84" text-anchor="middle">当前代码真实链路：DeviceWorker 调度、人设合并、MessageProcessor/AIClient、list 红点未读、新招呼跳过 dialogue、下一条校验、切到新人后循环回复、空闲防熄屏、异常恢复</text>
+  <text class="subtitle" x="880" y="84" text-anchor="middle">当前代码真实链路：DeviceWorker 调度、人设合并、MessageProcessor/AIClient、list 白字红点未读、新招呼保存范围检测、下一条校验、切到新人后循环回复、空闲防熄屏、异常恢复</text>
 
   <rect x="46" y="112" width="360" height="38" rx="19" fill="#e5ecf8" stroke="#b8c4df"/>
   <text class="lane-title" x="226" y="136" text-anchor="middle">外层调度与配置</text>
@@ -117,8 +117,8 @@
     <rect class="node ocr" x="520" y="564" width="380" height="108" rx="18"/>
     <text class="node-text" x="710" y="592">列表 OCR 扫描</text>
     <text class="node-sub" x="710" y="618">list 模式识别 message_list / bottom_nav</text>
-    <text class="node-sub" x="710" y="640">未读：左侧红点视觉检测，命中 unread=1</text>
-    <text class="node-sub" x="710" y="660">排除：在线配对 / 小时在线交友等入口</text>
+    <text class="node-sub" x="710" y="640">未读：左侧圆形红点 + 白字/相对白字 → unread=1</text>
+    <text class="node-sub" x="710" y="660">搜索高度 0.05；排除在线配对 / 福利多多等入口</text>
   </g>
   <g>
     <rect class="node action" x="520" y="714" width="380" height="84" rx="18"/>
@@ -150,7 +150,7 @@
   <g>
     <path class="node decision" d="M710 1420 L880 1496 L710 1572 L540 1496 Z"/>
     <text class="node-text" x="710" y="1488">有“新招呼”？</text>
-    <text class="node-sub" x="710" y="1514">btn_新招呼按钮</text>
+    <text class="node-sub" x="710" y="1514">btn_新招呼按钮；优先使用已保存范围</text>
   </g>
 
   <!-- Idle and abnormal branches -->
@@ -159,7 +159,7 @@
     <text class="node-text" x="710" y="1688">暂无消息：进入空闲维护</text>
     <text class="node-sub" x="710" y="1714">首次读取积分：点“我的” → points OCR</text>
     <text class="node-sub" x="710" y="1736">金币前数字 ÷ 10 上报主 UI</text>
-    <text class="node-sub" x="710" y="1758">防熄屏：连点“消息”两次，期间复扫</text>
+    <text class="node-sub" x="710" y="1758">防熄屏：点击“消息”一次，期间复扫</text>
   </g>
   <g>
     <rect class="node warning" x="520" y="1818" width="380" height="122" rx="18"/>
@@ -197,7 +197,8 @@
     <rect class="node ocr" x="1048" y="746" width="390" height="98" rx="18"/>
     <text class="node-text" x="1243" y="774">聊天详情 OCR</text>
     <text class="node-sub" x="1243" y="800">dialogue 模式读取 sender1 最后一条</text>
-    <text class="node-sub" x="1243" y="822">日志显示：对方最后一句</text>
+    <text class="node-sub" x="1243" y="822">无 sender1 内容时按“你好”处理</text>
+    <text class="node-sub" x="1243" y="838">日志显示：对方最后一句 / 兜底原因</text>
   </g>
   <g>
     <path class="node decision" d="M1243 888 L1414 964 L1243 1040 L1072 964 Z"/>
@@ -266,7 +267,7 @@
 
   <!-- Notes -->
   <g>
-    <rect x="48" y="1260" width="392" height="328" rx="18" fill="#ffffff" stroke="#d3c7af"/>
+    <rect x="48" y="1260" width="392" height="388" rx="18" fill="#ffffff" stroke="#d3c7af"/>
     <text class="lane-title" x="72" y="1292">本次排查补充项</text>
     <text class="note" x="72" y="1324">1. 外层 DeviceWorker / license / pause / stop / tick 已补。</text>
     <text class="note" x="72" y="1352">2. 前端人设配置链路已补：app_overrides.huanyou.persona。</text>
@@ -274,11 +275,12 @@
     <text class="note" x="72" y="1408">4. 黑屏：状态栏提示，进程继续轮询。</text>
     <text class="note" x="72" y="1436">5. 无手机：状态栏提示并打开 circuit 停止业务轮次。</text>
     <text class="note" x="72" y="1464">6. 未知界面：不在三大预设界面时，点击返回恢复。</text>
-    <text class="note" x="72" y="1492">7. 新招呼：只处理当前招呼；切到新人后不得继承跳过 OCR 状态。</text>
-    <text class="note" x="72" y="1520">8. list 未读：红点命中 unread=1；活动入口如“小时在线交友”排除。</text>
+    <text class="note" x="72" y="1492">7. 新招呼：优先用 button.new_greeting 保存范围；无配置才兜底 85%。</text>
+    <text class="note" x="72" y="1520">8. list 未读：圆形红点必须有白字；支持相对白字兜底。</text>
     <text class="note" x="72" y="1548">9. 正常回复后切人：复用校验姓名 OCR 的名字坐标收回输入框。</text>
     <text class="note" x="72" y="1576">10. 切到新人：重新判断新招呼；无新招呼则 OCR 回复后再点下一条。</text>
-    <text class="note" x="72" y="1604">11. 空闲：复扫前也先归位聊天列表，再执行 OCR。</text>
+    <text class="note" x="72" y="1604">11. dialogue 无 sender1 内容：默认按“你好”走 pingtai.txt。</text>
+    <text class="note" x="72" y="1632">12. 空闲：防熄屏只点“消息”一次；复扫前先归位聊天列表。</text>
   </g>
 
   <!-- Edges outer -->

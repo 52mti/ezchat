@@ -155,6 +155,75 @@ def test_subprocess_runtime_start_uses_backend_env_and_cache_home(tmp_path, monk
     assert str(scripts_dir) in env["PATH"]
 
 
+def test_subprocess_runtime_ignores_packaging_staging_cache_home(tmp_path, monkeypatch):
+    state_path = tmp_path / "runtime" / "install_state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "installed",
+                "validation": "ok",
+                "backend": "paddle_cuda",
+                "cache_home": "D:/Program Files (x86)/appkaifa/jixiebijiaoben/dist/_staging/build_001/jixiebijiaoben/runtime/.paddlex",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    runtime_python = tmp_path / "runtime" / "ocr_nvidia" / "python.exe"
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_text("python", encoding="utf-8")
+    public_root = tmp_path / "Public"
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **kwargs):
+        captured["env"] = dict(kwargs["env"])
+        return FakeProcess()
+
+    monkeypatch.setenv("PUBLIC", str(public_root))
+    monkeypatch.setattr(runtime_module, "_runtime_state_path", lambda project_root=None: state_path)
+    monkeypatch.setattr(runtime_module, "_package_root", lambda project_root=None: tmp_path)
+    monkeypatch.setattr(runtime_module, "runtime_python", lambda root, runtime_name, gui=False: runtime_python)
+    monkeypatch.setattr(runtime_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(runtime_module.subprocess, "STARTUPINFO", lambda: type("StartupInfo", (), {"dwFlags": 0})())
+    monkeypatch.setattr(runtime_module.subprocess, "STARTF_USESHOWWINDOW", 1, raising=False)
+
+    engine = runtime_module.SubprocessOcrRuntimeEngine(
+        backend="paddle_cuda",
+        model_tier="lite",
+        manifest=runtime_module.load_runtime_manifest(),
+        config={},
+    )
+
+    engine._start_process()
+
+    expected = public_root / "jixiebijiaoben_runtime" / ".paddlex"
+    assert captured["env"]["PADDLE_PDX_CACHE_HOME"] == str(expected)
+    assert captured["env"]["PADDLEX_HOME"] == str(expected)
+
+
+def test_manifest_subprocess_mode_uses_ocr_runtime_without_app_runtime(tmp_path, monkeypatch):
+    (tmp_path / "runtime_manifest.json").write_text(
+        json.dumps({"executionMode": "subprocess"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    ocr_python = tmp_path / "runtime" / "ocr_nvidia" / "python.exe"
+    ocr_python.parent.mkdir(parents=True)
+    ocr_python.write_text("python", encoding="utf-8")
+
+    monkeypatch.setattr(runtime_module, "_package_root", lambda project_root=None: tmp_path)
+
+    assert runtime_module._effective_execution_mode({}) == "subprocess"
+
+
 def test_load_installed_runtime_state_rejects_invalid_status(tmp_path, monkeypatch):
     state_path = tmp_path / "runtime" / "install_state.json"
     state_path.parent.mkdir(parents=True)
@@ -209,6 +278,91 @@ def test_create_ocr_runtime_engine_falls_back_to_cpu_and_persists_state(tmp_path
     assert payload["backend"] == "cpu"
     assert payload["fallback_from"] == "paddle_cuda"
     assert "gpu failed" in payload["fallback_reason"]
+
+
+def test_gpu_preload_success_clears_previous_cpu_fallback_state(tmp_path, monkeypatch):
+    state_path = tmp_path / "runtime" / "install_state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "status": "installed",
+                "validation": "ok",
+                "backend": "cpu",
+                "ocr_device": "cpu",
+                "fallback_from": "paddle_cuda",
+                "fallback_reason": "old failure",
+                "model_tier": "lite",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    class GpuEngine:
+        def preload(self) -> str:
+            return "gpu:0"
+
+    class CpuEngine:
+        def preload(self) -> str:
+            return "cpu"
+
+    def fake_create_engine(backend: str, model_tier: str, manifest, config):
+        return GpuEngine() if backend == "paddle_cuda" else CpuEngine()
+
+    monkeypatch.setattr(runtime_module, "_runtime_state_path", lambda project_root=None: state_path)
+    monkeypatch.setattr(runtime_module, "select_ocr_backend", lambda preferred_backend, hardware=None: "paddle_cuda")
+    monkeypatch.setattr(runtime_module, "_create_engine_for_backend", fake_create_engine)
+
+    engine = runtime_module.create_ocr_runtime_engine({"backend": "auto", "model_tier": "auto"})
+
+    assert engine.preload() == "gpu:0"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload["backend"] == "paddle_cuda"
+    assert payload["ocr_device"] == "gpu:0"
+    assert "fallback_from" not in payload
+    assert "fallback_reason" not in payload
+
+
+def test_create_local_runtime_engine_can_disable_same_process_fallback(monkeypatch):
+    class GpuEngine:
+        def preload(self) -> str:
+            raise RuntimeError("gpu failed")
+
+    class CpuEngine:
+        def preload(self) -> str:
+            return "cpu"
+
+    def fake_create_engine(backend: str, model_tier: str, manifest, config):
+        return GpuEngine() if backend == "paddle_cuda" else CpuEngine()
+
+    monkeypatch.setattr(runtime_module, "_effective_backend_config", lambda config: ("paddle_cuda", "lite"))
+    monkeypatch.setattr(runtime_module, "_create_engine_for_backend", fake_create_engine)
+
+    engine = runtime_module.create_local_runtime_engine({"backend": "paddle_cuda"}, allow_fallback=False)
+
+    with pytest.raises(RuntimeError, match="gpu failed"):
+        engine.preload()
+
+
+def test_paddle_runtime_import_error_reports_backend_and_dependency(monkeypatch):
+    real_import = __import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "paddleocr":
+            raise ImportError("No module named 'paddleocr'")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+    engine = runtime_module.PaddleOcrRuntimeEngine(
+        backend="cpu",
+        model_tier="lite",
+        manifest=runtime_module.load_runtime_manifest(),
+        config={},
+    )
+
+    with pytest.raises(RuntimeError, match="Missing packaged PaddleOCR runtime for backend cpu: No module named 'paddleocr'"):
+        engine.preload()
 
 
 def test_serialize_prediction_payload_handles_non_json_objects():

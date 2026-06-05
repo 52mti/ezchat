@@ -24,7 +24,7 @@ DEFAULT_CONFIG = {
         "buttons": "apps/xinyu/templates/buttons",
         "screens": "apps/xinyu/templates/screens",
     },
-    "match_threshold": 0.7,
+    "match_threshold": 0.85,
     **DEFAULT_RUNTIME_CONFIG,
     "idle_poll_interval_seconds": 5,
     "step_timeout": 10,

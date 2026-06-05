@@ -595,7 +595,7 @@ def test_consume_new_greetings_stops_without_next_when_expected_name(monkeypatch
     assert ("new_greeting_no_next", "新招呼后未找到下一条，返回聊天列表") in reports
 
 
-def test_huanyou_keep_screen_awake_clicks_message_twice(monkeypatch):
+def test_huanyou_keep_screen_awake_clicks_message_once(monkeypatch):
     robot = FakeRobot()
 
     monkeypatch.setattr(huanyou_app.steps, "ensure_list_screen", lambda robot, config, reporter=None: b"list")
@@ -611,7 +611,7 @@ def test_huanyou_keep_screen_awake_clicks_message_twice(monkeypatch):
     monkeypatch.setattr(huanyou_app.steps.time, "sleep", lambda seconds: None)
 
     assert huanyou_app.steps.keep_screen_awake(robot, {}) is True
-    assert robot.clicks == [(0.6965, 0.936), (0.6965, 0.936)]
+    assert robot.clicks == [(0.6965, 0.936)]
 
 
 def test_huanyou_app_skips_scroll_when_new_greeting_exists(monkeypatch):

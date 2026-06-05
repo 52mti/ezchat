@@ -658,11 +658,51 @@ def _manifest_execution_mode(project_root: str | Path | None = None) -> str:
     return normalize_execution_mode(payload.get("executionMode", "auto"))
 
 
+def _has_packaged_ocr_runtime_layout(project_root: str | Path | None = None) -> bool:
+    root = _package_root(project_root)
+    for runtime_name in ("ocr_cpu", "ocr_nvidia", "ocr_directml"):
+        if runtime_python(root, runtime_name, gui=False).is_file():
+            return True
+    return False
+
+
 def _bundled_model_mirror_root(project_root: str | Path | None = None) -> Path:
     if os.name == "nt":
         public_root = Path(os.environ.get("PUBLIC", r"C:\Users\Public")).resolve()
         return public_root / "jixiebijiaoben_runtime" / "bundled_models"
     return _package_root(project_root) / "runtime" / ".paddlex" / "bundled_models"
+
+
+def _path_anchor_exists(path: Path) -> bool:
+    anchor = path.anchor
+    if not anchor:
+        return True
+    try:
+        return Path(anchor).exists()
+    except OSError:
+        return False
+
+
+def _resolve_runtime_cache_home(root: Path, configured: object = "") -> Path:
+    raw = str(configured or "").strip()
+    if raw:
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            return (root / candidate).resolve()
+        normalized = str(candidate).replace("\\", "/").lower()
+        if "/dist/_staging/" not in normalized and _path_anchor_exists(candidate):
+            return candidate.resolve()
+    env_cache = str(os.environ.get("PADDLE_PDX_CACHE_HOME", "") or "").strip()
+    if env_cache:
+        candidate = Path(env_cache).expanduser()
+        if not candidate.is_absolute():
+            return (root / candidate).resolve()
+        if _path_anchor_exists(candidate):
+            return candidate.resolve()
+    if os.name == "nt":
+        public_root = Path(os.environ.get("PUBLIC", r"C:\Users\Public")).resolve()
+        return public_root / "jixiebijiaoben_runtime" / ".paddlex"
+    return root / "runtime" / ".paddlex"
 
 
 def _model_cache_key(model_dir: Path, model_name: str) -> str:
@@ -811,9 +851,36 @@ def _persist_runtime_fallback(backend: str, model_tier: str, fallback_from: str,
     payload["validation_error"] = ""
     payload["backend"] = backend
     payload["model_tier"] = model_tier
+    payload["cache_home"] = str(_resolve_runtime_cache_home(_package_root(), payload.get("cache_home", "")))
     payload["ocr_device"] = "cpu" if backend == "cpu" else payload.get("ocr_device", "")
     payload["fallback_from"] = fallback_from
     payload["fallback_reason"] = str(reason)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _persist_runtime_success(backend: str, model_tier: str, device: str) -> None:
+    if backend not in {"paddle_cuda", "onnx_directml", "cpu"}:
+        return
+    path = _runtime_state_path()
+    payload: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            payload.update(loaded)
+    payload["schema_version"] = max(int(payload.get("schema_version", 0) or 0), 4)
+    payload["status"] = "installed"
+    payload["validation"] = "ok"
+    payload["validation_error"] = ""
+    payload["backend"] = backend
+    payload["model_tier"] = model_tier
+    payload["cache_home"] = str(_resolve_runtime_cache_home(_package_root(), payload.get("cache_home", "")))
+    payload["ocr_device"] = str(device or "").strip() or ("cpu" if backend == "cpu" else "")
+    payload.pop("fallback_from", None)
+    payload.pop("fallback_reason", None)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -870,7 +937,10 @@ class PaddleOcrRuntimeEngine:
             try:
                 from paddleocr import PaddleOCR  # type: ignore
             except ImportError as exc:
-                raise RuntimeError("Missing packaged PaddleOCR runtime. Rebuild the full package.") from exc
+                raise RuntimeError(
+                    f"Missing packaged PaddleOCR runtime for backend {self.backend}: {exc}. "
+                    "Rebuild the full package."
+                ) from exc
             try:
                 with suppress_native_output():
                     engine = PaddleOCR(**self._build_kwargs(device))
@@ -995,7 +1065,9 @@ class ResilientRuntimeEngine:
 
     def preload(self) -> str:
         try:
-            return str(self._primary_engine.preload() or "")
+            device = str(self._primary_engine.preload() or "")
+            _persist_runtime_success(self._primary_backend, self._model_tier, device)
+            return device
         except Exception as exc:
             fallback = self._activate_fallback(exc)
             return str(fallback.preload() or "")
@@ -1074,10 +1146,9 @@ class SubprocessOcrRuntimeEngine:
         env["PYTHONNOUSERSITE"] = "1"
         env["PIP_USER"] = "0"
         env["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-        cache_home = str(load_installed_runtime_state(root).get("cache_home", "") or "").strip()
-        if cache_home:
-            env["PADDLE_PDX_CACHE_HOME"] = cache_home
-            env["PADDLEX_HOME"] = cache_home
+        cache_home = _resolve_runtime_cache_home(root, load_installed_runtime_state(root).get("cache_home", ""))
+        env["PADDLE_PDX_CACHE_HOME"] = str(cache_home)
+        env["PADDLEX_HOME"] = str(cache_home)
         runtime_dir_path = python_exe.parent
         if runtime_dir_path.name.lower() == "scripts":
             runtime_dir_path = runtime_dir_path.parent
@@ -1197,10 +1268,12 @@ def _effective_execution_mode(config: dict[str, Any]) -> str:
     state_mode = str(installed_state.get("execution_mode", "") or "").strip().lower()
     if state_mode in {"inprocess", "subprocess"}:
         return state_mode
-    if getattr(sys, "frozen", False) and has_packaged_runtime_layout(_package_root()):
+    root = _package_root()
+    has_ocr_runtime = _has_packaged_ocr_runtime_layout(root)
+    if getattr(sys, "frozen", False) and (has_packaged_runtime_layout(root) or has_ocr_runtime):
         return "subprocess"
-    manifest_mode = _manifest_execution_mode(_package_root())
-    if manifest_mode != "auto" and has_packaged_runtime_layout(_package_root()):
+    manifest_mode = _manifest_execution_mode(root)
+    if manifest_mode != "auto" and has_ocr_runtime:
         return manifest_mode
     return "inprocess"
 
@@ -1218,11 +1291,11 @@ def _create_engine_for_backend(
     raise RuntimeError(f"Unsupported OCR backend: {backend}")
 
 
-def create_local_runtime_engine(config: dict[str, Any]) -> Any:
+def create_local_runtime_engine(config: dict[str, Any], *, allow_fallback: bool = True) -> Any:
     manifest = load_runtime_manifest()
     backend, model_tier = _effective_backend_config(config)
     engine = _create_engine_for_backend(backend, model_tier, manifest, config)
-    if backend == "paddle_cuda":
+    if allow_fallback and backend == "paddle_cuda":
         fallback_config = dict(config)
         fallback_config["backend"] = "cpu"
         fallback_config["ocr_backend"] = "cpu"

@@ -1342,7 +1342,7 @@ class _LegacyAppConfigDialog(QDialog):
         self.match_threshold = QDoubleSpinBox()
         self.match_threshold.setRange(0.1, 1.0)
         self.match_threshold.setSingleStep(0.01)
-        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.7)))
+        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.85)))
         layout.addRow("模板阈值", self.match_threshold)
 
         ocr = overrides.get("ocr", {}) if isinstance(overrides.get("ocr", {}), dict) else {}
@@ -2289,7 +2289,7 @@ class AppConfigDialog(QDialog):
         self.match_threshold = NoWheelDoubleSpinBox()
         self.match_threshold.setRange(0.1, 1.0)
         self.match_threshold.setSingleStep(0.01)
-        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.7)))
+        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.85)))
         form.addRow("模板阈值", self.match_threshold)
 
         ocr = overrides.get("ocr", {}) if isinstance(overrides.get("ocr", {}), dict) else {}

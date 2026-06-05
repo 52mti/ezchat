@@ -38,7 +38,7 @@ def _report(reporter: Reporter | None, step: str, label: str, log_label: str | N
 
 
 def _threshold(config: dict[str, Any]) -> float:
-    return float(config.get("match_threshold", 0.7))
+    return float(config.get("match_threshold", 0.85))
 
 
 def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = None) -> dict[str, Any]:

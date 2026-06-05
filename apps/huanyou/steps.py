@@ -128,7 +128,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def _threshold(config: dict[str, Any]) -> float:
-    return float(config.get("match_threshold", 0.7))
+    return float(config.get("match_threshold", 0.85))
 
 
 def _step_timeout(config: dict[str, Any]) -> float:
@@ -801,7 +801,14 @@ def keep_screen_awake(
 
     _report(reporter, "keep_awake_scan", "防熄屏扫描底部消息")
     ocr_result = _run_ocr_mode(image, cfg, "list", region=_region(cfg, MESSAGE_LIST_REGION))
-    clicked = _click_bottom_nav_message(robot, ocr_result, reporter=reporter)
+    clicked = _click_bottom_nav_item(
+        robot,
+        ocr_result,
+        ("消息",),
+        reporter=reporter,
+        step="bottom_nav_click",
+        label="点击底部消息",
+    )
     if clicked:
         _report(reporter, "keep_awake_wait", "防熄屏等待下一轮")
     return clicked

@@ -42,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     config["_execution_mode"] = "inprocess"
 
     try:
-        engine = create_local_runtime_engine(config)
+        engine = create_local_runtime_engine(config, allow_fallback=False)
     except Exception as exc:
         _write_response({"ok": False, "error": str(exc)})
         return 1

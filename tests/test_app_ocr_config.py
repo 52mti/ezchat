@@ -68,9 +68,11 @@ def test_huanyou_list_rules_enable_left_badge_unread_and_filter_marketing_rows()
     assert rules["red_badge_relative_white_value_delta"] == 20
     assert rules["red_badge_relative_white_saturation_delta"] == 20
     assert rules["red_badge_min_circularity"] == 0.65
+    assert rules["left_red_badge_search_height_ratio"] == 0.05
     assert "在线匹配" in rules["excluded_keywords"]
     assert "在线配对" in rules["excluded_keywords"]
     assert "小助手" in rules["excluded_keywords"]
+    assert "福利多多" in rules["excluded_keywords"]
     assert "对方回复5条消息" not in rules["content_excluded_keywords"]
     assert "对方回复5条消息" not in rules["unread_count_excluded_keywords"]
     assert "温馨提示" in rules["unread_count_excluded_keywords"]

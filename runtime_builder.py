@@ -773,12 +773,46 @@ def _source_python_root() -> Path:
     return Path(sys.base_prefix).resolve()
 
 
+def _visual_cpp_runtime_dll_names() -> tuple[str, ...]:
+    return (
+        "concrt140.dll",
+        "msvcp140.dll",
+        "msvcp140_1.dll",
+        "msvcp140_2.dll",
+        "msvcp140_atomic_wait.dll",
+        "msvcp140_codecvt_ids.dll",
+        "vccorlib140.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+    )
+
+
+def _visual_cpp_runtime_sources(source: Path) -> list[Path]:
+    roots = [source]
+    if os.name == "nt":
+        system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        roots.extend([system_root / "System32", system_root / "SysWOW64"])
+    seen: set[str] = set()
+    sources: list[Path] = []
+    for dll_name in _visual_cpp_runtime_dll_names():
+        lowered = dll_name.lower()
+        if lowered in seen:
+            continue
+        for root in roots:
+            candidate = root / dll_name
+            if candidate.is_file():
+                sources.append(candidate)
+                seen.add(lowered)
+                break
+    return sources
+
+
 def _copy_python_tree(source: Path, target: Path) -> None:
     if target.exists():
         shutil.rmtree(target, ignore_errors=True)
     target.mkdir(parents=True, exist_ok=True)
     copy_dirs = ("DLLs", "Lib", "libs", "tcl")
-    copy_files = ("python.exe", "pythonw.exe", "python3.dll", f"python{sys.version_info.major}{sys.version_info.minor}.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+    copy_files = ("python.exe", "pythonw.exe", "python3.dll", f"python{sys.version_info.major}{sys.version_info.minor}.dll")
     for name in copy_dirs:
         src = source / name
         if not src.exists():
@@ -791,6 +825,8 @@ def _copy_python_tree(source: Path, target: Path) -> None:
         src = source / name
         if src.is_file():
             shutil.copy2(src, target / name)
+    for src in _visual_cpp_runtime_sources(source):
+        shutil.copy2(src, target / src.name)
     (target / "Lib" / "site-packages").mkdir(parents=True, exist_ok=True)
     (target / "Scripts").mkdir(parents=True, exist_ok=True)
 
