@@ -27,6 +27,8 @@ from apps.visual_assets import (
     back_button_template_paths,
     popup_template_paths,
     region_rule,
+    match_template_with_region,
+    template_match_region,
     screen_state_path,
     template_variant_paths,
     template_path,
@@ -204,24 +206,43 @@ def _template_miss_message(config: dict[str, Any], key: str, *, group: str, acti
     return f"{action}失败：没有匹配到{label}，已尝试图片：{_template_names(config, key, group=group)}"
 
 
-def _match_any(image: Any, paths: list[Path], config: dict[str, Any]) -> dict[str, float] | None:
+def _match_any(image: Any, paths: list[Path], config: dict[str, Any], key: str) -> dict[str, float] | None:
     for path in paths:
-        result = match(image, path, threshold=_threshold(config))
+        result = match_template_with_region(
+            image,
+            path,
+            config,
+            key,
+            threshold=_threshold(config),
+            match_func=match,
+        )
         if result:
             return result
     return None
 
 
-def _match_any_with_path(image: Any, paths: list[Path], config: dict[str, Any]) -> tuple[dict[str, float], Path] | None:
+def _match_any_with_path(
+    image: Any,
+    paths: list[Path],
+    config: dict[str, Any],
+    key: str,
+) -> tuple[dict[str, float], Path] | None:
     for path in paths:
-        result = match(image, path, threshold=_threshold(config))
+        result = match_template_with_region(
+            image,
+            path,
+            config,
+            key,
+            threshold=_threshold(config),
+            match_func=match,
+        )
         if result:
             return result, path
     return None
 
 
 def _template_match(image: Any, config: dict[str, Any], key: str, *, group: str) -> dict[str, float] | None:
-    return _match_any(image, _template_candidates(config, key, group=group), config)
+    return _match_any(image, _template_candidates(config, key, group=group), config, key)
 
 
 def _template_match_with_path(
@@ -231,7 +252,7 @@ def _template_match_with_path(
     *,
     group: str,
 ) -> tuple[dict[str, float], Path] | None:
-    return _match_any_with_path(image, _template_candidates(config, key, group=group), config)
+    return _match_any_with_path(image, _template_candidates(config, key, group=group), config, key)
 
 
 def _template_center(image: Any, config: dict[str, Any], key: str, *, group: str) -> tuple[float, float] | None:
@@ -249,7 +270,17 @@ def _template_center_in_region(
     group: str,
     region: tuple[float, float, float, float],
 ) -> tuple[float, float] | None:
-    result = _template_match(crop_region(image, region), config, key, group=group)
+    configured_region = template_match_region(config, key)
+    if configured_region is not None:
+        region = configured_region
+    local_config = dict(config)
+    local_config.pop("template_match_regions", None)
+    result = _match_any(
+        crop_region(image, region),
+        _template_candidates(config, key, group=group),
+        local_config,
+        key,
+    )
     if not result:
         return None
     region_x, region_y, region_w, region_h = region
@@ -419,7 +450,14 @@ def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> di
 
 def current_screen(image: Any, config: dict[str, Any]) -> str:
     for state in all_screen_states(config):
-        if match(image, state.path, threshold=_threshold(config)):
+        if match_template_with_region(
+            image,
+            state.path,
+            config,
+            state.name,
+            threshold=_threshold(config),
+            match_func=match,
+        ):
             return state.name
     if _matches_screen(image, config, CHAT_LIST_SCREEN):
         return CHAT_LIST_SCREEN

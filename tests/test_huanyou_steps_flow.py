@@ -448,7 +448,7 @@ def test_play_voice_reply_reports_when_microphone_missing(monkeypatch):
             reporter=lambda step, label, log_label=None: events.append((step, label, log_label)),
         )
     except huanyou_app.steps.StepUnavailable as exc:
-        assert str(exc) == "查找失败：没有匹配到麦克风按钮，已尝试图片：btn_麦克风按钮.jpg"
+        assert str(exc) == "查找失败：没有匹配到麦克风按钮，已尝试图片：btn_麦克风按钮.jpg、btn_麦克风按钮_2.jpg"
     else:
         raise AssertionError("expected microphone lookup failure")
 

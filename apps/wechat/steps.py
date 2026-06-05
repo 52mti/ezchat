@@ -18,6 +18,7 @@ from apps.visual_assets import (
     back_button_template_paths,
     popup_template_paths,
     region_rule,
+    match_template_with_region,
     screen_state_path,
     template_variant_paths,
     template_path,
@@ -135,23 +136,30 @@ def _template_candidates(config: dict[str, Any], key: str, *, group: str) -> lis
     return _unique_paths(candidates)
 
 
-def _match_any(image: Any, paths: list[Path], config: dict[str, Any]) -> dict[str, float] | None:
+def _match_any(image: Any, paths: list[Path], config: dict[str, Any], key: str) -> dict[str, float] | None:
     for path in paths:
-        result = match(image, path, threshold=_threshold(config))
+        result = match_template_with_region(
+            image,
+            path,
+            config,
+            key,
+            threshold=_threshold(config),
+            match_func=match,
+        )
         if result:
             return result
     return None
 
 
 def _template_center(image: Any, config: dict[str, Any], key: str, *, group: str) -> tuple[float, float] | None:
-    result = _match_any(image, _template_candidates(config, key, group=group), config)
+    result = _match_any(image, _template_candidates(config, key, group=group), config, key)
     if not result:
         return None
     return result["x"] + result["w"] / 2, result["y"] + result["h"] / 2
 
 
 def _matches_screen(image: Any, config: dict[str, Any], key: str) -> bool:
-    return _match_any(image, _template_candidates(config, key, group="screens"), config) is not None
+    return _match_any(image, _template_candidates(config, key, group="screens"), config, key) is not None
 
 
 def _report(reporter: Reporter | None, step: str, label: str, log_label: str | None = None) -> None:
@@ -183,7 +191,14 @@ def _bottom_nav_center(items: list[dict[str, Any]], keywords: tuple[str, ...]) -
 
 def current_screen(image: Any, config: dict[str, Any]) -> str:
     for state in all_screen_states(config):
-        if match(image, state.path, threshold=_threshold(config)):
+        if match_template_with_region(
+            image,
+            state.path,
+            config,
+            state.name,
+            threshold=_threshold(config),
+            match_func=match,
+        ):
             return state.name
     if _matches_screen(image, config, CHAT_LIST_SCREEN):
         return CHAT_LIST_SCREEN

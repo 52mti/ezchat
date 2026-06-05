@@ -60,6 +60,8 @@ from apps.visual_assets import (
     NEW_GREETING_BUTTON,
     NEXT_MESSAGE_BUTTON,
     SEND_BUTTON,
+    BACK_BUTTON,
+    TEMPLATE_MATCH_REGIONS_CONFIG_KEY,
     back_button_template_paths,
     fixed_template_rules,
     import_target_path,
@@ -1713,6 +1715,7 @@ class PopupCropDialog(QDialog):
         super().__init__(parent)
         self.source_image = image.convert("RGB")
         self.cropped_image: Image.Image | None = None
+        self.crop_region_norm: list[float] | None = None
         self.setWindowTitle(f"框选{template_label}")
         self.resize(880, 720)
 
@@ -1750,6 +1753,14 @@ class PopupCropDialog(QDialog):
         if box is None:
             QMessageBox.warning(self, "未选择区域", "请先在图片上框选区域")
             return
+        width, height = self.source_image.size
+        left, top, right, bottom = box
+        self.crop_region_norm = [
+            round(left / width, 3),
+            round(top / height, 3),
+            round((right - left) / width, 3),
+            round((bottom - top) / height, 3),
+        ]
         self.cropped_image = self.source_image.crop(box)
         self.accept()
 
@@ -1768,6 +1779,7 @@ class TemplateManagerWidget(QWidget):
         self.template_root = template_root
         self.device_ip = device_ip
         self.app_name = app_name
+        self.overrides = overrides
         self.show_offset_controls = show_offset_controls
         overrides = overrides if isinstance(overrides, dict) else {}
         self.buttons_dir = template_root / "buttons"
@@ -1908,8 +1920,21 @@ class TemplateManagerWidget(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "保存失败", f"无法保存{label}：{exc}")
             return
+        self._update_template_match_region(target_key, dialog.crop_region_norm)
         self.reload()
         QMessageBox.information(self, "已保存", f"{label}已保存：{target.name}")
+
+    def _update_template_match_region(self, target_key: str, region: list[float] | None) -> None:
+        if target_key == CUSTOM_POPUP or region is None:
+            return
+        region_key = BACK_BUTTON if target_key == CUSTOM_BACK_BUTTON else target_key
+        if not isinstance(self.overrides, dict):
+            return
+        regions = self.overrides.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY, {})
+        if not isinstance(regions, dict):
+            regions = {}
+        regions[region_key] = region
+        self.overrides[TEMPLATE_MATCH_REGIONS_CONFIG_KEY] = regions
 
     def _delete_template(self, path: Path) -> None:
         path.unlink(missing_ok=True)

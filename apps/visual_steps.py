@@ -21,6 +21,7 @@ from .visual_assets import (
     back_button_template_paths,
     popup_template_paths,
     region_rule,
+    match_template_with_region,
     template_path,
 )
 
@@ -73,7 +74,14 @@ def _template_center(image: Any, config: dict[str, Any], key: str) -> tuple[floa
     if not templates:
         return None
     for template in templates:
-        result = match(image, template, threshold=_threshold(config))
+        result = match_template_with_region(
+            image,
+            template,
+            config,
+            key,
+            threshold=_threshold(config),
+            match_func=match,
+        )
         if result:
             return result["x"] + result["w"] / 2, result["y"] + result["h"] / 2
     return None
@@ -83,7 +91,14 @@ def is_screen(image: Any, config: dict[str, Any], key: str) -> bool:
     template = template_path(config, key)
     if template is None:
         return False
-    return match(image, template, threshold=_threshold(config)) is not None
+    return match_template_with_region(
+        image,
+        template,
+        config,
+        key,
+        threshold=_threshold(config),
+        match_func=match,
+    ) is not None
 
 
 def current_screen(image: Any, config: dict[str, Any]) -> str:

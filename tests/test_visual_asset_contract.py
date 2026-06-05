@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from apps import visual_assets
 from apps.huanyou import app as huanyou_app
@@ -52,6 +53,7 @@ def test_template_names_align_main_program_and_helper_tool_contract(tmp_path):
     assert targets[visual_assets.CUSTOM_BACK_BUTTON] == visual_assets.next_back_button_template_path(buttons_dir).name
     assert targets[visual_assets.CUSTOM_POPUP] == "popup_custom_1.jpg"
     assert tool_filenames[visual_assets.SEND_BUTTON] == targets[visual_assets.SEND_BUTTON]
+    assert visual_assets.BACK_BUTTON not in tool_filenames
     assert popup_rule["key"] == visual_assets.CUSTOM_POPUP
     assert popup_rule["multiple"] is True
     assert popup_rule["filename_pattern"] == "popup_custom_{index}.jpg"
@@ -67,6 +69,78 @@ def test_template_names_align_main_program_and_helper_tool_contract(tmp_path):
     assert "竖屏" in popup_rule["description"]
     assert "regions" not in tool_rules
     assert "screen_roles" not in tool_rules
+    assert all(rule["match_region_supported"] is True for rule in tool_rules["templates"])
+    assert tool_rules["popups"][0]["match_region_supported"] is False
+    assert tool_rules["back_buttons"][0]["match_region_supported"] is True
+
+
+def test_template_region_match_maps_result_back_to_full_image(tmp_path):
+    template_path = tmp_path / "btn.jpg"
+    template_path.write_bytes(b"template")
+    image = Image.new("RGB", (100, 200), "white")
+    config = {
+        "template_match_regions": {
+            visual_assets.SEND_BUTTON: [0.2, 0.3, 0.4, 0.5],
+        }
+    }
+    seen_sizes: list[tuple[int, int]] = []
+
+    def fake_match(cropped_image, template, threshold=0.85):
+        seen_sizes.append(cropped_image.size)
+        return {"x": 0.25, "y": 0.4, "w": 0.1, "h": 0.2, "score": 0.99}
+
+    result = visual_assets.match_template_with_region(
+        image,
+        template_path,
+        config,
+        visual_assets.SEND_BUTTON,
+        threshold=0.7,
+        match_func=fake_match,
+    )
+
+    assert seen_sizes == [(40, 100)]
+    assert result == pytest.approx({"x": 0.3, "y": 0.5, "w": 0.04, "h": 0.1, "score": 0.99})
+
+
+def test_template_region_config_reports_missing_region_instead_of_global_fallback(tmp_path):
+    template_path = tmp_path / "btn.jpg"
+    template_path.write_bytes(b"template")
+
+    def fake_match(image, template, threshold=0.85):
+        raise AssertionError("global template matching should not run when region config exists")
+
+    with pytest.raises(visual_assets.TemplateMatchRegionMissingError, match="当前类别没有设置范围：button.send"):
+        visual_assets.match_template_with_region(
+            "screen",
+            template_path,
+            {"template_match_regions": {}},
+            visual_assets.SEND_BUTTON,
+            threshold=0.7,
+            match_func=fake_match,
+        )
+
+
+@pytest.mark.parametrize("template_key", ["screen.no_phone", "screen.black_screen"])
+def test_abnormal_screen_templates_are_global_even_when_region_config_exists(tmp_path, template_key):
+    template_path = tmp_path / "screen_abnormal.jpg"
+    template_path.write_bytes(b"template")
+    calls: list[str] = []
+
+    def fake_match(image, template, threshold=0.85):
+        calls.append(str(image))
+        return {"x": 0, "y": 0, "w": 1, "h": 1, "score": 0.99}
+
+    result = visual_assets.match_template_with_region(
+        "full-screen-image",
+        template_path,
+        {"template_match_regions": {}},
+        template_key,
+        threshold=0.7,
+        match_func=fake_match,
+    )
+
+    assert result is not None
+    assert calls == ["full-screen-image"]
 
 
 def test_next_popup_template_path_keeps_popup_pattern(tmp_path):

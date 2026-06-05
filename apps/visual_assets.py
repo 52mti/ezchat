@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
+from vision.screen import crop_region
+
 
 TemplateGroup = Literal["buttons", "screens"]
 AssetPhase = Literal["state", "action", "recovery", "region"]
@@ -61,12 +63,20 @@ MESSAGE_LIST_SCREEN_ROLE = "message_list"
 CHAT_WINDOW_SCREEN_ROLE = "chat_window"
 SCREEN_STATES_CONFIG_KEY = "screen_states"
 SCREEN_ROLES_CONFIG_KEY = "screen_roles"
+TEMPLATE_MATCH_REGIONS_CONFIG_KEY = "template_match_regions"
+GLOBAL_MATCH_TEMPLATE_KEYS = frozenset({"screen.no_phone", "screen.black_screen"})
 
 
 class ScreenState(NamedTuple):
     name: str
     label: str
     path: Path
+
+
+class TemplateMatchRegionMissingError(RuntimeError):
+    def __init__(self, key: str) -> None:
+        self.key = key
+        super().__init__(f"当前类别没有设置范围：{key}")
 
 
 FIXED_TEMPLATE_RULES: tuple[TemplateRule, ...] = (
@@ -285,6 +295,81 @@ def screen_matches_role(screen_name: str, config: dict[str, Any], role: str, def
     return screen_name == screen_role_name(config, role, default)
 
 
+def _coerce_region(raw_region: Any) -> tuple[float, float, float, float] | None:
+    if isinstance(raw_region, dict):
+        if {"x", "y", "w", "h"}.issubset(raw_region):
+            raw_values = [raw_region.get("x"), raw_region.get("y"), raw_region.get("w"), raw_region.get("h")]
+        elif {"left", "top", "right", "bottom"}.issubset(raw_region):
+            left = float(raw_region.get("left", 0.0) or 0.0)
+            top = float(raw_region.get("top", 0.0) or 0.0)
+            right = float(raw_region.get("right", left) or left)
+            bottom = float(raw_region.get("bottom", top) or top)
+            raw_values = [left, top, right - left, bottom - top]
+        else:
+            return None
+    elif isinstance(raw_region, (list, tuple)) and len(raw_region) == 4:
+        raw_values = list(raw_region)
+    else:
+        return None
+    try:
+        x, y, w, h = (float(value) for value in raw_values)
+    except (TypeError, ValueError):
+        return None
+    x = max(0.0, min(1.0, x))
+    y = max(0.0, min(1.0, y))
+    w = max(0.0, min(1.0 - x, w))
+    h = max(0.0, min(1.0 - y, h))
+    if w <= 0.0 or h <= 0.0:
+        return None
+    return x, y, w, h
+
+
+def template_match_region(config: dict[str, Any], key: str) -> tuple[float, float, float, float] | None:
+    regions = config.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY, {})
+    if not isinstance(regions, dict):
+        return None
+    return _coerce_region(regions.get(key))
+
+
+def map_match_result_from_region(
+    result: dict[str, float],
+    region: tuple[float, float, float, float],
+) -> dict[str, float]:
+    region_x, region_y, region_w, region_h = region
+    mapped = dict(result)
+    mapped["x"] = region_x + float(result["x"]) * region_w
+    mapped["y"] = region_y + float(result["y"]) * region_h
+    mapped["w"] = float(result["w"]) * region_w
+    mapped["h"] = float(result["h"]) * region_h
+    return mapped
+
+
+def match_template_with_region(
+    image: Any,
+    template: Path,
+    config: dict[str, Any],
+    key: str,
+    *,
+    threshold: float,
+    match_func: Any,
+) -> dict[str, float] | None:
+    if TEMPLATE_MATCH_REGIONS_CONFIG_KEY in config and isinstance(config.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY), dict):
+        if key in GLOBAL_MATCH_TEMPLATE_KEYS:
+            return match_func(image, template, threshold=threshold)
+        regions = config[TEMPLATE_MATCH_REGIONS_CONFIG_KEY]
+        region = _coerce_region(regions.get(key))
+        if region is None:
+            raise TemplateMatchRegionMissingError(key)
+    else:
+        region = None
+    if region is None:
+        return match_func(image, template, threshold=threshold)
+    result = match_func(crop_region(image, region), template, threshold=threshold)
+    if not result:
+        return None
+    return map_match_result_from_region(result, region)
+
+
 def popup_template_paths(config: dict[str, Any]) -> list[Path]:
     root = template_root(config, POPUP_TEMPLATE_RULE.group)
     if not root.exists():
@@ -424,9 +509,11 @@ def asset_rules_for_tool() -> dict[str, Any]:
                 "group": rule.group,
                 "filename": rule.filename,
                 "phase": rule.phase,
+                "match_region_supported": True,
                 "description": rule.description,
             }
             for rule in FIXED_TEMPLATE_RULES
+            if rule.key != BACK_BUTTON
         ],
         "popups": [
             {
@@ -438,7 +525,22 @@ def asset_rules_for_tool() -> dict[str, Any]:
                 "match_pattern": POPUP_TEMPLATE_RULE.match_pattern,
                 "phase": POPUP_TEMPLATE_RULE.phase,
                 "multiple": POPUP_TEMPLATE_RULE.multiple,
+                "match_region_supported": False,
                 "description": POPUP_TEMPLATE_RULE.description,
+            }
+        ],
+        "back_buttons": [
+            {
+                "key": BACK_BUTTON_TEMPLATE_RULE.key,
+                "label": BACK_BUTTON_TEMPLATE_RULE.label,
+                "group": BACK_BUTTON_TEMPLATE_RULE.group,
+                "filename_prefix": BACK_BUTTON_TEMPLATE_RULE.filename_prefix,
+                "filename_pattern": BACK_BUTTON_TEMPLATE_RULE.filename_pattern,
+                "match_pattern": BACK_BUTTON_TEMPLATE_RULE.match_pattern,
+                "phase": BACK_BUTTON_TEMPLATE_RULE.phase,
+                "multiple": BACK_BUTTON_TEMPLATE_RULE.multiple,
+                "match_region_supported": True,
+                "description": BACK_BUTTON_TEMPLATE_RULE.description,
             }
         ],
         "custom_screens": [
@@ -450,6 +552,7 @@ def asset_rules_for_tool() -> dict[str, Any]:
                 "config_key": SCREEN_STATES_CONFIG_KEY,
                 "multiple": True,
                 "phase": "state",
+                "match_region_supported": True,
                 "description": "用于保存用户自定义名称的界面判断图，可保存 3-5 个或更多界面。",
             }
         ],
@@ -461,6 +564,7 @@ def asset_rules_for_tool() -> dict[str, Any]:
                 "filename_pattern": "btn_{name}.jpg",
                 "multiple": True,
                 "phase": "action",
+                "match_region_supported": True,
                 "description": "用于保存用户自定义名称的按钮模板，匹配后返回竖屏归一化中心坐标。",
             }
         ],

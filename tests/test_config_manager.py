@@ -380,6 +380,31 @@ def test_config_manager_updates_device_app_offsets_independently(tmp_path):
     assert merged["next_message_click_y_offset"] == -0.02
 
 
+def test_config_manager_keeps_template_match_regions_in_app_scope(tmp_path):
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    manager.add_device({"ip": "1.1.1.1", "selected_app": "huanyou", "app_overrides": {"huanyou": {"persona": {}}}})
+
+    manager.update_app_config(
+        "huanyou",
+        {
+            "template_match_regions": {
+                "button.send": [0.1, 0.7, 0.8, 0.2],
+                "screen.chat_list": [0.0, 0.1, 1.0, 0.8],
+            }
+        },
+    )
+
+    saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    app_saved = _read_app_config(tmp_path, "huanyou")
+    merged = manager.get_app_config("1.1.1.1", "huanyou", {})
+
+    regions = app_saved["template_match_regions"]
+    assert regions["button.send"] == [0.1, 0.7, 0.8, 0.2]
+    assert regions["screen.chat_list"] == [0.0, 0.1, 1.0, 0.8]
+    assert "template_match_regions" not in saved["devices"][0].get("app_overrides", {}).get("huanyou", {})
+    assert merged["template_match_regions"]["button.send"] == [0.1, 0.7, 0.8, 0.2]
+
+
 def test_config_manager_migrates_legacy_app_level_offsets_to_device_app_scope(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(

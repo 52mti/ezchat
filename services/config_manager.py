@@ -45,6 +45,7 @@ APP_LEVEL_KEYS = {
     "ocr_modes",
     "templates",
     "match_threshold",
+    "template_match_regions",
 }
 DEVICE_LEVEL_KEYS = {
     "poll_interval",
