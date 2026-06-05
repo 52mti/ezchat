@@ -28,11 +28,12 @@ from apps.visual_assets import (
     popup_template_paths,
     region_rule,
     screen_state_path,
+    template_variant_paths,
     template_path,
     template_root,
 )
 from vision import match, run_ocr_mode
-from vision.screen import load_image
+from vision.screen import crop_region, load_image
 
 from .config import DEFAULT_CONFIG
 
@@ -54,6 +55,7 @@ MY_SCREEN = "screen.my"
 INPUT_BOX_BUTTON = "button.input_box"
 MICROPHONE_BUTTON = "button.microphone"
 NEW_GREETING_BUTTON = "button.new_greeting"
+NEW_GREETING_SEARCH_REGION = (0.0, 0.0, 1.0, 0.85)
 TTS_POST_DELAY_SECONDS = 3.0
 POPUP_MAX_X = 0.9
 NEXT_MESSAGE_SAME_NAME_RETRY_LIMIT = 3
@@ -71,7 +73,7 @@ SCREEN_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
     CHAT_LIST_SCREEN: ("screen_聊天列表.jpg", "chat_list.jpg", "screen_message_list.jpg"),
     CHAT_WINDOW_SCREEN: ("screen_聊天界面.jpg", "chat_window.jpg"),
     NO_PHONE_SCREEN: ("screen_无手机界面.jpg",),
-    MY_SCREEN: ("screen_我的界面.jpg",),
+    MY_SCREEN: ("screen_我的界面.jpg", "my_screen.jpg"),
 }
 
 BUTTON_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
@@ -183,9 +185,7 @@ def _template_candidates(config: dict[str, Any], key: str, *, group: str) -> lis
         aliases = SCREEN_TEMPLATE_ALIASES.get(key, ()) if group == "screens" else BUTTON_TEMPLATE_ALIASES.get(key, ())
         root = template_root(config, "screens" if group == "screens" else "buttons")
         for filename in aliases:
-            path = root / filename
-            if path.exists():
-                candidates.append(path)
+            candidates.extend(template_variant_paths(root, filename))
     return _unique_paths(candidates)
 
 
@@ -239,6 +239,23 @@ def _template_center(image: Any, config: dict[str, Any], key: str, *, group: str
     if not result:
         return None
     return result["x"] + result["w"] / 2, result["y"] + result["h"] / 2
+
+
+def _template_center_in_region(
+    image: Any,
+    config: dict[str, Any],
+    key: str,
+    *,
+    group: str,
+    region: tuple[float, float, float, float],
+) -> tuple[float, float] | None:
+    result = _template_match(crop_region(image, region), config, key, group=group)
+    if not result:
+        return None
+    region_x, region_y, region_w, region_h = region
+    center_x = region_x + (result["x"] + result["w"] / 2) * region_w
+    center_y = region_y + (result["y"] + result["h"] / 2) * region_h
+    return center_x, center_y
 
 
 def _template_center_with_path(
@@ -418,7 +435,7 @@ def _popup_close_point(image: Any, config: dict[str, Any]) -> tuple[float, float
         result = _popup_match(image, popup_template, config)
         if not result:
             continue
-        return min(0.98, result["x"] + result["w"] * 0.9), max(0.02, result["y"] + result["h"] * 0.1)
+        return min(0.98, result["x"] + result["w"] * 0.7), max(0.02, result["y"] + result["h"] * 0.1)
     return None
 
 
@@ -777,7 +794,13 @@ def click_new_greeting(
 ) -> bool:
     cfg = _config(config)
     current_image = image if image is not None else capture_after_popups(robot, cfg, label="new_greeting", reporter=reporter)
-    pos = _template_center(current_image, cfg, NEW_GREETING_BUTTON, group="buttons")
+    pos = _template_center_in_region(
+        current_image,
+        cfg,
+        NEW_GREETING_BUTTON,
+        group="buttons",
+        region=NEW_GREETING_SEARCH_REGION,
+    )
     if pos is None:
         return False
     offset_x, offset_y = _new_greeting_click_offset(cfg)
@@ -938,13 +961,24 @@ def consume_new_greetings(
         handled += 1
         current_image = capture_after_popups(robot, cfg, label="after_new_greeting", reporter=reporter)
         if expected_name:
-            current_image, _current_name, _clicks, _name_point = click_next_message_until_changed(
-                robot,
-                cfg,
-                expected_name=expected_name,
-                image=current_image,
-                reporter=reporter,
-            )
+            try:
+                current_image, _current_name, _clicks, _name_point = click_next_message_until_changed(
+                    robot,
+                    cfg,
+                    expected_name=expected_name,
+                    image=current_image,
+                    reporter=reporter,
+                )
+            except StepUnavailable as exc:
+                if "下一条按钮" not in str(exc):
+                    raise
+                stopped_without_next = True
+                _report(
+                    reporter,
+                    "new_greeting_no_next",
+                    "新招呼后未找到下一条，返回聊天列表",
+                )
+                return current_image, handled, stopped_without_next
         else:
             if not click_next_message(robot, cfg, image=current_image, reporter=reporter):
                 stopped_without_next = True
@@ -972,20 +1006,32 @@ def read_message(
     dialogues = dialogue_result.get("dialogues", [])
     dialogue_rules = cfg["ocr_modes"]["dialogue"]["rules"]
     target_sender = str(dialogue_rules["target_sender"])
-    target_messages = [
-        str(item.get("content", "")).strip()
-        for item in dialogues
-        if str(item.get("sender", "")) == target_sender and str(item.get("content", "")).strip()
-    ]
-    if not target_messages:
-        raise StepUnavailable(f"聊天详情 OCR 没有识别到对方消息：目标 sender={target_sender}")
-
+    trailing_target_messages: list[str] = []
+    for item in reversed(dialogues):
+        sender = str(item.get("sender", ""))
+        content = str(item.get("content", "")).strip()
+        if not content:
+            continue
+        if sender == target_sender:
+            trailing_target_messages.append(content)
+            continue
+        if trailing_target_messages:
+            break
     fallback_contact = str(target.get("name", "")) if isinstance(target, dict) else ""
     contact = fallback_contact or str(dialogue_result.get("user_name") or items[0]["text"])
+    content = "".join(reversed(trailing_target_messages))
+    if not content:
+        content = "你好"
+        _report(
+            reporter,
+            "dialogue_ocr_fallback",
+            "未识别到对方消息，按“你好”处理",
+            log_label=f"未识别到对方消息，按“你好”处理：目标 sender={target_sender}",
+        )
     return {
         "user": contact,
         "contact": contact,
-        "content": target_messages[-1],
+        "content": content,
         "sender": target_sender,
         "message_time": "",
         "unread_count": str(target.get("unread_count", "")) if isinstance(target, dict) else "",

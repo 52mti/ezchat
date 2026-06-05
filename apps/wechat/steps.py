@@ -19,6 +19,7 @@ from apps.visual_assets import (
     popup_template_paths,
     region_rule,
     screen_state_path,
+    template_variant_paths,
     template_path,
     template_root,
 )
@@ -40,7 +41,7 @@ SCREEN_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 BUTTON_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
-    INPUT_BOX_BUTTON: ("btn_输入框按钮.jpg",),
+    INPUT_BOX_BUTTON: ("btn_输入框.jpg", "btn_输入框按钮.jpg", "btn_input_box.jpg"),
     MICROPHONE_BUTTON: ("btn_麦克风按钮.jpg", "btn_voice_input.jpg"),
     BACK_BUTTON: ("btn_返回按钮_2.jpg", "btn_返回按钮.jpg", "btn_back.jpg"),
     "button.send": ("btn_发送按钮.jpg", "btn_send.jpg"),
@@ -130,9 +131,7 @@ def _template_candidates(config: dict[str, Any], key: str, *, group: str) -> lis
         aliases = SCREEN_TEMPLATE_ALIASES.get(key, ()) if group == "screens" else BUTTON_TEMPLATE_ALIASES.get(key, ())
         root = template_root(config, "screens" if group == "screens" else "buttons")
         for filename in aliases:
-            path = root / filename
-            if path.exists():
-                candidates.append(path)
+            candidates.extend(template_variant_paths(root, filename))
     return _unique_paths(candidates)
 
 

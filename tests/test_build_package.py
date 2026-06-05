@@ -109,7 +109,19 @@ def test_write_customer_update_archive_excludes_full_runtimes_and_models(tmp_pat
     assert all(not name.startswith(f"{build.PACKAGE_NAME}/models/ocr/") for name in names)
 
 
-def test_write_customer_update_archive_excludes_app_customer_config_assets(tmp_path):
+def test_write_archives_can_include_timestamp_suffix(tmp_path):
+    package_root = tmp_path / build.PACKAGE_NAME
+    dist_root = tmp_path / "dist"
+    package_root.mkdir()
+    (package_root / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+    archive_path = build._write_customer_update_archive(package_root, dist_root, timestamp="20260604_1825")
+
+    assert archive_path.name == f"{build.PACKAGE_NAME}_update_20260604_1825.zip"
+    assert archive_path.is_file()
+
+
+def test_write_customer_update_archive_keeps_app_json_configs(tmp_path):
     package_root = tmp_path / build.PACKAGE_NAME
     dist_root = tmp_path / "dist"
     app_root = package_root / "apps" / "xinyu"
@@ -119,6 +131,8 @@ def test_write_customer_update_archive_excludes_app_customer_config_assets(tmp_p
     (app_root / "config.py").write_text("NAME = 'xinyu'\n", encoding="utf-8")
     (app_root / "config.json").write_text('{"persona": "custom"}', encoding="utf-8")
     (app_root / "ocr_config.py").write_text("RULES = {}\n", encoding="utf-8")
+    (app_root / "dialogue_ocr_config.json").write_text('{"mode": "dialogue"}', encoding="utf-8")
+    (app_root / "list_ocr_config.json").write_text('{"mode": "list"}', encoding="utf-8")
     (app_root / "templates" / "buttons" / "btn_返回按钮.jpg").write_bytes(b"image")
 
     archive_path = build._write_customer_update_archive(package_root, dist_root)
@@ -129,8 +143,10 @@ def test_write_customer_update_archive_excludes_app_customer_config_assets(tmp_p
     assert f"{build.PACKAGE_NAME}/apps/xinyu/app.py" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/steps.py" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/config.py" in names
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/config.json" not in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/config.json" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/ocr_config.py" not in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/dialogue_ocr_config.json" in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/list_ocr_config.json" in names
     assert all(not name.startswith(f"{build.PACKAGE_NAME}/apps/xinyu/templates/") for name in names)
 
 
@@ -160,6 +176,8 @@ def test_write_full_package_archive_includes_app_customer_config_assets(tmp_path
     (app_root / "templates" / "buttons").mkdir(parents=True)
     (app_root / "config.json").write_text('{"persona": "default"}', encoding="utf-8")
     (app_root / "ocr_config.py").write_text("RULES = {}\n", encoding="utf-8")
+    (app_root / "dialogue_ocr_config.json").write_text('{"mode": "dialogue"}', encoding="utf-8")
+    (app_root / "list_ocr_config.json").write_text('{"mode": "list"}', encoding="utf-8")
     (app_root / "templates" / "buttons" / "btn_返回按钮.jpg").write_bytes(b"image")
 
     archive_path = build._write_full_package_archive(package_root, dist_root)
@@ -169,6 +187,8 @@ def test_write_full_package_archive_includes_app_customer_config_assets(tmp_path
 
     assert f"{build.PACKAGE_NAME}/apps/xinyu/config.json" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/ocr_config.py" in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/dialogue_ocr_config.json" in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/list_ocr_config.json" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/templates/buttons/btn_返回按钮.jpg" in names
 
 
@@ -399,6 +419,41 @@ def test_restore_archives_from_cache_can_restore_full_zip(tmp_path):
     assert full_zip is not None
     assert full_zip.read_bytes() == b"full"
     assert update_zip.read_bytes() == b"update"
+
+
+def test_restore_archives_from_cache_writes_only_timestamped_names(tmp_path):
+    dist_root = tmp_path / "dist"
+    cache_dir = tmp_path / "pkg_cache" / "cache123"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / f"{build.PACKAGE_NAME}_full.zip").write_bytes(b"full")
+    (cache_dir / f"{build.PACKAGE_NAME}_update.zip").write_bytes(b"update")
+
+    full_zip, update_zip = build._restore_archives_from_cache(
+        dist_root,
+        cache_dir,
+        include_full=True,
+        timestamp="20260604_1825",
+    )
+
+    assert full_zip is not None
+    assert full_zip.name == f"{build.PACKAGE_NAME}_full_20260604_1825.zip"
+    assert update_zip.name == f"{build.PACKAGE_NAME}_update_20260604_1825.zip"
+    assert not (dist_root / f"{build.PACKAGE_NAME}_full.zip").exists()
+    assert not (dist_root / f"{build.PACKAGE_NAME}_update.zip").exists()
+
+
+def test_remove_dist_archives_removes_legacy_and_timestamped_zip_names(tmp_path):
+    dist_root = tmp_path / "dist"
+    dist_root.mkdir()
+    (dist_root / f"{build.PACKAGE_NAME}_update.zip").write_bytes(b"legacy")
+    (dist_root / f"{build.PACKAGE_NAME}_update_20260604_1825.zip").write_bytes(b"new")
+    (dist_root / "other.zip").write_bytes(b"other")
+
+    build._remove_dist_archives(dist_root)
+
+    assert not (dist_root / f"{build.PACKAGE_NAME}_update.zip").exists()
+    assert not (dist_root / f"{build.PACKAGE_NAME}_update_20260604_1825.zip").exists()
+    assert (dist_root / "other.zip").is_file()
 
 
 def test_ensure_runtime_available_reuses_cached_runtime(tmp_path, monkeypatch):

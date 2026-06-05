@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import time
 from types import SimpleNamespace
 
 from services.config_manager import ConfigManager
@@ -39,6 +40,36 @@ class StartupCheckApp(DummyApp):
             if log_label is not None:
                 payload["current_step_log_label"] = log_label
             self.status_callback(payload)
+
+
+class RaisingApp(DummyApp):
+    def __init__(self, robot, config, reply_provider=None, sent_callback=None):
+        super().__init__(robot, config, reply_provider=reply_provider, sent_callback=sent_callback)
+        self.circuit_breaker_threshold = 1
+
+    def run_once(self):
+        raise RuntimeError("boom")
+
+    def get_status(self):
+        return {
+            "current_step": "raising_step",
+            "current_step_label": "Raising Step",
+            "error_count": self.status.error_count,
+            "is_circuit_open": self.status.is_circuit_open,
+            "last_error": getattr(self.status, "last_error", ""),
+        }
+
+
+class CountingApp(DummyApp):
+    def __init__(self, robot, config, reply_provider=None, sent_callback=None):
+        super().__init__(robot, config, reply_provider=reply_provider, sent_callback=sent_callback)
+        self.count = 0
+
+    def run_once(self):
+        self.count += 1
+
+    def get_status(self):
+        return {"is_circuit_open": False, "current_step": "counting", "current_step_label": "Counting"}
 
 
 def test_worker_suppresses_app_status_after_stop(tmp_path, monkeypatch):
@@ -183,3 +214,47 @@ def test_worker_startup_back_button_check_accepts_app_template(tmp_path, monkeyp
     )
 
     assert worker._required_back_button_templates_available() is True
+
+
+def test_worker_exception_is_isolated_to_that_device(tmp_path, monkeypatch):
+    monkeypatch.setattr(device_worker_module, "get_registered_apps", lambda: {"bad": RaisingApp, "good": CountingApp})
+    monkeypatch.setattr(device_worker_module, "back_button_template_paths", lambda _config: ["template"])
+    events: "queue.Queue" = queue.Queue()
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    bad_worker = DeviceWorker(
+        {"ip": "192.168.1.108", "selected_app": "bad"},
+        app_config={"poll_interval": 0.01, "robot_monitor": {"enabled": False}},
+        events=events,
+        config_manager=manager,
+        robot=object(),
+    )
+    good_worker = DeviceWorker(
+        {"ip": "192.168.1.109", "selected_app": "good"},
+        app_config={"poll_interval": 0.01, "robot_monitor": {"enabled": False}},
+        events=events,
+        config_manager=manager,
+        robot=object(),
+    )
+
+    bad_worker.start()
+    good_worker.start()
+    deadline = time.monotonic() + 2.0
+    emitted = []
+    try:
+        while time.monotonic() < deadline:
+            while not events.empty():
+                emitted.append(events.get_nowait())
+            bad_error = any(event.device_ip == "192.168.1.108" and event.message == "app_error" for event in emitted)
+            good_tick = any(event.device_ip == "192.168.1.109" and event.message == "tick" for event in emitted)
+            if bad_error and good_tick:
+                break
+            time.sleep(0.01)
+    finally:
+        bad_worker.stop()
+        good_worker.stop()
+        bad_worker.join(timeout=1)
+        good_worker.join(timeout=1)
+
+    assert any(event.device_ip == "192.168.1.108" and event.message == "app_error" for event in emitted)
+    assert any(event.device_ip == "192.168.1.109" and event.message == "tick" for event in emitted)
+    assert good_worker.app.count > 0

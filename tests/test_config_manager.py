@@ -12,6 +12,11 @@ def _read_app_config(tmp_path, app_name):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _read_app_ocr_mode_config(tmp_path, app_name, filename):
+    path = tmp_path / "apps" / app_name / filename
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def test_config_manager_get_set_and_atomic_write(tmp_path):
     config_path = tmp_path / "config.json"
     outbox_path = tmp_path / "outbox.json"
@@ -190,13 +195,64 @@ def test_config_manager_migrates_legacy_app_override_scopes_on_update(tmp_path):
 
     saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     app_saved = _read_app_config(tmp_path, "wechat")
+    dialogue_saved = _read_app_ocr_mode_config(tmp_path, "wechat", "dialogue_ocr_config.json")
     assert saved["devices"][0]["runtime_overrides"]["poll_interval"] == 9
     assert "apps" not in saved
-    assert app_saved["ocr_modes"]["dialogue"]["rules"]["line_gap"] == 1
+    assert "dialogue" not in app_saved.get("ocr_modes", {})
+    assert dialogue_saved["rules"]["line_gap"] == 1
     assert saved["devices"][0]["app_overrides"] == {}
     app_config = manager.get_app_config("1.1.1.1", "wechat", WECHAT_DEFAULT_CONFIG)
     assert app_config["poll_interval"] == 9
     assert app_config["ocr_modes"]["dialogue"]["rules"]["line_gap"] == 1
+
+
+def test_config_manager_splits_app_level_dialogue_and_list_ocr_files_on_save(tmp_path):
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+
+    manager.update_app_config(
+        "xinyu",
+        {
+            "ocr_modes": {
+                "dialogue": {"rules": {"line_gap": 31}},
+                "list": {"rules": {"main_top_ratio": 0.18}},
+                "points": {"rules": {"neighbor_x_ratio": 0.66}},
+            }
+        },
+    )
+
+    base_saved = _read_app_config(tmp_path, "xinyu")
+    dialogue_saved = _read_app_ocr_mode_config(tmp_path, "xinyu", "dialogue_ocr_config.json")
+    list_saved = _read_app_ocr_mode_config(tmp_path, "xinyu", "list_ocr_config.json")
+
+    assert "dialogue" not in base_saved.get("ocr_modes", {})
+    assert "list" not in base_saved.get("ocr_modes", {})
+    assert base_saved["ocr_modes"]["points"]["rules"]["neighbor_x_ratio"] == 0.66
+    assert dialogue_saved["rules"]["line_gap"] == 31
+    assert list_saved["rules"]["main_top_ratio"] == 0.18
+
+
+def test_config_manager_reads_split_app_level_dialogue_and_list_ocr_files(tmp_path):
+    apps_dir = tmp_path / "apps" / "xinyu"
+    apps_dir.mkdir(parents=True)
+    (apps_dir / "config.json").write_text(
+        json.dumps({"ocr_modes": {"points": {"rules": {"neighbor_x_ratio": 0.45}}}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (apps_dir / "dialogue_ocr_config.json").write_text(
+        json.dumps({"rules": {"line_gap": 35}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (apps_dir / "list_ocr_config.json").write_text(
+        json.dumps({"rules": {"main_top_ratio": 0.16}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    app_config = manager.get_app_config("1.1.1.1", "xinyu", {})
+
+    assert app_config["ocr_modes"]["dialogue"]["rules"]["line_gap"] == 35
+    assert app_config["ocr_modes"]["list"]["rules"]["main_top_ratio"] == 0.16
+    assert app_config["ocr_modes"]["points"]["rules"]["neighbor_x_ratio"] == 0.45
 
 
 def test_config_manager_normalizes_device_template_paths_to_app_scope(tmp_path):

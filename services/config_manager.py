@@ -61,6 +61,8 @@ DEVICE_APP_LEVEL_KEYS = {
     "next_message_click_y_offset",
 }
 APP_CONFIG_FILE_NAME = "config.json"
+APP_DIALOGUE_OCR_CONFIG_FILE_NAME = "dialogue_ocr_config.json"
+APP_LIST_OCR_CONFIG_FILE_NAME = "list_ocr_config.json"
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -256,8 +258,29 @@ def _app_config_path(app_config_root: Path, app_name: str) -> Path:
     return app_config_root / str(app_name) / APP_CONFIG_FILE_NAME
 
 
+def _app_dialogue_ocr_config_path(app_config_root: Path, app_name: str) -> Path:
+    return app_config_root / str(app_name) / APP_DIALOGUE_OCR_CONFIG_FILE_NAME
+
+
+def _app_list_ocr_config_path(app_config_root: Path, app_name: str) -> Path:
+    return app_config_root / str(app_name) / APP_LIST_OCR_CONFIG_FILE_NAME
+
+
+def _load_app_ocr_mode_override_files(app_config_root: Path, app_name: str) -> dict[str, Any]:
+    ocr_modes: dict[str, Any] = {}
+    for mode_name, path in (
+        ("dialogue", _app_dialogue_ocr_config_path(app_config_root, app_name)),
+        ("list", _app_list_ocr_config_path(app_config_root, app_name)),
+    ):
+        payload = _load_json_dict(path)
+        if payload:
+            ocr_modes[mode_name] = payload
+    return {"ocr_modes": ocr_modes} if ocr_modes else {}
+
+
 def _load_app_override_file(app_config_root: Path, app_name: str) -> dict[str, Any]:
     payload = _load_json_dict(_app_config_path(app_config_root, app_name))
+    payload = _deep_merge(payload, _load_app_ocr_mode_override_files(app_config_root, app_name))
     app_level, _, _ = _split_override_scopes(payload)
     _normalize_app_templates(app_name, app_level)
     _normalize_huanyou_dialogue_rules(app_name, app_level)
@@ -308,7 +331,23 @@ def _merge_app_level_config(app_config_root: Path, app_name: str, updates: dict[
     existing = _load_app_override_file(app_config_root, app_name)
     merged = _deep_merge(existing, updates)
     _normalize_app_templates(app_name, merged)
+    ocr_modes = merged.get("ocr_modes", {})
+    ocr_modes = copy.deepcopy(ocr_modes) if isinstance(ocr_modes, dict) else {}
+    dialogue_mode = ocr_modes.pop("dialogue", None)
+    list_mode = ocr_modes.pop("list", None)
+    if ocr_modes:
+        merged["ocr_modes"] = ocr_modes
+    else:
+        merged.pop("ocr_modes", None)
     _atomic_write_json(_app_config_path(app_config_root, app_name), merged)
+    for mode_payload, path in (
+        (dialogue_mode, _app_dialogue_ocr_config_path(app_config_root, app_name)),
+        (list_mode, _app_list_ocr_config_path(app_config_root, app_name)),
+    ):
+        if isinstance(mode_payload, dict) and mode_payload:
+            _atomic_write_json(path, mode_payload)
+        else:
+            path.unlink(missing_ok=True)
 
 
 def _merge_runtime_overrides(device: dict[str, Any], updates: dict[str, Any]) -> None:

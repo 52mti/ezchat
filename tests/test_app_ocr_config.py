@@ -46,7 +46,11 @@ def test_huanyou_dialogue_sender_anchor_is_app_specific():
     assert huanyou_sender["bubble_color_sender2_blue_red_ratio_min"] == 1.60
     assert huanyou_sender["bubble_color_sender2_blue_min_saturation"] == 0.30
     assert wechat_sender["method"] == "position"
-    assert xinyu_sender["method"] == "position"
+    assert xinyu_sender["method"] == "bubble_color"
+    assert xinyu_sender["bubble_color_sender2_hue_min"] == 0
+    assert xinyu_sender["bubble_color_sender2_hue_max"] == 12
+    assert xinyu_sender["bubble_color_sender2_blue_red_ratio_min"] == 0.80
+    assert xinyu_sender["bubble_color_sender2_blue_min_saturation"] == 0.18
 
 
 def test_huanyou_list_rules_enable_left_badge_unread_and_filter_marketing_rows():
@@ -59,6 +63,11 @@ def test_huanyou_list_rules_enable_left_badge_unread_and_filter_marketing_rows()
     assert rules["left_badge_read_red_badge_number"] is False
     assert rules["row_top_extra_top_ratio"] == 0.012
     assert rules["red_badge_enable_white_digit_bonus"] is True
+    assert rules["red_badge_require_white_digit"] is True
+    assert rules["red_badge_enable_relative_white_digit"] is True
+    assert rules["red_badge_relative_white_value_delta"] == 20
+    assert rules["red_badge_relative_white_saturation_delta"] == 20
+    assert rules["red_badge_min_circularity"] == 0.65
     assert "在线匹配" in rules["excluded_keywords"]
     assert "在线配对" in rules["excluded_keywords"]
     assert "小助手" in rules["excluded_keywords"]

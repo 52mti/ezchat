@@ -50,12 +50,22 @@ from PIL import Image
 from apps import get_default_app_name, get_registered_apps, resolve_app_name
 from apps.defaults import DEFAULT_RUNTIME_CONFIG, with_app_defaults
 from apps.visual_assets import (
+    CHAT_LIST_SCREEN,
+    CHAT_WINDOW_SCREEN,
     CUSTOM_BACK_BUTTON,
     CUSTOM_POPUP,
+    INPUT_BOX_BUTTON,
+    MICROPHONE_BUTTON,
+    MY_SCREEN,
+    NEW_GREETING_BUTTON,
+    NEXT_MESSAGE_BUTTON,
+    SEND_BUTTON,
     back_button_template_paths,
+    fixed_template_rules,
     import_target_path,
     is_back_button_template_name,
     is_popup_template_name,
+    template_variant_paths,
 )
 from lgb.lgb import RobotInterface, scan_devices
 from services import ConfigManager, LicenseClient
@@ -1077,12 +1087,20 @@ class MainWindow(QMainWindow):
             selected_ip = str(self.log_device_filter.currentData() or "")
         self.logs.clear()
         for event in self.log_events:
-            if selected_ip and event.device_ip != selected_ip:
+            event_ip = str(getattr(event, "device_ip", "") or "")
+            if selected_ip and event_ip != selected_ip:
                 continue
+            self._append_log_event(event)
+
+    def _append_log_event(self, event: WorkerEvent) -> None:
+        try:
             self.logs.append(self._format_log_event(event))
+        except Exception as exc:
+            device_ip = str(getattr(event, "device_ip", "unknown") or "unknown")
+            self.logs.append(f"[error] {device_ip}: UI事件日志格式化失败：{exc}")
 
     def _format_log_event(self, event: WorkerEvent) -> str:
-        payload = event.payload or {}
+        payload = event.payload if isinstance(event.payload, dict) else {}
         if event.level == "status" and event.message == "tick":
             return f"[{event.level}] {event.device_ip}: 心跳"
         if event.level == "status" and event.message.startswith("progress:"):
@@ -1203,36 +1221,49 @@ class MainWindow(QMainWindow):
             except queue.Empty:
                 break
             self.log_events.append(event)
-            selected_ip = ""
-            if hasattr(self, "log_device_filter"):
-                selected_ip = str(self.log_device_filter.currentData() or "")
-            if not selected_ip or event.device_ip == selected_ip:
-                self.logs.append(self._format_log_event(event))
-            if event.level == "status":
-                if self._row_status_for_device(event.device_ip) in {"stopping", "stopped"}:
-                    continue
-                is_open = bool((event.payload or {}).get("is_circuit_open"))
-                current_step = str((event.payload or {}).get("current_step", "") or "")
-                detail = strip_status_coordinates(str((event.payload or {}).get("current_step_label", "") or ""))
-                reply_round_count = int((event.payload or {}).get("reply_round_count") or 0)
-                average_reply_seconds = (event.payload or {}).get("average_reply_seconds")
-                self._set_row_average_reply_time(event.device_ip, average_reply_seconds, reply_round_count)
-                if is_open:
-                    row_status = "circuit_open"
-                elif current_step.startswith(("black_screen", "no_phone")):
-                    row_status = "abnormal"
-                else:
-                    row_status = "running"
-                self._set_row_status(event.device_ip, row_status, detail)
-            elif event.message in {"paused", "stopped", "stopping"}:
-                if event.message == "stopped":
-                    self._finalize_unattended_timer(event.device_ip)
-                detail = str((event.payload or {}).get("detail", "") or "")
-                self._set_row_status(event.device_ip, event.message, detail)
-            elif event.message in {"xinyu_balance", "huanyou_balance"}:
-                self._set_row_balance(event.device_ip, str((event.payload or {}).get("balance", "") or ""))
-        self._refresh_unattended_durations()
+            try:
+                self._handle_worker_event(event)
+            except Exception as exc:
+                device_ip = str(getattr(event, "device_ip", "unknown") or "unknown")
+                self.logs.append(f"[error] {device_ip}: UI事件处理失败：{exc}")
+        try:
+            self._refresh_unattended_durations()
+        except Exception as exc:
+            self.logs.append(f"[error] UI: 无干预时长刷新失败：{exc}")
 
+    def _handle_worker_event(self, event: WorkerEvent) -> None:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        event_ip = str(event.device_ip or "")
+        message = str(event.message or "")
+        level = str(event.level or "")
+        selected_ip = ""
+        if hasattr(self, "log_device_filter"):
+            selected_ip = str(self.log_device_filter.currentData() or "")
+        if not selected_ip or event_ip == selected_ip:
+            self._append_log_event(event)
+        if level == "status":
+            if self._row_status_for_device(event_ip) in {"stopping", "stopped"}:
+                return
+            is_open = bool(payload.get("is_circuit_open"))
+            current_step = str(payload.get("current_step", "") or "")
+            detail = strip_status_coordinates(str(payload.get("current_step_label", "") or ""))
+            reply_round_count = int(payload.get("reply_round_count") or 0)
+            average_reply_seconds = payload.get("average_reply_seconds")
+            self._set_row_average_reply_time(event_ip, average_reply_seconds, reply_round_count)
+            if is_open:
+                row_status = "circuit_open"
+            elif current_step.startswith(("black_screen", "no_phone")):
+                row_status = "abnormal"
+            else:
+                row_status = "running"
+            self._set_row_status(event_ip, row_status, detail)
+        elif message in {"paused", "stopped", "stopping"}:
+            if message == "stopped":
+                self._finalize_unattended_timer(event_ip)
+            detail = str(payload.get("detail", "") or "")
+            self._set_row_status(event_ip, message, detail)
+        elif message in {"xinyu_balance", "huanyou_balance"}:
+            self._set_row_balance(event_ip, str(payload.get("balance", "") or ""))
 
 class _LegacyAppConfigDialog(QDialog):
     def __init__(
@@ -1706,10 +1737,10 @@ class PopupCropDialog(QDialog):
         ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
         cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
         if ok_button:
-            ok_button.setText("????")
+            ok_button.setText("确定")
             ok_button.setObjectName("PrimaryButton")
         if cancel_button:
-            cancel_button.setText("??")
+            cancel_button.setText("取消")
         buttons.accepted.connect(self._accept_crop)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
@@ -1717,7 +1748,7 @@ class PopupCropDialog(QDialog):
     def _accept_crop(self) -> None:
         box = self.crop_label.crop_box()
         if box is None:
-            QMessageBox.warning(self, "?????", "???????????")
+            QMessageBox.warning(self, "未选择区域", "请先在图片上框选区域")
             return
         self.cropped_image = self.source_image.crop(box)
         self.accept()
@@ -1772,18 +1803,33 @@ class TemplateManagerWidget(QWidget):
         action_layout = QVBoxLayout(action_panel)
         action_layout.setContentsMargins(14, 12, 14, 12)
         action_layout.setSpacing(8)
-        template_actions = QHBoxLayout()
-        template_actions.setSpacing(8)
-        add_popup = QPushButton("添加弹窗")
-        add_popup.setObjectName("PrimaryButton")
-        add_popup.clicked.connect(self._capture_popup_template)
-        template_actions.addWidget(add_popup)
-        add_back_button = QPushButton("添加返回按钮")
-        add_back_button.setObjectName("PrimaryButton")
-        add_back_button.clicked.connect(self._capture_back_button_template)
-        template_actions.addWidget(add_back_button)
-        template_actions.addStretch(1)
-        action_layout.addLayout(template_actions)
+        template_action_rows: list[list[tuple[str, str, str]]] = [
+            [
+                ("添加弹窗", CUSTOM_POPUP, "弹窗模板"),
+                ("添加返回按钮", CUSTOM_BACK_BUTTON, "返回按钮模板"),
+                ("添加发送按钮", SEND_BUTTON, "发送按钮模板"),
+                ("添加麦克风", MICROPHONE_BUTTON, "麦克风模板"),
+                ("添加输入框", INPUT_BOX_BUTTON, "输入框模板"),
+            ],
+            [
+                ("添加下一条", NEXT_MESSAGE_BUTTON, "下一条模板"),
+                ("添加新招呼", NEW_GREETING_BUTTON, "新招呼模板"),
+                ("添加聊天界面", CHAT_WINDOW_SCREEN, "聊天界面模板"),
+                ("添加聊天列表", CHAT_LIST_SCREEN, "聊天列表模板"),
+                ("添加我的界面", MY_SCREEN, "我的界面模板"),
+            ],
+        ]
+        for row_index, action_specs in enumerate(template_action_rows):
+            template_actions = QHBoxLayout()
+            template_actions.setSpacing(8)
+            for text, target_key, label in action_specs:
+                button = QPushButton(text)
+                if row_index == 0 and target_key in {CUSTOM_POPUP, CUSTOM_BACK_BUTTON}:
+                    button.setObjectName("PrimaryButton")
+                button.clicked.connect(lambda checked=False, key=target_key, title=label: self._capture_template(key, title))
+                template_actions.addWidget(button)
+            template_actions.addStretch(1)
+            action_layout.addLayout(template_actions)
         layout.addWidget(action_panel)
 
         list_panel = QFrame()
@@ -1817,8 +1863,20 @@ class TemplateManagerWidget(QWidget):
             for path in back_button_template_paths({"templates": {"buttons": str(self.buttons_dir)}})
             if is_back_button_template_name(path.name)
         )
-        self.table.setRowCount(len(files))
-        for row, (kind, path) in enumerate(files):
+        for rule in fixed_template_rules():
+            root = self.buttons_dir if rule.group == "buttons" else self.screens_dir
+            for path in template_variant_paths(root, rule.filename):
+                files.append((rule.label, path))
+        seen: set[Path] = set()
+        unique_files: list[tuple[str, Path]] = []
+        for kind, path in files:
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            unique_files.append((kind, path))
+        self.table.setRowCount(len(unique_files))
+        for row, (kind, path) in enumerate(unique_files):
             self.table.setItem(row, 0, QTableWidgetItem(kind))
             self.table.setItem(row, 1, QTableWidgetItem(path.name))
             delete_button = QPushButton("删除")
@@ -2616,6 +2674,7 @@ class DeviceSettingsDialogInteractive(QDialog):
         self.device_ip = device_ip
         self.app_name = app_name
         self.selected_point: tuple[float, float] | None = None
+        self.current_screenshot: Image.Image | None = None
         self.offset_spin_boxes: dict[str, tuple[QDoubleSpinBox, QDoubleSpinBox]] = {}
         self.test_target_combo: QComboBox | None = None
         self.setWindowTitle(f"设备设置 - {device_ip} / {app_name}")
@@ -2659,7 +2718,15 @@ class DeviceSettingsDialogInteractive(QDialog):
         self.refresh_screenshot_button = QPushButton("刷新截图")
         self.refresh_screenshot_button.setObjectName("PrimaryButton")
         self.refresh_screenshot_button.clicked.connect(self._refresh_screenshot)
-        screenshot_layout.addWidget(self.refresh_screenshot_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.save_error_screenshot_button = QPushButton("保存当前图片到报错路径")
+        self.save_error_screenshot_button.clicked.connect(self._save_current_screenshot_to_error_path)
+        screenshot_button_row = QHBoxLayout()
+        screenshot_button_row.setContentsMargins(0, 0, 0, 0)
+        screenshot_button_row.setSpacing(8)
+        screenshot_button_row.addWidget(self.refresh_screenshot_button)
+        screenshot_button_row.addWidget(self.save_error_screenshot_button)
+        screenshot_button_row.addStretch(1)
+        screenshot_layout.addLayout(screenshot_button_row)
 
         placeholder = QPixmap(720, 1280)
         placeholder.fill(QColor("#f8fafc"))
@@ -2797,11 +2864,32 @@ class DeviceSettingsDialogInteractive(QDialog):
             self.refresh_screenshot_button.setText(original_text)
 
     def _set_screenshot(self, image: Image.Image) -> None:
+        self.current_screenshot = image.copy()
         self.crop_label.set_pixmap(_pixmap_from_pil_image(image))
         self.selected_point = None
         self.point_x_label.setText("--")
         self.point_y_label.setText("--")
         self._update_click_labels()
+
+    def _save_current_screenshot_to_error_path(self) -> None:
+        if self.current_screenshot is None:
+            QMessageBox.warning(self, "未刷新截图", "请先刷新截图，再保存当前图片。")
+            return
+        error_dir = Path("photo") / "errors"
+        error_dir.mkdir(parents=True, exist_ok=True)
+        safe_ip = re.sub(r"[^0-9A-Za-z_.-]+", "_", self.device_ip).replace(".", "_")
+        safe_app = re.sub(r"[^0-9A-Za-z_.-]+", "_", self.app_name)
+        file_name = f"manual_{safe_ip}_{safe_app}_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+        target = error_dir / file_name
+        image = self.current_screenshot
+        if image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
+        try:
+            image.save(target, format="JPEG", quality=95)
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", f"无法保存当前图片：{exc}")
+            return
+        QMessageBox.information(self, "保存完成", f"已保存到：{target}")
 
     def _selected_field_key(self) -> str | None:
         if self.test_target_combo is not None and self.test_target_combo.count() > 0:

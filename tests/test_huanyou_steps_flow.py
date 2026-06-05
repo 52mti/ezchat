@@ -328,8 +328,13 @@ def test_click_next_message_offsets_x(monkeypatch):
 
 def test_click_new_greeting_uses_configured_offsets(monkeypatch):
     robot = FakeRobot()
+    regions: list[tuple[float, float, float, float]] = []
 
-    monkeypatch.setattr(huanyou_app.steps, "_template_center", lambda image, config, key, group: (0.4, 0.5))
+    def fake_template_center_in_region(image, config, key, *, group, region):
+        regions.append(region)
+        return (0.4, 0.5)
+
+    monkeypatch.setattr(huanyou_app.steps, "_template_center_in_region", fake_template_center_in_region)
     monkeypatch.setattr(huanyou_app.steps.time, "sleep", lambda seconds: None)
 
     assert (
@@ -341,6 +346,7 @@ def test_click_new_greeting_uses_configured_offsets(monkeypatch):
         is True
     )
     assert robot.clicks == [(0.43, 0.48)]
+    assert regions == [huanyou_app.steps.NEW_GREETING_SEARCH_REGION]
 
 
 def test_click_next_message_uses_configured_offsets(monkeypatch):
@@ -557,6 +563,36 @@ def test_click_next_message_until_changed_retries_same_contact(monkeypatch):
     assert clicks == 2
     assert name_point is None
     assert robot.clicks == [(0.4, 0.5), (0.4, 0.5)]
+
+
+def test_consume_new_greetings_stops_without_next_when_expected_name(monkeypatch):
+    robot = FakeRobot()
+    reports: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(huanyou_app.steps, "click_new_greeting", lambda robot, config, image=None, reporter=None: True)
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "capture_after_popups",
+        lambda robot, config, label="", reporter=None: b"after_greeting",
+    )
+
+    def fake_next_message(robot, config, expected_name=None, image=None, reporter=None):
+        raise huanyou_app.steps.StepUnavailable("查找失败：没有匹配到下一条按钮，已尝试图片：btn_下一条按钮.jpg")
+
+    monkeypatch.setattr(huanyou_app.steps, "click_next_message_until_changed", fake_next_message)
+
+    image, handled, stopped_without_next = huanyou_app.steps.consume_new_greetings(
+        robot,
+        {},
+        image=b"chat",
+        expected_name="余额",
+        reporter=lambda key, label, log_label=None: reports.append((key, label)),
+    )
+
+    assert image == b"after_greeting"
+    assert handled == 1
+    assert stopped_without_next is True
+    assert ("new_greeting_no_next", "新招呼后未找到下一条，返回聊天列表") in reports
 
 
 def test_huanyou_keep_screen_awake_clicks_message_twice(monkeypatch):
@@ -1204,9 +1240,10 @@ def test_read_message_uses_configured_dialogue_target_sender(monkeypatch):
             "result": {
                 "user_name": "???",
                 "dialogues": [
-                    {"sender": "sender1", "content": "????????????"},
-                    {"sender": "sender2", "content": "????"},
-                    {"sender": "sender1", "content": "??"},
+                    {"sender": "sender1", "content": "旧消息"},
+                    {"sender": "sender2", "content": "自己回复"},
+                    {"sender": "sender1", "content": "第一句"},
+                    {"sender": "sender1", "content": "第二句"},
                 ],
             },
         },
@@ -1228,4 +1265,45 @@ def test_read_message_uses_configured_dialogue_target_sender(monkeypatch):
     )
 
     assert message["contact"] == "???"
-    assert message["content"] == "??"
+    assert message["content"] == "第一句第二句"
+
+
+def test_read_message_defaults_to_hello_when_target_sender_missing(monkeypatch):
+    robot = FakeRobot()
+    reports: list[tuple[str, str, str | None]] = []
+
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "run_ocr_mode",
+        lambda image, config, mode, region=None: {
+            "ocr_items": [{"text": "聊天标题"}],
+            "result": {
+                "user_name": "用户",
+                "dialogues": [
+                    {"sender": "sender2", "content": "自己回复"},
+                    {"sender": "sender2", "content": "继续回复"},
+                ],
+            },
+        },
+    )
+
+    message = huanyou_app.steps.read_message(
+        robot,
+        {
+            "ocr_modes": {
+                "dialogue": {
+                    "rules": {
+                        "target_sender": "sender1",
+                    },
+                },
+            },
+        },
+        {"name": "列表用户"},
+        image=b"image",
+        reporter=lambda step, label, log_label=None: reports.append((step, label, log_label)),
+    )
+
+    assert message["contact"] == "列表用户"
+    assert message["content"] == "你好"
+    assert message["sender"] == "sender1"
+    assert any(step == "dialogue_ocr_fallback" for step, _label, _log_label in reports)

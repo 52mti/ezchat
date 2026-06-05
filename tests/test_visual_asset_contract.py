@@ -39,14 +39,17 @@ def test_template_names_align_main_program_and_helper_tool_contract(tmp_path):
     tool_filenames = {rule["key"]: rule["filename"] for rule in tool_rules["templates"]}
     popup_rule = tool_rules["popups"][0]
 
-    assert [rule["label"] for rule in tool_rules["save_types"]] == ["判定界面", "按钮", "弹窗"]
-    assert targets[visual_assets.CHAT_LIST_SCREEN] == "chat_list.jpg"
-    assert targets[visual_assets.CHAT_WINDOW_SCREEN] == "chat_window.jpg"
-    assert targets[visual_assets.NEXT_MESSAGE_BUTTON] == "btn_next_msg.jpg"
-    assert targets[visual_assets.VOICE_INPUT_BUTTON] == "btn_voice_input.jpg"
-    assert targets[visual_assets.SEND_BUTTON] == "btn_send.jpg"
+    assert [rule["key"] for rule in tool_rules["save_types"]] == ["screen", "button", "popup"]
+    assert targets[visual_assets.CHAT_LIST_SCREEN] == "screen_聊天列表.jpg"
+    assert targets[visual_assets.CHAT_WINDOW_SCREEN] == "screen_聊天界面.jpg"
+    assert targets[visual_assets.MY_SCREEN] == "screen_我的界面.jpg"
+    assert targets[visual_assets.NEXT_MESSAGE_BUTTON] == "btn_下一条按钮.jpg"
+    assert targets[visual_assets.INPUT_BOX_BUTTON] == "btn_输入框.jpg"
+    assert targets[visual_assets.MICROPHONE_BUTTON] == "btn_麦克风按钮.jpg"
+    assert targets[visual_assets.SEND_BUTTON] == "btn_发送按钮.jpg"
+    assert targets[visual_assets.NEW_GREETING_BUTTON] == "btn_新招呼按钮.jpg"
     assert targets[visual_assets.BACK_BUTTON] == "btn_back.jpg"
-    assert targets[visual_assets.CUSTOM_BACK_BUTTON] == "btn_返回按钮.jpg"
+    assert targets[visual_assets.CUSTOM_BACK_BUTTON] == visual_assets.next_back_button_template_path(buttons_dir).name
     assert targets[visual_assets.CUSTOM_POPUP] == "popup_custom_1.jpg"
     assert tool_filenames[visual_assets.SEND_BUTTON] == targets[visual_assets.SEND_BUTTON]
     assert popup_rule["key"] == visual_assets.CUSTOM_POPUP
@@ -88,6 +91,33 @@ def test_next_back_button_template_path_keeps_app_button_pattern(tmp_path):
 
     assert target.name == "btn_返回按钮_3.jpg"
     assert visual_assets.is_back_button_template_name(target.name)
+
+
+def test_fixed_template_import_uses_incremental_variant_names(tmp_path):
+    buttons_dir = tmp_path / "buttons"
+    screens_dir = tmp_path / "screens"
+    buttons_dir.mkdir()
+    screens_dir.mkdir()
+    (buttons_dir / "btn_发送按钮.jpg").write_bytes(b"existing")
+    (buttons_dir / "btn_发送按钮_2.jpg").write_bytes(b"existing")
+    (screens_dir / "screen_聊天列表.jpg").write_bytes(b"existing")
+
+    send_target = visual_assets.import_target_path(visual_assets.SEND_BUTTON, buttons_dir, screens_dir)
+    list_target = visual_assets.import_target_path(visual_assets.CHAT_LIST_SCREEN, buttons_dir, screens_dir)
+
+    assert send_target.name == "btn_发送按钮_3.jpg"
+    assert list_target.name == "screen_聊天列表_2.jpg"
+
+
+def test_template_variant_paths_load_incremental_templates(tmp_path):
+    buttons_dir = tmp_path / "buttons"
+    buttons_dir.mkdir()
+    for name in ["btn_发送按钮_10.jpg", "btn_发送按钮.jpg", "btn_发送按钮_2.jpg", "btn_发送按钮_old.jpg"]:
+        (buttons_dir / name).write_bytes(b"template")
+
+    paths = visual_assets.template_variant_paths(buttons_dir, "btn_发送按钮.jpg")
+
+    assert [path.name for path in paths] == ["btn_发送按钮.jpg", "btn_发送按钮_2.jpg", "btn_发送按钮_10.jpg"]
 
 
 def test_runtime_loads_multiple_back_button_templates(tmp_path):
@@ -178,8 +208,8 @@ def test_popup_is_checked_before_current_screen(monkeypatch, tmp_path):
     screens_dir.mkdir()
     for path in [
         buttons_dir / "popup_custom_1.jpg",
-        screens_dir / "chat_list.jpg",
-        screens_dir / "chat_window.jpg",
+        screens_dir / "screen_\u804a\u5929\u5217\u8868.jpg",
+        screens_dir / "screen_\u804a\u5929\u754c\u9762.jpg",
     ]:
         path.write_bytes(b"template")
 
@@ -187,9 +217,9 @@ def test_popup_is_checked_before_current_screen(monkeypatch, tmp_path):
         name = Path(template).name
         if image == "popup" and name.startswith("popup_"):
             return {"x": 0.1, "y": 0.2, "w": 0.4, "h": 0.3, "score": 0.99}
-        if image == "popup" and name in {"chat_list.jpg", "chat_window.jpg"}:
+        if image == "popup" and name in {"screen_\u804a\u5929\u5217\u8868.jpg", "screen_\u804a\u5929\u754c\u9762.jpg"}:
             raise AssertionError("current screen was checked before popup handling")
-        if image == "list" and name == "chat_list.jpg":
+        if image == "list" and name == "screen_\u804a\u5929\u5217\u8868.jpg":
             return {"x": 0.2, "y": 0.4, "w": 0.1, "h": 0.2, "score": 0.99}
         return None
 

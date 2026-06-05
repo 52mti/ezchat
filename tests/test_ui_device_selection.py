@@ -244,6 +244,61 @@ def test_status_event_shows_current_step_and_average_reply_time(qtbot, tmp_path)
     assert status_item.data(257) == "Dialogue OCR Read"
 
 
+def test_bad_worker_event_does_not_block_other_device_status(qtbot, tmp_path, monkeypatch):
+    window = _window(
+        qtbot,
+        tmp_path,
+        [
+            {"ip": "192.168.1.108", "selected_app": "xinyu"},
+            {"ip": "192.168.1.109", "selected_app": "huanyou"},
+        ],
+    )
+
+    original_set_average = window._set_row_average_reply_time
+    window._set_row_status("192.168.1.108", "running")
+    window._set_row_status("192.168.1.109", "running")
+
+    def flaky_set_average(device_ip, *args, **kwargs):
+        if device_ip == "192.168.1.108":
+            raise RuntimeError("bad row")
+        return original_set_average(device_ip, *args, **kwargs)
+
+    monkeypatch.setattr(window, "_set_row_average_reply_time", flaky_set_average)
+
+    window.events.put(
+        WorkerEvent(
+            "192.168.1.108",
+            "status",
+            "progress",
+            {
+                "current_step": "bad",
+                "current_step_label": "Bad Event",
+                "is_circuit_open": False,
+            },
+        )
+    )
+    window.events.put(
+        WorkerEvent(
+            "192.168.1.109",
+            "status",
+            "progress",
+            {
+                "current_step": "list_ocr_scan",
+                "current_step_label": "List OCR Scan",
+                "is_circuit_open": False,
+            },
+        )
+    )
+
+    window._drain_events()
+
+    assert "bad row" in window.logs.toPlainText()
+    good_status = window.table.item(1, main_window_module.COL_STATUS)
+    assert good_status is not None
+    assert good_status.data(256) == "running"
+    assert good_status.text() == "List OCR Scan"
+
+
 def test_black_screen_status_is_marked_abnormal(qtbot, tmp_path):
     window = _window(qtbot, tmp_path, [{"ip": "192.168.1.108", "selected_app": "xinyu"}])
     window._set_row_status("192.168.1.108", "running")

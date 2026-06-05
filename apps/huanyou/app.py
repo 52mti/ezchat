@@ -275,7 +275,7 @@ class HuanyouApp(BaseApp):
             if self.idle_waiting:
                 target = steps.rescan_unread_target(self.robot, self.config, reporter=reporter)
             else:
-                reporter("popup_check", "???????")
+                reporter("popup_check", "检查并关闭弹窗")
                 target = steps.find_unread_target(self.robot, self.config, reporter=reporter)
             if not target:
                 self.idle_waiting = True
@@ -302,8 +302,8 @@ class HuanyouApp(BaseApp):
             current_name = str(target.get("name", "") or "").strip()
             reporter(
                 "enter_chat",
-                "??????",
-                log_label=f"???????{current_name} {point_text}" if current_name else f"???????{point_text}",
+                "点击目标进入聊天",
+                log_label=f"点击目标进入聊天：{current_name} {point_text}" if current_name else f"点击目标进入聊天：{point_text}",
             )
             steps.enter_chat(self.robot, float(target["x"]), float(target["y"]))
             self._mark_activity()
@@ -323,7 +323,7 @@ class HuanyouApp(BaseApp):
                 message = steps.read_message(self.robot, self.config, current_target, image=chat_image, reporter=reporter)
                 action = self._reply_to_message(reporter, message)
                 if action.skip:
-                    reporter("skip_reply", "??????")
+                    reporter("skip_reply", "跳过本轮回复")
                     steps.go_back(self.robot, self.config, reporter=reporter)
                     self._mark_activity()
                     self.mark_success()
@@ -345,7 +345,7 @@ class HuanyouApp(BaseApp):
                     )
                     steps.go_back(self.robot, self.config, reporter=reporter, click_count=2)
                     self._mark_activity()
-                    reporter("wait_next_round", "???????")
+                    reporter("wait_next_round", "等待下一轮扫描")
                     self.record_reply_round(time.monotonic() - round_started_at)
                     self.mark_success()
                     return
@@ -380,7 +380,7 @@ class HuanyouApp(BaseApp):
                 if stopped_without_next:
                     steps.go_back(self.robot, self.config, reporter=reporter)
                     self._mark_activity()
-                    reporter("wait_next_round", "???????")
+                    reporter("wait_next_round", "等待下一轮扫描")
                     self.record_reply_round(time.monotonic() - round_started_at)
                     self.mark_success()
                     return

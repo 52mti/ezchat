@@ -15,6 +15,7 @@ _bootstrap/
 wheelhouse/
 
 config.json
+*_ocr_config.json
 outbox.json
 .env/
 runtime/logs/*

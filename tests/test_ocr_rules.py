@@ -6,9 +6,10 @@ from PIL import Image
 
 import vision.ocr_rules as ocr_rules
 from apps.huanyou.ocr_config import DIALOGUE_OCR_MODE as HUANYOU_DIALOGUE_OCR_MODE
+from apps.xinyu.ocr_config import DIALOGUE_OCR_MODE as XINYU_DIALOGUE_OCR_MODE
 from apps.wechat.config import DEFAULT_CONFIG as WECHAT_CONFIG
 from apps.wechat.ocr_config import DIALOGUE_OCR_MODE as WECHAT_DIALOGUE_OCR_MODE
-from vision.ocr_rules import build_dialogue_result, run_ocr_mode
+from vision.ocr_rules import build_dialogue_result, looks_like_time_text, run_ocr_mode
 
 
 def _dialogue_rules(**overrides):
@@ -251,6 +252,92 @@ def test_dialogue_rules_filter_time_and_merge_sender_lines():
     assert result["dialogues"] == [{"sender": "sender1", "content": "你好在吗"}]
 
 
+def test_looks_like_time_text_accepts_relative_day_with_clock():
+    assert looks_like_time_text("昨天05:08") is True
+    assert looks_like_time_text("前天 12:30") is True
+
+
+def test_xinyu_dialogue_rules_filter_prompt_keywords_before_sender_detection():
+    items = [
+        {
+            "text": "和他聊聊看，别错过缘分哦。",
+            "raw_text": "和他聊聊看，别错过缘分哦。",
+            "confidence": 0.99,
+            "min_x": 120,
+            "max_x": 430,
+            "min_y": 250,
+            "max_y": 290,
+            "center_x": 275,
+            "center_y": 270,
+            "width": 310,
+            "height": 40,
+            "background_saturation": 0.41,
+            "background_hue": 103.0,
+            "background_value": 0.48,
+            "background_blue_green_delta": 23.0,
+            "background_blue_red_ratio": 9.5,
+        },
+        {
+            "text": "消息发出没有回复？试试热聊话题",
+            "raw_text": "消息发出没有回复？试试热聊话题",
+            "confidence": 0.99,
+            "min_x": 155,
+            "max_x": 405,
+            "min_y": 960,
+            "max_y": 1005,
+            "center_x": 280,
+            "center_y": 982,
+            "width": 250,
+            "height": 45,
+            "background_saturation": 0.41,
+            "background_hue": 103.0,
+            "background_value": 0.48,
+            "background_blue_green_delta": 23.0,
+            "background_blue_red_ratio": 9.5,
+        },
+        {
+            "text": "请输入信息",
+            "raw_text": "请输入信息",
+            "confidence": 0.99,
+            "min_x": 60,
+            "max_x": 190,
+            "min_y": 1110,
+            "max_y": 1155,
+            "center_x": 125,
+            "center_y": 1132,
+            "width": 130,
+            "height": 45,
+            "background_saturation": 0.41,
+            "background_hue": 103.0,
+            "background_value": 0.48,
+            "background_blue_green_delta": 23.0,
+            "background_blue_red_ratio": 9.5,
+        },
+        {
+            "text": "你会把喜欢的人设置成聊天置顶吗？",
+            "raw_text": "你会把喜欢的人设置成聊天置顶吗？",
+            "confidence": 0.99,
+            "min_x": 98,
+            "max_x": 462,
+            "min_y": 360,
+            "max_y": 430,
+            "center_x": 280,
+            "center_y": 395,
+            "width": 364,
+            "height": 70,
+            "background_saturation": 0.42,
+            "background_hue": 4.0,
+            "background_value": 0.82,
+            "background_blue_green_delta": -12.0,
+            "background_blue_red_ratio": 0.62,
+        },
+    ]
+
+    result = build_dialogue_result(items, (562, 1254), XINYU_DIALOGUE_OCR_MODE["rules"])
+
+    assert result["dialogues"] == [{"sender": "sender2", "content": "你会把喜欢的人设置成聊天置顶吗？"}]
+
+
 def test_dialogue_name_gap_ratio_scales_with_image_height():
     items = [
         {
@@ -438,6 +525,28 @@ def test_huanyou_dialogue_user_name_excludes_distance_text():
     result = build_dialogue_result([item], (681, 1222), HUANYOU_DIALOGUE_OCR_MODE["rules"])
 
     assert result["user_name"] == ""
+
+
+def test_xinyu_dialogue_user_name_accepts_configured_single_char_name():
+    item = {
+        "text": "无",
+        "raw_text": "无",
+        "confidence": 0.99,
+        "min_x": 300,
+        "max_x": 344,
+        "min_y": 70,
+        "max_y": 106,
+        "center_x": 322,
+        "center_y": 88,
+        "width": 44,
+        "height": 36,
+        "background_saturation": 0.1,
+    }
+
+    result = build_dialogue_result([item], (681, 1222), XINYU_DIALOGUE_OCR_MODE["rules"])
+
+    assert result["user_name"] == "无"
+    assert result["dialogues"] == []
 
 
 def test_huanyou_dialogue_rules_do_not_merge_separate_left_bubbles_with_large_gap():

@@ -460,6 +460,24 @@ def test_xinyu_input_box_error_is_reported_in_chinese(monkeypatch, tmp_path):
         steps.focus_input_box(robot, config)
 
 
+def test_xinyu_focus_input_box_clamps_negative_offset(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["chat"])
+
+    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None: "chat")
+
+    def fake_match(image, template, threshold=0.85):
+        if Path(template).name == "btn_输入框.jpg":
+            return {"x": 0.02, "y": 0.80, "w": 0.11, "h": 0.08, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+
+    steps.focus_input_box(robot, config)
+
+    assert robot.clicks == [(0.12, 0.84)]
+
+
 def test_xinyu_chat_window_error_is_reported_in_chinese(monkeypatch, tmp_path):
     config = _config(tmp_path)
     robot = FakeRobot(["list"])
@@ -975,6 +993,71 @@ def test_xinyu_app_reads_dialogue_sender1_last_message(monkeypatch, tmp_path):
     app.run_once()
 
     assert seen == [{"text": "AI回复"}]
+
+
+def test_xinyu_read_message_uses_dialogue_target_sender(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    config["ocr_modes"] = {
+        **config.get("ocr_modes", {}),
+        "dialogue": {
+            "preprocess": {"mode": "original", "scale": 2, "rotate_to_portrait": True},
+            "rules": {
+                "min_confidence": 0.3,
+                "min_box_height_ratio": 0.02,
+                "line_gap": 24,
+                "name_gap_ratio": 0.037,
+                "sender_detection": {"method": "bubble_color", "sender2_min_x_ratio": 0.52},
+                "target_sender": "sender1",
+                "ocr_result_excluded_keywords": [],
+                "line_excluded_keywords": [],
+                "line_and_below_keywords": [],
+                "basic_filter": {
+                    "enable_time_text_filter": True,
+                    "enable_debug_text_filter": True,
+                    "enable_reward_text_filter": True,
+                    "enable_center_y_region_filter": False,
+                    "center_y_min_ratio": 0.18,
+                    "center_y_max_ratio": 0.88,
+                    "enable_max_x_filter": True,
+                    "max_x_ratio": 0.90,
+                    "enable_max_width_filter": True,
+                    "max_width_ratio": 0.80,
+                    "enable_low_conf_single_char_filter": True,
+                    "single_char_confidence_threshold": 0.90,
+                    "enable_right_narrow_non_cjk_filter": True,
+                    "right_narrow_min_x_ratio": 0.88,
+                    "right_narrow_max_width_ratio": 0.12,
+                    "enable_non_cjk_non_emoji_filter": True,
+                },
+            },
+        },
+    }
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "ocr_items": [{"text": "顶部名字"}],
+            "result": {
+                "user_name": "",
+                "dialogues": [
+                    {"sender": "sender1", "content": "更早的对方消息"},
+                    {"sender": "sender2", "content": "右侧自己"},
+                    {"sender": "sender1", "content": "第一句"},
+                    {"sender": "sender1", "content": "第二句"},
+                ],
+            },
+        },
+    )
+
+    result = steps.read_message(
+        FakeRobot([]),
+        config,
+        target={"name": "白嫖", "unread_count": 1, "favorability": 12},
+        image="chat",
+    )
+
+    assert result["content"] == "第一句第二句"
+    assert result["sender"] == "sender1"
 
 
 def test_xinyu_go_back_clicks_back_twice_after_send(monkeypatch, tmp_path):

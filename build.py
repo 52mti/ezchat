@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
@@ -177,7 +178,10 @@ def _is_app_customer_config_asset(relative: str) -> bool:
     parts = relative.split("/")
     if len(parts) < 3 or parts[0] != "apps":
         return False
-    if parts[2] in {"config.json", "ocr_config.py"}:
+    if (
+        parts[2] == "ocr_config.py"
+        or parts[2].endswith("_ocr_config.py")
+    ):
         return True
     return len(parts) >= 3 and parts[2] == "templates"
 
@@ -261,9 +265,10 @@ def _write_archive(
     exclude_runtime_state: bool,
     exclude_full_runtimes: bool,
     exclude_app_customer_config_assets: bool,
+    timestamp: str = "",
 ) -> Path:
     dist_root.mkdir(parents=True, exist_ok=True)
-    archive_path = dist_root / f"{PACKAGE_NAME}{suffix}.zip"
+    archive_path = dist_root / f"{PACKAGE_NAME}{suffix}{'_' + timestamp if timestamp else ''}.zip"
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for arcname in _iter_archive_dirs(
             package_root,
@@ -283,7 +288,7 @@ def _write_archive(
     return archive_path
 
 
-def _write_full_package_archive(package_root: Path, dist_root: Path) -> Path:
+def _write_full_package_archive(package_root: Path, dist_root: Path, *, timestamp: str = "") -> Path:
     return _write_archive(
         package_root,
         dist_root,
@@ -291,10 +296,11 @@ def _write_full_package_archive(package_root: Path, dist_root: Path) -> Path:
         exclude_runtime_state=False,
         exclude_full_runtimes=False,
         exclude_app_customer_config_assets=False,
+        timestamp=timestamp,
     )
 
 
-def _write_customer_update_archive(package_root: Path, dist_root: Path) -> Path:
+def _write_customer_update_archive(package_root: Path, dist_root: Path, *, timestamp: str = "") -> Path:
     return _write_archive(
         package_root,
         dist_root,
@@ -302,6 +308,7 @@ def _write_customer_update_archive(package_root: Path, dist_root: Path) -> Path:
         exclude_runtime_state=True,
         exclude_full_runtimes=True,
         exclude_app_customer_config_assets=True,
+        timestamp=timestamp,
     )
 
 
@@ -772,10 +779,9 @@ def _cleanup_staging(dist_root: Path) -> None:
         _remove_path(staging_root)
 
 
-def _remove_dist_full_archive(dist_root: Path) -> None:
-    full_zip = dist_root / f"{PACKAGE_NAME}_full.zip"
-    if full_zip.exists():
-        full_zip.unlink(missing_ok=True)
+def _remove_dist_archives(dist_root: Path) -> None:
+    for archive_path in dist_root.glob(f"{PACKAGE_NAME}_*.zip"):
+        archive_path.unlink(missing_ok=True)
 
 
 def _publish_cached_package_directory(cached_package_root: Path, dist_root: Path) -> Path:
@@ -807,18 +813,20 @@ def _restore_archives_from_cache(
     cache_dir: Path,
     *,
     include_full: bool,
+    timestamp: str = "",
 ) -> tuple[Path | None, Path]:
     dist_root.mkdir(parents=True, exist_ok=True)
     full_zip: Path | None = None
-    update_zip = dist_root / f"{PACKAGE_NAME}_update.zip"
-    target_full = dist_root / f"{PACKAGE_NAME}_full.zip"
+    update_zip = dist_root / f"{PACKAGE_NAME}_update{'_' + timestamp if timestamp else ''}.zip"
     if include_full:
         cached_full = cache_dir / f"{PACKAGE_NAME}_full.zip"
         if cached_full.is_file():
-            _link_or_copy_file(cached_full, target_full)
-            full_zip = target_full
-    elif target_full.exists():
-        target_full.unlink(missing_ok=True)
+            full_zip = dist_root / f"{PACKAGE_NAME}_full{'_' + timestamp if timestamp else ''}.zip"
+            _link_or_copy_file(cached_full, full_zip)
+    elif not timestamp:
+        target_full = dist_root / f"{PACKAGE_NAME}_full.zip"
+        if target_full.exists():
+            target_full.unlink(missing_ok=True)
     _link_or_copy_file(cache_dir / f"{PACKAGE_NAME}_update.zip", update_zip)
     return full_zip, update_zip
 
@@ -840,6 +848,10 @@ def _store_package_cache(
         shutil.copy2(full_zip, cache_dir / f"{PACKAGE_NAME}_full.zip")
     shutil.copy2(update_zip, cache_dir / f"{PACKAGE_NAME}_update.zip")
     return cache_dir
+
+
+def _current_package_timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M")
 
 
 def _write_windows_script(path: Path, lines: list[str]) -> None:
@@ -978,6 +990,8 @@ def main(argv: list[str] | None = None) -> int:
     dist = root / "dist"
     dist.mkdir(parents=True, exist_ok=True)
     include_full_payload = bool(args.full or args.publish_dir)
+    package_timestamp = _current_package_timestamp()
+    _remove_dist_archives(dist)
 
     package_cache_key = _package_cache_key(
         root,
@@ -992,9 +1006,14 @@ def main(argv: list[str] | None = None) -> int:
         require_full_zip=False,
     ):
         print(f"[package-cache] hit {package_cache_key}")
-        full_zip, update_zip = _restore_archives_from_cache(dist, cache_dir, include_full=args.full)
+        full_zip, update_zip = _restore_archives_from_cache(
+            dist,
+            cache_dir,
+            include_full=args.full,
+            timestamp=package_timestamp,
+        )
         if args.full and full_zip is None:
-            full_zip = _write_full_package_archive(cache_dir / PACKAGE_NAME, dist)
+            full_zip = _write_full_package_archive(cache_dir / PACKAGE_NAME, dist, timestamp=package_timestamp)
         if args.publish_dir:
             published_root = _publish_cached_package_directory(cache_dir / PACKAGE_NAME, dist)
             print(f"[done] package={published_root}")
@@ -1003,8 +1022,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[done] update={update_zip}")
         return 0
 
-    if not args.full:
-        _remove_dist_full_archive(dist)
     package_root = _prepare_staging_package_root(dist)
     _copy_sources(root, package_root)
     _copy_bundled_data(root, package_root)
@@ -1026,8 +1043,8 @@ def main(argv: list[str] | None = None) -> int:
 
     full_zip: Path | None = None
     if args.full:
-        full_zip = _write_full_package_archive(package_root, dist)
-    update_zip = _write_customer_update_archive(package_root, dist)
+        full_zip = _write_full_package_archive(package_root, dist, timestamp=package_timestamp)
+    update_zip = _write_customer_update_archive(package_root, dist, timestamp=package_timestamp)
     cache_dir = _store_package_cache(root, package_root, full_zip, update_zip, cache_key=package_cache_key)
     published_root: Path | None = None
     if args.publish_dir:

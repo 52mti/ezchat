@@ -255,3 +255,20 @@ def test_keep_screen_awake_clicks_bottom_nav_positions_from_list_ocr(monkeypatch
 
     assert steps.keep_screen_awake(robot, config)
     assert robot.clicks == [pytest.approx((0.10, 0.94))]
+
+
+def test_template_candidates_include_incremental_variants(tmp_path):
+    buttons_dir = tmp_path / "buttons"
+    screens_dir = tmp_path / "screens"
+    buttons_dir.mkdir()
+    screens_dir.mkdir()
+    for name in ["btn_发送按钮.jpg", "btn_发送按钮_2.jpg"]:
+        (buttons_dir / name).write_bytes(b"template")
+
+    candidates = steps._template_candidates(
+        {"templates": {"buttons": str(buttons_dir), "screens": str(screens_dir)}},
+        steps.SEND_BUTTON_KEY,
+        group="buttons",
+    )
+
+    assert [path.name for path in candidates] == ["btn_发送按钮.jpg", "btn_发送按钮_2.jpg"]

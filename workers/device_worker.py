@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import queue
 import threading
 import time
@@ -126,13 +127,16 @@ class DeviceWorker(threading.Thread):
     def _emit(self, level: str, message: str, payload: dict[str, Any] | None = None) -> None:
         self.events.put(WorkerEvent(str(self.device["ip"]), level, message, payload))
         safe_payload = "" if payload is None else f" {payload}"
-        setup_runtime_logging().log(
-            {"error": 40, "warning": 30, "info": 20, "status": 20}.get(level, 20),
-            "%s %s%s",
-            self.device["ip"],
-            message,
-            safe_payload,
-        )
+        try:
+            setup_runtime_logging().log(
+                {"error": 40, "warning": 30, "info": 20, "status": 20}.get(level, 20),
+                "%s %s%s",
+                self.device["ip"],
+                message,
+                safe_payload,
+            )
+        except Exception:
+            return
 
     def _emit_app_status(self, payload: dict[str, Any]) -> None:
         if self._stop_event.is_set():
@@ -192,22 +196,91 @@ class DeviceWorker(threading.Thread):
         self._emit("error", detail, {"app_name": self.app_name})
         return False
 
+    def _fallback_status(self) -> dict[str, Any]:
+        status_obj = getattr(self.app, "status", None)
+        if hasattr(status_obj, "as_dict"):
+            try:
+                status = status_obj.as_dict()
+                if isinstance(status, dict):
+                    return status
+            except Exception:
+                pass
+        return {
+            "last_error": str(getattr(status_obj, "last_error", "") or ""),
+            "error_count": int(getattr(status_obj, "error_count", 0) or 0),
+            "is_circuit_open": bool(getattr(status_obj, "is_circuit_open", False)),
+            "current_step": str(getattr(status_obj, "current_step", "") or ""),
+            "current_step_label": str(getattr(status_obj, "current_step_label", "") or ""),
+        }
+
+    def _safe_get_status(self) -> dict[str, Any]:
+        try:
+            status = self.app.get_status()
+            if isinstance(status, dict):
+                return status
+        except Exception as exc:
+            self._emit("error", "worker_status_error", {"error": str(exc), "app_name": self.app_name})
+        return self._fallback_status()
+
+    def _record_unhandled_app_exception(self, exc: Exception) -> dict[str, Any]:
+        status_obj = getattr(self.app, "status", None)
+        try:
+            current_count = int(getattr(status_obj, "error_count", 0) or 0)
+        except (TypeError, ValueError):
+            current_count = 0
+        error_count = current_count + 1
+        if status_obj is not None:
+            with contextlib.suppress(Exception):
+                status_obj.error_count = error_count
+            with contextlib.suppress(Exception):
+                status_obj.last_error = str(exc)
+            threshold = int(getattr(self.app, "circuit_breaker_threshold", 5) or 5)
+            if error_count >= threshold:
+                with contextlib.suppress(Exception):
+                    status_obj.is_circuit_open = True
+        status = self._fallback_status()
+        status["error_count"] = error_count
+        status["last_error"] = str(exc)
+        label = str(status.get("current_step_label", "") or status.get("current_step", "") or "run_once")
+        self._emit(
+            "error",
+            "app_error",
+            {
+                "step": status.get("current_step", ""),
+                "label": label,
+                "error": str(exc),
+                "error_count": error_count,
+                "app_name": self.app_name,
+                "thread_isolated": True,
+            },
+        )
+        return status
+
     def run(self) -> None:
-        poll_interval = float(self.app_config.get("poll_interval", 1))
         self._emit("info", "started")
         try:
-            if not self._ensure_startup_templates():
+            poll_interval = float(self.app_config.get("poll_interval", 1) or 1)
+            try:
+                if not self._ensure_startup_templates():
+                    return
+            except Exception as exc:
+                status = self._record_unhandled_app_exception(exc)
+                status["checked_at"] = datetime.now().isoformat(timespec="seconds")
+                self._emit("status", "tick", status)
                 return
             while not self._stop_event.is_set():
                 self._pause_event.wait()
                 if self._stop_event.is_set():
                     break
-                if not self._license_allows_run():
-                    continue
-                self.app.run_once()
+                try:
+                    if not self._license_allows_run():
+                        continue
+                    self.app.run_once()
+                    status = self._safe_get_status()
+                except Exception as exc:
+                    status = self._record_unhandled_app_exception(exc)
                 if self._stop_event.is_set():
                     break
-                status = self.app.get_status()
                 status["checked_at"] = datetime.now().isoformat(timespec="seconds")
                 self._emit("status", "tick", status)
                 if status.get("is_circuit_open"):

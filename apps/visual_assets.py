@@ -44,10 +44,14 @@ class RegionRule:
 
 CHAT_LIST_SCREEN = "screen.chat_list"
 CHAT_WINDOW_SCREEN = "screen.chat_window"
+MY_SCREEN = "screen.my"
 CUSTOM_SCREEN = "screen.custom"
 NEXT_MESSAGE_BUTTON = "button.next_message"
-VOICE_INPUT_BUTTON = "button.voice_input"
+INPUT_BOX_BUTTON = "button.input_box"
+MICROPHONE_BUTTON = "button.microphone"
+VOICE_INPUT_BUTTON = MICROPHONE_BUTTON
 SEND_BUTTON = "button.send"
+NEW_GREETING_BUTTON = "button.new_greeting"
 BACK_BUTTON = "button.back"
 CUSTOM_BACK_BUTTON = "button.back.custom"
 CUSTOM_POPUP = "popup.custom"
@@ -70,41 +74,65 @@ FIXED_TEMPLATE_RULES: tuple[TemplateRule, ...] = (
         key=CHAT_LIST_SCREEN,
         label="聊天列表界面",
         group="screens",
-        filename="chat_list.jpg",
+        filename="screen_聊天列表.jpg",
         phase="state",
-        description="用于判断当前是否在消息列表界面。",
+        description="用于判断当前是否在聊天列表界面。",
     ),
     TemplateRule(
         key=CHAT_WINDOW_SCREEN,
-        label="聊天窗口界面",
+        label="聊天界面",
         group="screens",
-        filename="chat_window.jpg",
+        filename="screen_聊天界面.jpg",
         phase="state",
         description="用于判断当前是否在聊天详情界面。",
     ),
     TemplateRule(
-        key=NEXT_MESSAGE_BUTTON,
-        label="未读消息入口",
-        group="buttons",
-        filename="btn_next_msg.jpg",
-        phase="action",
-        description="用于定位下一条未读消息入口。",
+        key=MY_SCREEN,
+        label="我的界面",
+        group="screens",
+        filename="screen_我的界面.jpg",
+        phase="state",
+        description="用于判断当前是否在我的界面。",
     ),
     TemplateRule(
-        key=VOICE_INPUT_BUTTON,
-        label="语音输入按钮",
+        key=NEXT_MESSAGE_BUTTON,
+        label="下一条按钮",
         group="buttons",
-        filename="btn_voice_input.jpg",
+        filename="btn_下一条按钮.jpg",
         phase="action",
-        description="用于定位语音输入按钮。",
+        description="用于定位下一条按钮。",
+    ),
+    TemplateRule(
+        key=INPUT_BOX_BUTTON,
+        label="输入框",
+        group="buttons",
+        filename="btn_输入框.jpg",
+        phase="action",
+        description="用于定位输入框。",
+    ),
+    TemplateRule(
+        key=MICROPHONE_BUTTON,
+        label="麦克风",
+        group="buttons",
+        filename="btn_麦克风按钮.jpg",
+        phase="action",
+        description="用于定位麦克风按钮。",
     ),
     TemplateRule(
         key=SEND_BUTTON,
         label="发送按钮",
         group="buttons",
-        filename="btn_send.jpg",
+        filename="btn_发送按钮.jpg",
         phase="action",
         description="用于定位发送按钮。",
+    ),
+    TemplateRule(
+        key=NEW_GREETING_BUTTON,
+        label="新招呼",
+        group="buttons",
+        filename="btn_新招呼按钮.jpg",
+        phase="action",
+        description="用于定位新招呼按钮。",
     ),
     TemplateRule(
         key=BACK_BUTTON,
@@ -285,6 +313,47 @@ def back_button_template_paths(config: dict[str, Any]) -> list[Path]:
     return sorted(paths, key=_back_button_sort_key)
 
 
+def _template_variant_pattern(filename: str) -> tuple[str, str]:
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix or ".jpg"
+    return stem, suffix
+
+
+def _template_variant_sort_key(path: Path, base_filename: str) -> tuple[int, str]:
+    base_stem, suffix = _template_variant_pattern(base_filename)
+    if path.name == base_filename:
+        return (1, path.name)
+    match = re.fullmatch(rf"{re.escape(base_stem)}_(\d+){re.escape(suffix)}", path.name)
+    if match:
+        return (int(match.group(1)), path.name)
+    return (9999, path.name)
+
+
+def template_variant_paths(root: Path, filename: str) -> list[Path]:
+    if not root.exists():
+        return []
+    base_stem, suffix = _template_variant_pattern(filename)
+    paths = [
+        path
+        for path in root.glob(f"{base_stem}*{suffix}")
+        if path.name == filename or re.fullmatch(rf"{re.escape(base_stem)}_\d+{re.escape(suffix)}", path.name)
+    ]
+    return sorted(paths, key=lambda path: _template_variant_sort_key(path, filename))
+
+
+def next_template_variant_path(root: Path, filename: str) -> Path:
+    first = root / filename
+    if not first.exists():
+        return first
+    base_stem, suffix = _template_variant_pattern(filename)
+    index = 2
+    while True:
+        target = root / f"{base_stem}_{index}{suffix}"
+        if not target.exists():
+            return target
+        index += 1
+
+
 def next_popup_template_path(buttons_dir: Path) -> Path:
     index = 1
     while True:
@@ -325,7 +394,7 @@ def import_target_path(key: str, buttons_dir: Path, screens_dir: Path) -> Path:
         return next_back_button_template_path(buttons_dir)
     rule = template_rule(key)
     root = buttons_dir if rule.group == "buttons" else screens_dir
-    return root / rule.filename
+    return next_template_variant_path(root, rule.filename)
 
 
 def asset_rules_for_tool() -> dict[str, Any]:

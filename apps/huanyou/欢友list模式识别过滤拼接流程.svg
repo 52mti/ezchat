@@ -32,7 +32,7 @@
 
   <rect class="bg" width="1560" height="1740"/>
   <text class="title" x="780" y="52" text-anchor="middle">欢友 list 模式识别、过滤、拼接流程</text>
-  <text class="subtitle" x="780" y="82" text-anchor="middle">代码来源：vision/ocr_rules.py build_list_result()，规则来源：apps/huanyou/ocr_config.py LIST_OCR_MODE</text>
+  <text class="subtitle" x="780" y="82" text-anchor="middle">代码来源：vision/ocr_rules.py build_list_result()，规则来源：apps/huanyou/list_ocr_config.json</text>
 
   <g>
     <rect class="node start" x="70" y="130" width="300" height="78" rx="24"/>

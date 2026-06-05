@@ -20,6 +20,7 @@ from apps.visual_assets import (
     back_button_template_paths,
     popup_template_paths,
     screen_state_path,
+    template_variant_paths,
     template_path,
     template_root,
 )
@@ -67,7 +68,7 @@ SCREEN_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
     CHAT_WINDOW_SCREEN: ("screen_聊天界面.jpg", "chat_window.jpg"),
     BLACK_SCREEN: ("screen_黑屏异常.jpg",),
     NO_PHONE_SCREEN: ("screen_无手机界面.jpg",),
-    MY_SCREEN: ("screen_我的界面.jpg",),
+    MY_SCREEN: ("screen_我的界面.jpg", "my_screen.jpg"),
 }
 
 BUTTON_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
@@ -176,9 +177,7 @@ def _template_candidates(config: dict[str, Any], key: str, *, group: str) -> lis
         aliases = SCREEN_TEMPLATE_ALIASES.get(key, ()) if group == "screens" else BUTTON_TEMPLATE_ALIASES.get(key, ())
         root = template_root(config, "screens" if group == "screens" else "buttons")
         for filename in aliases:
-            path = root / filename
-            if path.exists():
-                candidates.append(path)
+            candidates.extend(template_variant_paths(root, filename))
     return _unique_paths(candidates)
 
 
@@ -713,20 +712,29 @@ def read_message(
 
     dialogue_result = ocr_result["result"]
     dialogues = dialogue_result.get("dialogues", [])
-    sender1_messages = [
-        str(item.get("content", "")).strip()
-        for item in dialogues
-        if str(item.get("sender", "")) == "sender1" and str(item.get("content", "")).strip()
-    ]
-    if not sender1_messages:
-        raise StepUnavailable("聊天详情 OCR 未识别到左侧对方消息")
+    dialogue_rules = cfg["ocr_modes"]["dialogue"]["rules"]
+    target_sender = str(dialogue_rules.get("target_sender", "sender1"))
+    trailing_target_messages: list[str] = []
+    for item in reversed(dialogues):
+        sender = str(item.get("sender", ""))
+        content = str(item.get("content", "")).strip()
+        if not content:
+            continue
+        if sender == target_sender:
+            trailing_target_messages.append(content)
+            continue
+        if trailing_target_messages:
+            break
+    if not trailing_target_messages:
+        raise StepUnavailable(f"聊天详情 OCR 未识别到对方消息：目标 sender={target_sender}")
 
     fallback_contact = str(target.get("name", "")) if isinstance(target, dict) else ""
     contact = fallback_contact or str(dialogue_result.get("user_name") or items[0]["text"])
     return {
         "user": contact,
         "contact": contact,
-        "content": sender1_messages[-1],
+        "content": "".join(reversed(trailing_target_messages)),
+        "sender": target_sender,
         "message_time": "",
         "unread_count": str(target.get("unread_count", "")) if isinstance(target, dict) else "",
         "favorability": str(target.get("favorability", "")) if isinstance(target, dict) else "",
@@ -752,10 +760,25 @@ def focus_input_box(
 ) -> None:
     cfg = _config(config)
     image = capture_after_popups(robot, cfg, label="input_box", reporter=reporter)
-    pos = _template_center(image, cfg, INPUT_BOX_BUTTON, group="buttons")
-    if pos is None:
+    match_result = _template_match(image, cfg, INPUT_BOX_BUTTON, group="buttons")
+    if match_result is None:
         raise StepUnavailable(f"未找到输入框模板：{_template_hint(INPUT_BOX_BUTTON, group='buttons')}")
-    click_point = (pos[0] - 0.5, pos[1])
+    pos = (
+        match_result["x"] + match_result["w"] / 2,
+        match_result["y"] + match_result["h"] / 2,
+    )
+    raw_click_x = pos[0] - 0.5
+    min_click_x = float(cfg.get("input_box_click_min_x", 0.12) or 0.12)
+    max_click_x = float(cfg.get("input_box_click_max_x", 0.88) or 0.88)
+    click_x = max(min_click_x, min(max_click_x, raw_click_x))
+    click_point = (click_x, pos[1])
+    if abs(click_x - raw_click_x) > 1e-6:
+        _report(
+            reporter,
+            "input_box_click_adjusted",
+            "输入框点击位置已修正",
+            log_label=f"输入框点击位置已修正：原始X={raw_click_x:.3f}，修正后X={click_x:.3f}",
+        )
     _report(reporter, "input_box_click", "点击输入框偏移位置", log_label=f"点击输入框偏移位置：{format_point(*click_point)}")
     click_image_point(robot, *click_point)
 

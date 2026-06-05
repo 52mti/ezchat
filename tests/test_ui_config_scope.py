@@ -171,7 +171,7 @@ def test_ocr_numeric_inputs_ignore_wheel_events(qtbot, tmp_path):
     assert dialog.match_threshold.buttonSymbols() == QAbstractSpinBox.ButtonSymbols.NoButtons
 
 
-def test_template_manager_exposes_popup_and_back_button_actions(qtbot, tmp_path):
+def test_template_manager_exposes_all_template_actions(qtbot, tmp_path):
     dialog = AppConfigDialog(
         {},
         device_ip="192.168.1.108",
@@ -182,8 +182,19 @@ def test_template_manager_exposes_popup_and_back_button_actions(qtbot, tmp_path)
 
     button_texts = [button.text() for button in dialog.template_manager.findChildren(QPushButton)]
 
-    assert "添加弹窗" in button_texts
-    assert "添加返回按钮" in button_texts
+    for text in [
+        "添加弹窗",
+        "添加返回按钮",
+        "添加发送按钮",
+        "添加麦克风",
+        "添加输入框",
+        "添加下一条",
+        "添加新招呼",
+        "添加聊天界面",
+        "添加聊天列表",
+        "添加我的界面",
+    ]:
+        assert text in button_texts
     assert not any(text.startswith("导入") for text in button_texts)
 
 
@@ -320,4 +331,20 @@ def test_device_settings_refresh_screenshot_handles_display_errors(qtbot, monkey
 
     assert critical_messages == ["无法从当前设备获取截图：display failed"]
     assert dialog.refresh_screenshot_button.isEnabled()
+
+
+def test_device_settings_can_save_current_screenshot_to_error_path(qtbot, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_window_module.QMessageBox, "information", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main_window_module.QMessageBox, "warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main_window_module.QMessageBox, "critical", lambda *args, **kwargs: None)
+
+    dialog = DeviceSettingsDialog({}, device_ip="192.168.1.133", app_name="xinyu")
+    qtbot.addWidget(dialog)
+    dialog.current_screenshot = Image.new("RGB", (120, 240), "white")
+
+    dialog._save_current_screenshot_to_error_path()
+
+    saved = list((tmp_path / "photo" / "errors").glob("manual_192_168_1_133_xinyu_*.jpg"))
+    assert len(saved) == 1
 

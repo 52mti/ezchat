@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 
 from apps.wechat.ocr_config import DIALOGUE_OCR_MODE as WECHAT_DIALOGUE_OCR_MODE
+from apps.xinyu.ocr_config import DIALOGUE_OCR_MODE as XINYU_DIALOGUE_OCR_MODE
 from vision.ocr_rules import build_dialogue_result
 
 
@@ -254,3 +255,119 @@ def test_dialogue_bubble_color_method_keeps_low_saturation_blue_card_as_sender1(
     )
 
     assert result["dialogues"] == [{"sender": "sender1", "content": "blue image card"}]
+
+
+def test_xinyu_dialogue_bubble_color_method_marks_red_bubble_as_sender2():
+    item = {
+        "text": "红色气泡",
+        "raw_text": "红色气泡",
+        "confidence": 0.99,
+        "min_x": 20,
+        "max_x": 150,
+        "min_y": 100,
+        "max_y": 140,
+        "center_x": 85,
+        "center_y": 120,
+        "width": 130,
+        "height": 40,
+        "background_saturation": 0.42,
+        "background_hue": 4.0,
+        "background_value": 0.78,
+        "background_blue_green_delta": -8.0,
+        "background_blue_red_ratio": 0.92,
+    }
+
+    result = build_dialogue_result(
+        [item],
+        (200, 300),
+        copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"]),
+    )
+
+    assert result["dialogues"] == [{"sender": "sender2", "content": "红色气泡"}]
+
+
+def test_xinyu_dialogue_bubble_color_method_marks_wraparound_red_bubble_as_sender2():
+    item = {
+        "text": "深红气泡",
+        "raw_text": "深红气泡",
+        "confidence": 0.99,
+        "min_x": 20,
+        "max_x": 150,
+        "min_y": 100,
+        "max_y": 140,
+        "center_x": 85,
+        "center_y": 120,
+        "width": 130,
+        "height": 40,
+        "background_saturation": 0.66,
+        "background_hue": 172.0,
+        "background_value": 0.53,
+        "background_blue_green_delta": 21.0,
+        "background_blue_red_ratio": 0.49,
+    }
+
+    result = build_dialogue_result(
+        [item],
+        (200, 300),
+        copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"]),
+    )
+
+    assert result["dialogues"] == [{"sender": "sender2", "content": "深红气泡"}]
+
+
+def test_xinyu_dialogue_bubble_color_method_keeps_white_blue_bubble_as_sender1():
+    item = {
+        "text": "浅色气泡",
+        "raw_text": "浅色气泡",
+        "confidence": 0.99,
+        "min_x": 24,
+        "max_x": 104,
+        "min_y": 170,
+        "max_y": 210,
+        "center_x": 64.0,
+        "center_y": 190,
+        "width": 80,
+        "height": 40,
+        "background_saturation": 0.09,
+        "background_hue": 102.0,
+        "background_value": 0.93,
+        "background_blue_green_delta": 34.0,
+        "background_blue_red_ratio": 1.34,
+    }
+
+    result = build_dialogue_result(
+        [item],
+        (200, 300),
+        copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"]),
+    )
+
+    assert result["dialogues"] == [{"sender": "sender1", "content": "浅色气泡"}]
+
+
+def test_xinyu_dialogue_bubble_color_method_does_not_treat_dark_blue_header_as_sender2():
+    item = {
+        "text": "顶部标题",
+        "raw_text": "顶部标题",
+        "confidence": 0.99,
+        "min_x": 20,
+        "max_x": 150,
+        "min_y": 100,
+        "max_y": 140,
+        "center_x": 85,
+        "center_y": 120,
+        "width": 130,
+        "height": 40,
+        "background_saturation": 0.42,
+        "background_hue": 103.0,
+        "background_value": 0.48,
+        "background_blue_green_delta": 23.0,
+        "background_blue_red_ratio": 9.5,
+    }
+
+    result = build_dialogue_result(
+        [item],
+        (200, 300),
+        copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"]),
+    )
+
+    assert result["dialogues"] == [{"sender": "sender1", "content": "顶部标题"}]

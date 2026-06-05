@@ -383,6 +383,9 @@ def test_detect_red_badge_bounds_ignore_small_red_patch_for_huanyou():
         for y in range(135, 160):
             if (x - 102) ** 2 + (y - 147) ** 2 <= 12 ** 2:
                 pixels[x, y] = (220, 60, 45)
+    for y in range(141, 154):
+        pixels[102, y] = (245, 245, 245)
+        pixels[103, y] = (245, 245, 245)
 
     badge_bounds = ocr_rules._detect_red_badge_bounds(
         np.array(image),
@@ -396,9 +399,60 @@ def test_detect_red_badge_bounds_ignore_small_red_patch_for_huanyou():
     assert badge_bounds[0] >= 80
 
 
+def test_detect_red_badge_bounds_requires_white_digit_for_huanyou():
+    rules = _huanyou_rules()
+    image = Image.new("RGB", (560, 997), "white")
+    pixels = image.load()
+    for x in range(90, 115):
+        for y in range(135, 160):
+            if (x - 102) ** 2 + (y - 147) ** 2 <= 12 ** 2:
+                pixels[x, y] = (220, 60, 45)
+
+    badge_bounds = ocr_rules._detect_red_badge_bounds(
+        np.array(image),
+        (0, 140, 540, 220),
+        560,
+        997,
+        rules,
+    )
+
+    assert badge_bounds is None
+
+
+def test_detect_red_badge_bounds_accepts_relative_white_digit_for_huanyou():
+    rules = _huanyou_rules(
+        red_badge_enable_relative_white_digit=True,
+        red_badge_relative_white_value_delta=20,
+        red_badge_relative_white_saturation_delta=20,
+        red_badge_white_digit_value_min=160,
+        red_badge_white_digit_saturation_max=80,
+    )
+    image = Image.new("RGB", (560, 997), "white")
+    pixels = image.load()
+    for x in range(90, 115):
+        for y in range(135, 160):
+            if (x - 102) ** 2 + (y - 147) ** 2 <= 12 ** 2:
+                pixels[x, y] = (75, 45, 38)
+    for y in range(141, 154):
+        pixels[102, y] = (105, 115, 126)
+        pixels[103, y] = (105, 115, 126)
+
+    badge_bounds = ocr_rules._detect_red_badge_bounds(
+        np.array(image),
+        (0, 140, 540, 220),
+        560,
+        997,
+        rules,
+    )
+
+    assert badge_bounds is not None
+    assert 90 <= badge_bounds[0] <= 115
+
+
 def test_detect_red_badge_bounds_prefers_white_digit_candidate_for_huanyou():
     rules = _huanyou_rules(
         red_badge_enable_white_digit_bonus=True,
+        red_badge_require_white_digit=True,
         red_badge_white_digit_min_pixels=4,
         red_badge_white_digit_bonus_multiplier=2.0,
         left_badge_max_ratio=0.35,
@@ -596,6 +650,9 @@ def test_huanyou_list_rules_use_ratio_row_top_offset_for_left_badge():
         for x in range(82, 106):
             if (x - 94) ** 2 + (y - 220) ** 2 <= 12 ** 2:
                 pixels[x, y] = (210, 30, 30)
+    for y in range(214, 227):
+        pixels[94, y] = (245, 245, 245)
+        pixels[95, y] = (245, 245, 245)
     items = [
         _item("target", 128, 260, 250, 282),
         _item("content", 128, 360, 288, 320),

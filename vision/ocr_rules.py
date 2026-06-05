@@ -48,17 +48,20 @@ def text_similarity(left: str, right: str) -> float:
 
 
 def looks_like_time_text(text: str) -> bool:
-    compact = str(text or "").replace(" ", "")
+    compact = normalize_ocr_text(text).replace(" ", "")
+    compact = compact.translate(str.maketrans({"：": ":", "．": ".", "。": ".", "／": "/"}))
     patterns = (
         r"\d{1,2}[:.]\d{2}",
         r"\d{1,2}[:.]\d{2}[:.]\d{2}",
         r"\d{1,2}/\d{1,2}",
         r"\d{1,2}-\d{1,2}",
+        r"(?:今天|昨天|前天)\d{1,2}[:.]\d{2}",
+        r"(?:今天|昨天|前天)\d{1,2}[:.]\d{2}[:.]\d{2}",
         r"\d{1,3}分钟前",
         r"\d{1,3}小时前",
-        r"\d{1,3}澶╁墠",
+        r"\d{1,3}天前",
     )
-    return any(re.fullmatch(pattern, compact) for pattern in patterns) or compact in {"鍒氬垰", "鏄ㄥぉ", "鍓嶅ぉ"}
+    return any(re.fullmatch(pattern, compact) for pattern in patterns) or compact in {"刚刚", "今天", "昨天", "前天"}
 
 
 def looks_like_debug_text(text: str) -> bool:
@@ -341,13 +344,15 @@ def build_dialogue_result(
     user_name_top_ratio = float(rules.get("user_name_top_ratio", 0.12))
     user_name_center_x_min_ratio = float(rules.get("user_name_center_x_min_ratio", 0.0))
     user_name_center_x_max_ratio = float(rules.get("user_name_center_x_max_ratio", 1.0))
+    user_name_min_length = int(rules.get("user_name_min_length", 2))
+    user_name_max_length = int(rules.get("user_name_max_length", 16))
 
     def is_user_name_candidate(item: dict[str, Any]) -> bool:
         text = item["text"]
         return (
             item["center_y"] <= image_height * user_name_top_ratio
             and image_width * user_name_center_x_min_ratio <= item["center_x"] <= image_width * user_name_center_x_max_ratio
-            and 2 <= len(text) <= 16
+            and user_name_min_length <= len(text) <= user_name_max_length
             and contains_cjk(text)
             and not looks_like_time_text(text)
             and not looks_like_distance_text(text)
@@ -412,15 +417,22 @@ def build_dialogue_result(
             min_value = float(sender_detection.get("bubble_color_min_value", 0.20))
             hue_min = float(sender_detection.get("bubble_color_sender2_hue_min", 125))
             hue_max = float(sender_detection.get("bubble_color_sender2_hue_max", 170))
+            hue_min_2 = sender_detection.get("bubble_color_sender2_hue_min_2")
+            hue_max_2 = sender_detection.get("bubble_color_sender2_hue_max_2")
+            enable_blue_detection = bool(sender_detection.get("bubble_color_enable_blue_detection", True))
             blue_green_min = float(sender_detection.get("bubble_color_sender2_blue_green_min", 65))
             blue_red_ratio_min = float(sender_detection.get("bubble_color_sender2_blue_red_ratio_min", 1.60))
             blue_min_saturation = float(sender_detection.get("bubble_color_sender2_blue_min_saturation", 0.30))
             if hue is not None and saturation >= min_saturation and value >= min_value:
-                is_sender2_hue = hue_min <= float(hue) <= hue_max
+                hue_value = float(hue)
+                is_sender2_hue = hue_min <= hue_value <= hue_max
+                if hue_min_2 is not None and hue_max_2 is not None:
+                    is_sender2_hue = is_sender2_hue or float(hue_min_2) <= hue_value <= float(hue_max_2)
                 blue_green_delta = float(item.get("background_blue_green_delta") or 0.0)
                 blue_red_ratio = float(item.get("background_blue_red_ratio") or 0.0)
                 is_sender2_blue = (
-                    saturation >= blue_min_saturation
+                    enable_blue_detection
+                    and saturation >= blue_min_saturation
                     and blue_green_delta >= blue_green_min
                     and blue_red_ratio >= blue_red_ratio_min
                 )
@@ -839,6 +851,8 @@ def _detect_red_badge_bounds(
     max_aspect_ratio = float(rules.get("red_badge_max_aspect_ratio", 1.8))
     min_circularity = float(rules.get("red_badge_min_circularity", 0.30))
     enable_white_digit_bonus = bool(rules.get("red_badge_enable_white_digit_bonus", False))
+    require_white_digit = bool(rules.get("red_badge_require_white_digit", False))
+    enable_relative_white_digit = bool(rules.get("red_badge_enable_relative_white_digit", False))
     white_digit_min_pixels = int(rules.get("red_badge_white_digit_min_pixels", 6))
     white_digit_bonus_multiplier = float(rules.get("red_badge_white_digit_bonus_multiplier", 1.35))
     mask1 = cv2.inRange(hsv, np.array([0, red_saturation_min, red_value_min]), np.array([14, 255, 255]))
@@ -867,7 +881,7 @@ def _detect_red_badge_bounds(
         if circularity < min_circularity:
             continue
         score = area * circularity
-        if enable_white_digit_bonus and white_digit_min_pixels > 0:
+        if (enable_white_digit_bonus or require_white_digit) and white_digit_min_pixels > 0:
             badge_hsv = hsv[y : y + height, x : x + width]
             white_mask = cv2.inRange(
                 badge_hsv,
@@ -878,10 +892,26 @@ def _detect_red_badge_bounds(
             contour_mask = np.zeros((height, width), dtype=np.uint8)
             cv2.drawContours(contour_mask, [local_contour], -1, 255, thickness=cv2.FILLED)
             white_mask = cv2.bitwise_and(white_mask, contour_mask)
+            if enable_relative_white_digit:
+                contour_pixels = badge_hsv[contour_mask > 0].astype(np.float32)
+                if contour_pixels.size:
+                    median_saturation = float(np.median(contour_pixels[:, 1]))
+                    median_value = float(np.median(contour_pixels[:, 2]))
+                    value_delta = float(rules.get("red_badge_relative_white_value_delta", 20))
+                    saturation_delta = float(rules.get("red_badge_relative_white_saturation_delta", 20))
+                    relative_mask = (
+                        (badge_hsv[:, :, 2].astype(np.float32) >= median_value + value_delta)
+                        & (badge_hsv[:, :, 1].astype(np.float32) <= median_saturation - saturation_delta)
+                    ).astype(np.uint8) * 255
+                    relative_mask = cv2.bitwise_and(relative_mask, contour_mask)
+                    white_mask = cv2.bitwise_or(white_mask, relative_mask)
             white_pixels = int(cv2.countNonZero(white_mask))
+            if require_white_digit and white_pixels < white_digit_min_pixels:
+                continue
             if white_pixels >= white_digit_min_pixels:
                 white_ratio = white_pixels / max(1, width * height)
-                score *= white_digit_bonus_multiplier + min(1.0, white_ratio * 10.0)
+                if enable_white_digit_bonus:
+                    score *= white_digit_bonus_multiplier + min(1.0, white_ratio * 10.0)
         if score > best_score:
             best_score = score
             best_box = (
