@@ -1190,11 +1190,18 @@ class SubprocessOcrRuntimeEngine:
                 stderr_output = ""
                 if process.stderr is not None:
                     stderr_output = process.stderr.read().strip()
+                self.close()
                 raise RuntimeError(f"OCR subprocess exited unexpectedly. {stderr_output}".strip())
-            response = json.loads(line)
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError:
+                self.close()
+                raise
             if not isinstance(response, dict):
+                self.close()
                 raise RuntimeError("OCR subprocess returned an invalid response payload.")
             if not bool(response.get("ok", False)):
+                self.close()
                 raise RuntimeError(str(response.get("error", "OCR subprocess request failed.")))
             return response
 

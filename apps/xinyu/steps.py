@@ -46,6 +46,7 @@ class NoPhoneScreenError(RuntimeError):
 BLACK_SCREEN = "screen.black_screen"
 NO_PHONE_SCREEN = "screen.no_phone"
 MY_SCREEN = "screen.my"
+POINTS_REGION = "ocr.regions.points"
 INPUT_BOX_BUTTON = "button.input_box"
 MICROPHONE_BUTTON = "button.microphone"
 UNREAD_BUTTON = "button.unread"
@@ -635,7 +636,7 @@ def read_my_points(
         raise StepUnavailable(f"未匹配到“我的界面”模板：{_template_hint(MY_SCREEN, group='screens')}")
 
     _report(reporter, "points_ocr_read", "积分 OCR 读取")
-    ocr_result = _run_ocr_mode(image, cfg, "points", region=None)
+    ocr_result = _run_ocr_mode(image, cfg, "points", region=_region(cfg, POINTS_REGION))
     result = ocr_result.get("result", {}) if isinstance(ocr_result.get("result", {}), dict) else {}
     points = str(result.get("points") or result.get("balance") or "").strip()
     _report(

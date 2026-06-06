@@ -463,6 +463,7 @@ class MainWindow(QMainWindow):
         self.events: "queue.Queue[WorkerEvent]" = queue.Queue()
         self.workers: dict[str, DeviceWorker] = {}
         self.log_events: list[WorkerEvent] = []
+        self.log_event_times: dict[int, str] = {}
         self.unattended_started_at: dict[str, float] = {}
         self.unattended_elapsed_seconds: dict[str, float] = {}
         self.setWindowTitle("机械臂视觉控制系统")
@@ -896,7 +897,7 @@ class MainWindow(QMainWindow):
         self.unattended_elapsed_seconds.pop(device_ip, None)
         if self.config_manager.remove_device(device_ip):
             self._load_devices()
-            self.logs.append(f"[info] {device_ip}: device removed")
+            self.logs.append(f"[{time.strftime('%H:%M:%S')}] [info] {device_ip}: device removed")
 
     def _save_apikey(self) -> None:
         value = self.apikey_input.text().strip()
@@ -1096,10 +1097,18 @@ class MainWindow(QMainWindow):
 
     def _append_log_event(self, event: WorkerEvent) -> None:
         try:
-            self.logs.append(self._format_log_event(event))
+            self.logs.append(f"{self._log_event_time(event)} {self._format_log_event(event)}")
         except Exception as exc:
             device_ip = str(getattr(event, "device_ip", "unknown") or "unknown")
-            self.logs.append(f"[error] {device_ip}: UI事件日志格式化失败：{exc}")
+            self.logs.append(f"[{time.strftime('%H:%M:%S')}] [error] {device_ip}: UI事件日志格式化失败：{exc}")
+
+    def _log_event_time(self, event: WorkerEvent) -> str:
+        event_id = id(event)
+        timestamp = self.log_event_times.get(event_id)
+        if not timestamp:
+            timestamp = time.strftime("%H:%M:%S")
+            self.log_event_times[event_id] = timestamp
+        return f"[{timestamp}]"
 
     def _format_log_event(self, event: WorkerEvent) -> str:
         payload = event.payload if isinstance(event.payload, dict) else {}
@@ -1222,16 +1231,17 @@ class MainWindow(QMainWindow):
                 event = self.events.get_nowait()
             except queue.Empty:
                 break
+            self.log_event_times.setdefault(id(event), time.strftime("%H:%M:%S"))
             self.log_events.append(event)
             try:
                 self._handle_worker_event(event)
             except Exception as exc:
                 device_ip = str(getattr(event, "device_ip", "unknown") or "unknown")
-                self.logs.append(f"[error] {device_ip}: UI事件处理失败：{exc}")
+                self.logs.append(f"[{time.strftime('%H:%M:%S')}] [error] {device_ip}: UI事件处理失败：{exc}")
         try:
             self._refresh_unattended_durations()
         except Exception as exc:
-            self.logs.append(f"[error] UI: 无干预时长刷新失败：{exc}")
+            self.logs.append(f"[{time.strftime('%H:%M:%S')}] [error] UI: 无干预时长刷新失败：{exc}")
 
     def _handle_worker_event(self, event: WorkerEvent) -> None:
         payload = event.payload if isinstance(event.payload, dict) else {}

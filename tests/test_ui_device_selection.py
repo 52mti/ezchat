@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from unittest.mock import patch
 
 from PyQt6.QtCore import QPoint
@@ -521,6 +522,7 @@ def test_log_panel_shows_ocr_message_and_ai_reply_payload(qtbot, tmp_path):
     window._drain_events()
 
     logs_text = window.logs.toPlainText()
+    assert re.search(r"^\[\d{2}:\d{2}:\d{2}\] \[info\] 192\.168\.1\.108:", logs_text, re.MULTILINE)
     assert "OCR" in logs_text
     assert "\u65e0\u654c\u963f\u5f3a" in logs_text
     assert "AI" in logs_text

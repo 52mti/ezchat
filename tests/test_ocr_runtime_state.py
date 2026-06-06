@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 
 import numpy as np
 import pytest
@@ -208,6 +209,64 @@ def test_subprocess_runtime_ignores_packaging_staging_cache_home(tmp_path, monke
     expected = public_root / "jixiebijiaoben_runtime" / ".paddlex"
     assert captured["env"]["PADDLE_PDX_CACHE_HOME"] == str(expected)
     assert captured["env"]["PADDLEX_HOME"] == str(expected)
+
+
+def test_subprocess_runtime_closes_failed_child_process(tmp_path, monkeypatch):
+    state_path = tmp_path / "runtime" / "install_state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps({"status": "installed", "validation": "ok", "backend": "paddle_cuda"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    runtime_python = tmp_path / "runtime" / "ocr_nvidia" / "python.exe"
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_text("python", encoding="utf-8")
+
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def write(self, value: str) -> None:
+            self.lines.append(value)
+
+        def flush(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = FakeStdin()
+            self.stdout = io.StringIO('{"ok": false, "error": "bad paddlex state"}\n')
+            self.stderr = io.StringIO("")
+            self.terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+    process = FakeProcess()
+
+    monkeypatch.setattr(runtime_module, "_runtime_state_path", lambda project_root=None: state_path)
+    monkeypatch.setattr(runtime_module, "_package_root", lambda project_root=None: tmp_path)
+    monkeypatch.setattr(runtime_module, "runtime_python", lambda root, runtime_name, gui=False: runtime_python)
+    monkeypatch.setattr(runtime_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(runtime_module.subprocess, "STARTUPINFO", lambda: type("StartupInfo", (), {"dwFlags": 0})())
+    monkeypatch.setattr(runtime_module.subprocess, "STARTF_USESHOWWINDOW", 1, raising=False)
+
+    engine = runtime_module.SubprocessOcrRuntimeEngine(
+        backend="paddle_cuda",
+        model_tier="lite",
+        manifest=runtime_module.load_runtime_manifest(),
+        config={},
+    )
+
+    with pytest.raises(RuntimeError, match="bad paddlex state"):
+        engine.preload()
+
+    assert engine._process is None
+    assert process.terminated is True
+    assert any('"action": "shutdown"' in line for line in process.stdin.lines)
 
 
 def test_manifest_subprocess_mode_uses_ocr_runtime_without_app_runtime(tmp_path, monkeypatch):
