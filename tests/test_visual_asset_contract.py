@@ -70,7 +70,7 @@ def test_template_names_align_main_program_and_helper_tool_contract(tmp_path):
     assert "regions" not in tool_rules
     assert "screen_roles" not in tool_rules
     assert all(rule["match_region_supported"] is True for rule in tool_rules["templates"])
-    assert tool_rules["popups"][0]["match_region_supported"] is False
+    assert tool_rules["popups"][0]["match_region_supported"] is True
     assert tool_rules["back_buttons"][0]["match_region_supported"] is True
 
 
@@ -100,6 +100,83 @@ def test_template_region_match_maps_result_back_to_full_image(tmp_path):
 
     assert seen_sizes == [(40, 100)]
     assert result == pytest.approx({"x": 0.3, "y": 0.5, "w": 0.04, "h": 0.1, "score": 0.99})
+
+
+def test_template_match_reuses_previous_result_when_same_photo(tmp_path):
+    visual_assets._TEMPLATE_MATCH_CACHE.clear()
+    template_path = tmp_path / "btn.jpg"
+    template_path.write_bytes(b"template")
+    image = Image.new("RGB", (100, 200), "white")
+    config = {
+        "_runtime": {"device_ip": "192.168.1.108", "app_name": "xinyu"},
+        "template_match_regions": {
+            visual_assets.SEND_BUTTON: [0.2, 0.3, 0.4, 0.5],
+        },
+    }
+    calls = 0
+
+    def fake_match(cropped_image, template, threshold=0.85):
+        nonlocal calls
+        calls += 1
+        return {"x": 0.25, "y": 0.4, "w": 0.1, "h": 0.2, "score": 0.99}
+
+    first = visual_assets.match_template_with_region(
+        image,
+        template_path,
+        config,
+        visual_assets.SEND_BUTTON,
+        threshold=0.85,
+        match_func=fake_match,
+    )
+    second = visual_assets.match_template_with_region(
+        image,
+        template_path,
+        config,
+        visual_assets.SEND_BUTTON,
+        threshold=0.85,
+        match_func=fake_match,
+    )
+
+    assert first == second
+    assert calls == 1
+
+
+def test_template_match_cache_can_be_disabled(tmp_path):
+    visual_assets._TEMPLATE_MATCH_CACHE.clear()
+    template_path = tmp_path / "btn.jpg"
+    template_path.write_bytes(b"template")
+    image = Image.new("RGB", (100, 200), "white")
+    config = {
+        "enable_template_match_cache": False,
+        "template_match_regions": {
+            visual_assets.SEND_BUTTON: [0.2, 0.3, 0.4, 0.5],
+        },
+    }
+    calls = 0
+
+    def fake_match(cropped_image, template, threshold=0.85):
+        nonlocal calls
+        calls += 1
+        return {"x": 0.25, "y": 0.4, "w": 0.1, "h": 0.2, "score": 0.99}
+
+    visual_assets.match_template_with_region(
+        image,
+        template_path,
+        config,
+        visual_assets.SEND_BUTTON,
+        threshold=0.85,
+        match_func=fake_match,
+    )
+    visual_assets.match_template_with_region(
+        image,
+        template_path,
+        config,
+        visual_assets.SEND_BUTTON,
+        threshold=0.85,
+        match_func=fake_match,
+    )
+
+    assert calls == 2
 
 
 def test_template_region_config_reports_missing_region_instead_of_global_fallback(tmp_path):
@@ -221,6 +298,31 @@ def test_runtime_loads_multiple_popup_templates(tmp_path):
     assert [path.name for path in paths] == ["popup_custom_1.jpg", "popup_custom_2.jpg"]
 
 
+def test_popup_template_region_key_uses_each_template_name(tmp_path):
+    path = tmp_path / "popup_custom_2.jpg"
+
+    assert visual_assets.popup_template_region_key(path) == "popup.custom.popup_custom_2"
+
+
+def test_popup_match_uses_template_specific_region(monkeypatch, tmp_path):
+    popup_template = tmp_path / "popup_custom_1.jpg"
+    popup_template.write_bytes(b"template")
+    seen_sizes: list[tuple[int, int]] = []
+
+    def fake_match(image, template, threshold=0.85):
+        seen_sizes.append(image.size)
+        return {"x": 0.1, "y": 0.2, "w": 0.4, "h": 0.3, "score": 0.99}
+
+    monkeypatch.setattr(wechat_steps, "match", fake_match)
+    image = Image.new("RGB", (100, 200), "white")
+    config = {"template_match_regions": {"popup.custom.popup_custom_1": [0.5, 0.0, 0.5, 1.0]}}
+
+    result = wechat_steps._popup_match(image, popup_template, config)
+
+    assert seen_sizes == [(50, 200)]
+    assert result == {"x": 0.55, "y": 0.2, "w": 0.2, "h": 0.3, "score": 0.99}
+
+
 def test_popup_match_drops_results_beyond_right_edge(monkeypatch, tmp_path):
     popup_template = tmp_path / "popup_custom_1.jpg"
     popup_template.write_bytes(b"template")
@@ -305,6 +407,11 @@ def test_popup_is_checked_before_current_screen(monkeypatch, tmp_path):
             "result": {"message_list": [{"unread_count": 1, "bounds": [0.2, 0.4, 0.3, 0.6]}]},
             "ocr_items": [],
         },
+    )
+    monkeypatch.setattr(
+        wechat_steps,
+        "capture_transform_image",
+        lambda robot, config, pre_move=True, label="screen": robot.images.pop(0) if robot.images else "list",
     )
     robot = FakeRobot()
 

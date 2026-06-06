@@ -58,6 +58,75 @@ def test_run_ocr_mode_forces_original_preprocess(monkeypatch):
     assert result["result"]["message_list"][0]["unread_count"] == 1
 
 
+def test_run_ocr_mode_reuses_result_for_same_image_and_config(monkeypatch):
+    ocr_rules._OCR_RESULT_CACHE.clear()
+    calls = 0
+
+    def fake_ocr(_image, _config):
+        nonlocal calls
+        calls += 1
+        return [{"text": "张三", "x": 0.2, "y": 0.3, "w": 0.3, "h": 0.1, "confidence": 0.95}]
+
+    def fake_build_list_result(*_args, **_kwargs):
+        return {"message_list": [{"name": "张三", "bounds": [0.2, 0.3, 0.5, 0.4]}], "bottom_nav": []}
+
+    monkeypatch.setattr(ocr_rules, "ocr", fake_ocr)
+    monkeypatch.setattr(ocr_rules, "build_list_result", fake_build_list_result)
+    image = Image.new("RGB", (100, 200), "white")
+    config = {
+        "ocr": {"runtime_enabled": True},
+        "ocr_modes": {
+            "list": {
+                "preprocess": {"mode": "original", "scale": 1},
+                "rules": {"min_confidence": 0.1, "min_box_height_ratio": 0.01},
+            }
+        },
+    }
+
+    first = run_ocr_mode(image, config, "list")
+    second = run_ocr_mode(image, config, "list")
+
+    assert first == second
+    assert calls == 1
+
+
+def test_run_ocr_mode_cache_is_scoped_by_app_name(monkeypatch):
+    ocr_rules._OCR_RESULT_CACHE.clear()
+    calls = 0
+
+    def fake_ocr(_image, _config):
+        nonlocal calls
+        calls += 1
+        return [{"text": f"张三{calls}", "x": 0.2, "y": 0.3, "w": 0.3, "h": 0.1, "confidence": 0.95}]
+
+    def fake_build_list_result(items, *_args, **_kwargs):
+        return {"message_list": [{"name": items[0]["text"], "bounds": [0.2, 0.3, 0.5, 0.4]}], "bottom_nav": []}
+
+    monkeypatch.setattr(ocr_rules, "ocr", fake_ocr)
+    monkeypatch.setattr(ocr_rules, "build_list_result", fake_build_list_result)
+    image = Image.new("RGB", (100, 200), "white")
+    base_config = {
+        "ocr": {"runtime_enabled": True},
+        "ocr_modes": {
+            "list": {
+                "preprocess": {"mode": "original", "scale": 1},
+                "rules": {"min_confidence": 0.1, "min_box_height_ratio": 0.01},
+            }
+        },
+    }
+    first_config = copy.deepcopy(base_config)
+    first_config["_runtime"] = {"device_ip": "192.168.1.108", "app_name": "huanyou"}
+    second_config = copy.deepcopy(base_config)
+    second_config["_runtime"] = {"device_ip": "192.168.1.108", "app_name": "xinyu"}
+
+    first = run_ocr_mode(image, first_config, "list")
+    second = run_ocr_mode(image, second_config, "list")
+
+    assert calls == 2
+    assert first["result"]["message_list"][0]["name"] == "张三1"
+    assert second["result"]["message_list"][0]["name"] == "张三2"
+
+
 def test_run_ocr_mode_returns_portrait_bounds_for_landscape_input(monkeypatch):
     def fake_ocr(_image, _config):
         return [{"text": "sample", "x": 0.2, "y": 0.2, "w": 0.2, "h": 0.1, "confidence": 0.99}]

@@ -124,8 +124,15 @@ class XinyuApp(BaseApp):
             return
         try:
             reporter = self.set_runtime_step
+            entry_image = self.capture_entry_image()
             reporter("popup_check", "检查并关闭弹窗")
-            target = steps.find_unread_target(self.robot, self.config, reporter=reporter)
+            target = self.call_step_with_optional_image(
+                steps.find_unread_target,
+                self.robot,
+                self.config,
+                reporter=reporter,
+                image=entry_image,
+            )
             if not target:
                 reporter("empty_list_target", "暂无消息，进入防熄屏等待")
                 self._run_idle_maintenance(reporter)

@@ -18,8 +18,10 @@ from apps.visual_assets import (
     CHAT_WINDOW_SCREEN,
     all_screen_states,
     back_button_template_paths,
+    popup_template_region_key,
     popup_template_paths,
     match_template_with_region,
+    region_rule,
     screen_state_path,
     template_variant_paths,
     template_path,
@@ -100,6 +102,19 @@ def _config(config: dict[str, Any] | None) -> dict[str, Any]:
     return cfg
 
 
+def _region(config: dict[str, Any], key: str) -> Any:
+    current: Any = config
+    try:
+        path = region_rule(key).config_path
+    except KeyError:
+        path = tuple(key.split("."))
+    for part in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
 def _disable_dialogue_region_filter(config: dict[str, Any]) -> None:
     ocr_modes = config.get("ocr_modes")
     if not isinstance(ocr_modes, dict):
@@ -131,7 +146,14 @@ def _threshold(config: dict[str, Any]) -> float:
 
 
 def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> dict[str, float] | None:
-    result = match(image, popup_template, threshold=_threshold(config))
+    result = match_template_with_region(
+        image,
+        popup_template,
+        config,
+        popup_template_region_key(popup_template),
+        threshold=_threshold(config),
+        match_func=match,
+    )
     if not result:
         return None
     max_x = float(config.get("popup_max_x", POPUP_MAX_X) or POPUP_MAX_X)
@@ -393,9 +415,10 @@ def capture_after_popups(
     *,
     label: str = "screen",
     max_dismiss: int = 2,
+    image: Any | None = None,
     reporter: Reporter | None = None,
 ) -> Any:
-    image = capture_transform_image(robot, config, pre_move=True, label=label)
+    image = image if image is not None else capture_transform_image(robot, config, pre_move=True, label=label)
     for _ in range(max_dismiss):
         if _is_chat_window_image(image, config):
             break
@@ -445,10 +468,15 @@ def _click_message_button(
     return True
 
 
-def ensure_list_screen(robot: Any, config: dict[str, Any] | None = None, reporter: Reporter | None = None) -> Any | None:
+def ensure_list_screen(
+    robot: Any,
+    config: dict[str, Any] | None = None,
+    reporter: Reporter | None = None,
+    image: Any | None = None,
+) -> Any | None:
     cfg = _config(config)
     _report(reporter, "confirm_xinyu_list", "确认心遇聊天列表")
-    initial_image = capture_transform_image(robot, cfg, pre_move=True, label="startup_screen_detect")
+    initial_image = image if image is not None else capture_transform_image(robot, cfg, pre_move=True, label="startup_screen_detect")
     _raise_if_black_screen(initial_image, cfg)
     if _matches_screen(initial_image, cfg, CHAT_WINDOW_SCREEN):
         if not _click_back_once(robot, cfg, initial_image, reporter=reporter):
@@ -533,9 +561,13 @@ def find_unread_target(
     robot: Any,
     config: dict[str, Any] | None = None,
     reporter: Reporter | None = None,
+    image: Any | None = None,
 ) -> dict[str, Any] | None:
     cfg = _config(config)
-    image = ensure_list_screen(robot, cfg, reporter=reporter)
+    if image is None:
+        image = ensure_list_screen(robot, cfg, reporter=reporter)
+    else:
+        image = ensure_list_screen(robot, cfg, reporter=reporter, image=image)
     if image is None:
         return None
     _report(reporter, "list_ocr_scan", "列表 OCR 扫描")

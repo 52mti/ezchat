@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any, Callable
 
 from apps.cancellation import OperationCancelled, operation_cancelled
-from vision.screen import ensure_portrait_image
 
 
 ERROR_PHOTO_DIR = Path("photo") / "errors"
@@ -81,6 +81,13 @@ class BaseApp:
         if self._log_callback:
             self._log_callback(level, message, payload)
 
+    def capture_entry_image(self, label: str = "app_entry_check") -> Any | None:
+        if not hasattr(self.robot, "get_capture_image") or not hasattr(self.robot, "get_status"):
+            return None
+        from apps.photo_capture import capture_transform_image
+
+        return capture_transform_image(self.robot, self.config, pre_move=True, label=label)
+
     def recover(self) -> None:
         if hasattr(self.robot, "reset_device"):
             self.robot.reset_device(wait=True)
@@ -102,6 +109,26 @@ class BaseApp:
         self.status.average_reply_seconds = self._reply_round_total_seconds / self.status.reply_round_count
         if self._status_callback:
             self._status_callback(self.status.as_dict())
+
+    @staticmethod
+    def call_step_with_optional_image(
+        func: Callable[..., Any],
+        robot: Any,
+        config: dict[str, Any],
+        *,
+        reporter: Callable[..., None] | None = None,
+        image: Any | None = None,
+    ) -> Any:
+        try:
+            parameters = signature(func).parameters
+            supports_image = "image" in parameters or any(
+                parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values()
+            )
+        except (TypeError, ValueError):
+            supports_image = False
+        if supports_image:
+            return func(robot, config, reporter=reporter, image=image)
+        return func(robot, config, reporter=reporter)
 
     def on_error(self, exc: Exception) -> None:
         if isinstance(exc, OperationCancelled) or operation_cancelled(self.robot, self.config):
@@ -136,17 +163,17 @@ class BaseApp:
                 self.status.is_circuit_open = True
 
     def _save_error_capture(self) -> None:
+        from apps.photo_capture import capture_transform_image
         from services.retention import cleanup_old_error_captures
 
-        if not hasattr(self.robot, "get_transform_image"):
+        if not hasattr(self.robot, "get_capture_image") or not hasattr(self.robot, "get_status"):
             return
         host = str(getattr(self.robot, "host", "unknown")).replace(":", "_")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = (ERROR_PHOTO_DIR / f"{host}_{timestamp}.jpg").resolve()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            self.robot.get_transform_image(pre_move=True, save_path=path)
-            ensure_portrait_image(path).save(path, format="JPEG", quality=95)
+            path.write_bytes(capture_transform_image(self.robot, self.config, pre_move=True, label="error"))
             cleanup_old_error_captures(path.parent, retention_days=int(self.config.get("error_capture_retention_days", 7) or 7), max_files=int(self.config.get("error_capture_max_files", 200) or 200))
         except Exception:
             return

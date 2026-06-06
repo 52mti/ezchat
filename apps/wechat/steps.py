@@ -16,6 +16,7 @@ from apps.visual_assets import (
     CHAT_WINDOW_SCREEN,
     all_screen_states,
     back_button_template_paths,
+    popup_template_region_key,
     popup_template_paths,
     region_rule,
     match_template_with_region,
@@ -74,7 +75,14 @@ def _threshold(config: dict[str, Any]) -> float:
 
 
 def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> dict[str, float] | None:
-    result = match(image, popup_template, threshold=_threshold(config))
+    result = match_template_with_region(
+        image,
+        popup_template,
+        config,
+        popup_template_region_key(popup_template),
+        threshold=_threshold(config),
+        match_func=match,
+    )
     if not result:
         return None
     max_x = float(config.get("popup_max_x", POPUP_MAX_X) or POPUP_MAX_X)
@@ -238,10 +246,11 @@ def capture_after_popups(
     *,
     label: str = "screen",
     max_dismiss: int = 2,
+    image: Any | None = None,
     reporter: Reporter | None = None,
 ) -> Any:
     _report(reporter, "capture_screen", "复位后截图")
-    image = capture_transform_image(robot, config, pre_move=True, label=label)
+    image = image if image is not None else capture_transform_image(robot, config, pre_move=True, label=label)
     for _ in range(max_dismiss):
         close_point = _popup_close_point(image, config)
         if close_point is None:
@@ -274,9 +283,17 @@ def _click_back_once(
     return True
 
 
-def _ensure_list_screen(robot: Any, config: dict[str, Any], reporter: Reporter | None = None) -> Any | None:
+def _ensure_list_screen(
+    robot: Any,
+    config: dict[str, Any],
+    reporter: Reporter | None = None,
+    image: Any | None = None,
+) -> Any | None:
     _report(reporter, "confirm_chat_list", "确认聊天列表")
-    image = capture_after_popups(robot, config, label="ensure_list", reporter=reporter)
+    if image is None:
+        image = capture_after_popups(robot, config, label="ensure_list", reporter=reporter)
+    else:
+        image = capture_after_popups(robot, config, label="ensure_list", image=image, reporter=reporter)
     if _matches_screen(image, config, CHAT_LIST_SCREEN):
         return image
     if _matches_screen(image, config, CHAT_WINDOW_SCREEN):
@@ -297,9 +314,13 @@ def find_unread_target(
     robot: Any,
     config: dict[str, Any] | None = None,
     reporter: Reporter | None = None,
+    image: Any | None = None,
 ) -> dict[str, Any] | None:
     cfg = _config(config)
-    image = _ensure_list_screen(robot, cfg, reporter=reporter)
+    if image is None:
+        image = _ensure_list_screen(robot, cfg, reporter=reporter)
+    else:
+        image = _ensure_list_screen(robot, cfg, reporter=reporter, image=image)
     if image is None:
         return None
 

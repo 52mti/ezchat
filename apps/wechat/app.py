@@ -55,8 +55,15 @@ class WechatApp(BaseApp):
                 else:
                     self._mark_activity()
 
+            entry_image = self.capture_entry_image()
             reporter("popup_check", "检查弹窗")
-            target = steps.find_unread_target(self.robot, self.config, reporter=reporter)
+            target = self.call_step_with_optional_image(
+                steps.find_unread_target,
+                self.robot,
+                self.config,
+                reporter=reporter,
+                image=entry_image,
+            )
             if not target:
                 return
 

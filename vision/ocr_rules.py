@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import copy
 import difflib
+from hashlib import blake2b
+import json
 import re
+import threading
 from typing import Any
 
 import cv2
@@ -10,6 +13,11 @@ import numpy as np
 
 from .ocr import OcrItem, ocr
 from .screen import ImageInput, ensure_portrait_image, load_image
+
+
+_OCR_RESULT_CACHE_LOCK = threading.Lock()
+_OCR_RESULT_CACHE: dict[str, dict[str, Any]] = {}
+_OCR_RESULT_CACHE_MAX_SIZE = 32
 
 
 def _keywords(value: Any) -> tuple[str, ...]:
@@ -1175,6 +1183,7 @@ def build_list_result(
     excluded_keywords = _keywords(rules["excluded_keywords"])
     content_excluded_keywords = _keywords(rules["content_excluded_keywords"])
     unread_count_excluded_keywords = _keywords(rules.get("unread_count_excluded_keywords", ()))
+    content_force_unread_keywords = _keywords(rules.get("content_force_unread_keywords", ()))
     bottom_nav_keywords = _keywords(rules["bottom_nav_keywords"])
     max_unread_count = int(rules["max_unread_count"])
     right_meta_min = image_width * float(rules["right_meta_min_ratio"])
@@ -1582,6 +1591,13 @@ def build_list_result(
             unread_candidates = []
         if unread_count is None and unread_candidates:
             unread_count = unread_candidates[0]
+        if (
+            unread_count is None
+            and not suppress_unread_count
+            and find_keyword(content, content_force_unread_keywords)
+        ):
+            forced_unread_count = int(rules.get("badge_default_unread_count", 1) or 1)
+            unread_count = max(1, min(max_unread_count, forced_unread_count))
         if unread_count is not None and not (0 <= unread_count <= max_unread_count):
             unread_count = None
         rows.append(
@@ -1715,6 +1731,57 @@ def _mode_config(config: dict[str, Any], mode: str) -> dict[str, Any]:
     return copy.deepcopy(configured)
 
 
+def _json_cache_fragment(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        return repr(value)
+
+
+def _portrait_image_fingerprint(image: Any) -> str:
+    thumb = image.convert("L").resize((64, 64))
+    digest = blake2b(digest_size=16)
+    digest.update(str(image.size).encode("ascii", errors="ignore"))
+    digest.update(thumb.tobytes())
+    return digest.hexdigest()
+
+
+def _ocr_result_cache_key(
+    portrait_image: Any,
+    *,
+    mode: str,
+    region: Any,
+    ocr_config: dict[str, Any],
+    mode_config: dict[str, Any],
+    runtime_scope: Any,
+) -> str:
+    cache_ocr_config = dict(ocr_config)
+    cache_ocr_config.pop("engine", None)
+    return "|".join(
+        (
+            _json_cache_fragment(runtime_scope),
+            mode,
+            _portrait_image_fingerprint(portrait_image),
+            _json_cache_fragment(region),
+            _json_cache_fragment(cache_ocr_config),
+            _json_cache_fragment(mode_config),
+        )
+    )
+
+
+def _get_cached_ocr_result(cache_key: str) -> dict[str, Any] | None:
+    with _OCR_RESULT_CACHE_LOCK:
+        cached = _OCR_RESULT_CACHE.get(cache_key)
+    return copy.deepcopy(cached) if cached is not None else None
+
+
+def _set_cached_ocr_result(cache_key: str, result: dict[str, Any]) -> None:
+    with _OCR_RESULT_CACHE_LOCK:
+        if len(_OCR_RESULT_CACHE) >= _OCR_RESULT_CACHE_MAX_SIZE:
+            _OCR_RESULT_CACHE.clear()
+        _OCR_RESULT_CACHE[cache_key] = copy.deepcopy(result)
+
+
 def run_ocr_mode(
     image: ImageInput,
     config: dict[str, Any],
@@ -1737,6 +1804,20 @@ def run_ocr_mode(
     primary_ocr_config["preprocess"] = "original"
     primary_ocr_config["scale"] = preprocess["scale"]
     primary_ocr_config["rotate_to_portrait"] = False
+    cache_key = _ocr_result_cache_key(
+        portrait_image,
+        mode=mode,
+        region=region,
+        ocr_config=primary_ocr_config,
+        mode_config=mode_config,
+        runtime_scope={
+            "device_ip": (config.get("_runtime") or {}).get("device_ip") if isinstance(config.get("_runtime"), dict) else "",
+            "app_name": (config.get("_runtime") or {}).get("app_name") if isinstance(config.get("_runtime"), dict) else "",
+        },
+    )
+    cached_result = _get_cached_ocr_result(cache_key) if config.get("enable_ocr_result_cache", True) else None
+    if cached_result is not None:
+        return cached_result
     primary_items = ocr(portrait_image, primary_ocr_config)
 
     raw_items = primary_items
@@ -1756,11 +1837,14 @@ def run_ocr_mode(
         )
     else:
         result = build_points_result(rule_items, image_size, rules)
-    return {
+    payload = {
         "mode": mode,
         "items": rule_items,
         "ocr_items": normalized_items,
         "result": result,
     }
+    if config.get("enable_ocr_result_cache", True):
+        _set_cached_ocr_result(cache_key, payload)
+    return payload
 
 

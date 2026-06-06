@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 
+from apps import photo_capture as photo_capture_module
 from apps.base import BaseApp
 from apps.photo_capture import capture_transform_image
 from PIL import Image
@@ -11,21 +12,32 @@ class CaptureRobot:
     host = "192.168.1.108"
 
     def __init__(self):
-        self.save_paths = []
         self.pre_moves = []
+        self.status_calls = 0
 
     def _image_bytes(self) -> bytes:
         buffer = BytesIO()
         Image.new("RGB", (8, 8), "white").save(buffer, format="JPEG")
         return buffer.getvalue()
 
-    def get_transform_image(self, pre_move=True, save_path=None):
+    def get_status(self):
+        self.status_calls += 1
+        return {
+            "data": {
+                "transform_width": 8,
+                "transform_height": 8,
+                "points": [
+                    {"x": 0, "y": 0},
+                    {"x": 7, "y": 0},
+                    {"x": 7, "y": 7},
+                    {"x": 0, "y": 7},
+                ],
+            }
+        }
+
+    def get_capture_image(self, pre_move=True):
         self.pre_moves.append(pre_move)
-        self.save_paths.append(save_path)
-        image_bytes = self._image_bytes()
-        if save_path:
-            save_path.write_bytes(image_bytes)
-        return image_bytes
+        return self._image_bytes()
 
 
 class DemoApp(BaseApp):
@@ -75,8 +87,8 @@ def test_base_app_error_capture_is_saved_under_photo(tmp_path, monkeypatch):
 
     saved = list((tmp_path / "photo" / "errors").glob("192.168.1.108_*.jpg"))
     assert len(saved) == 1
-    assert robot.save_paths == [saved[0]]
     assert robot.pre_moves == [True]
+    assert robot.status_calls == 1
     assert not (tmp_path / "runtime" / "errors").exists()
 
 
@@ -91,9 +103,58 @@ def test_runtime_robot_capture_is_not_saved_by_default(tmp_path, monkeypatch):
     )
 
     assert image.startswith(b"\xff\xd8")
-    assert robot.save_paths == [None]
     assert robot.pre_moves == [True]
+    assert robot.status_calls == 1
     assert not (tmp_path / "photo" / "captures").exists()
+
+
+def test_capture_reuses_perspective_status_for_process_lifetime(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    photo_capture_module._STATUS_CACHE.clear()
+    photo_capture_module._PROCESSED_IMAGE_CACHE.clear()
+    robot = CaptureRobot()
+
+    capture_transform_image(robot, {"_runtime": {"device_ip": "192.168.1.108", "app_name": "wechat"}})
+    capture_transform_image(robot, {"_runtime": {"device_ip": "192.168.1.108", "app_name": "wechat"}})
+
+    assert robot.status_calls == 1
+    assert robot.pre_moves == [True, True]
+
+
+def test_capture_reuses_processed_image_when_raw_image_unchanged(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    photo_capture_module._STATUS_CACHE.clear()
+    photo_capture_module._PROCESSED_IMAGE_CACHE.clear()
+    robot = CaptureRobot()
+    build_calls = 0
+    original_build = photo_capture_module.build_local_perspective_image
+
+    def counted_build(raw_bytes, status):
+        nonlocal build_calls
+        build_calls += 1
+        return original_build(raw_bytes, status)
+
+    monkeypatch.setattr(photo_capture_module, "build_local_perspective_image", counted_build)
+
+    first = capture_transform_image(robot, {"_runtime": {"device_ip": "192.168.1.108", "app_name": "wechat"}})
+    second = capture_transform_image(robot, {"_runtime": {"device_ip": "192.168.1.108", "app_name": "wechat"}})
+
+    assert first == second
+    assert build_calls == 1
+    assert robot.status_calls == 1
+    assert robot.pre_moves == [True, True]
+
+
+def test_capture_time_is_excluded_from_step_timeout(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    photo_capture_module._STATUS_CACHE.clear()
+    photo_capture_module._PROCESSED_IMAGE_CACHE.clear()
+    robot = CaptureRobot()
+    config = {"_runtime": {"device_ip": "192.168.1.108", "app_name": "wechat"}}
+
+    capture_transform_image(robot, config)
+
+    assert float(config["_runtime"].get("_step_timeout_excluded_seconds", 0.0)) > 0.0
 
 
 def test_base_app_runtime_step_updates_status_and_callback():

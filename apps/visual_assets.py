@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from hashlib import blake2b
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Any, Literal, NamedTuple
 
-from vision.screen import crop_region
+from vision.screen import crop_region, load_image
 
 
 TemplateGroup = Literal["buttons", "screens"]
@@ -65,6 +67,9 @@ SCREEN_STATES_CONFIG_KEY = "screen_states"
 SCREEN_ROLES_CONFIG_KEY = "screen_roles"
 TEMPLATE_MATCH_REGIONS_CONFIG_KEY = "template_match_regions"
 GLOBAL_MATCH_TEMPLATE_KEYS = frozenset({"screen.no_phone", "screen.black_screen"})
+TEMPLATE_MATCH_CACHE_MAX_SIZE = 512
+_TEMPLATE_MATCH_CACHE: dict[tuple[Any, ...], dict[str, float] | None] = {}
+_TEMPLATE_MATCH_CACHE_LOCK = Lock()
 
 
 class ScreenState(NamedTuple):
@@ -344,6 +349,59 @@ def map_match_result_from_region(
     return mapped
 
 
+def _template_file_signature(template: Path) -> tuple[str, int, int]:
+    try:
+        stat = template.stat()
+    except OSError:
+        return str(template), 0, 0
+    return str(template.resolve()), int(stat.st_mtime_ns), int(stat.st_size)
+
+
+def _image_fingerprint(image: Any) -> str:
+    if isinstance(image, (bytes, bytearray)):
+        return blake2b(bytes(image), digest_size=16).hexdigest()
+    try:
+        path = Path(image)
+    except TypeError:
+        path = None
+    if path is not None and path.exists():
+        try:
+            return blake2b(path.read_bytes(), digest_size=16).hexdigest()
+        except OSError:
+            pass
+    try:
+        loaded = load_image(image)
+        payload = (
+            f"{loaded.mode}:{loaded.size[0]}x{loaded.size[1]}:".encode("utf-8")
+            + loaded.tobytes()
+        )
+        return blake2b(payload, digest_size=16).hexdigest()
+    except Exception:
+        return blake2b(repr(image).encode("utf-8", errors="replace"), digest_size=16).hexdigest()
+
+
+def _runtime_scope(config: dict[str, Any]) -> tuple[str, str]:
+    runtime = config.get("_runtime", {})
+    if not isinstance(runtime, dict):
+        runtime = {}
+    return str(runtime.get("device_ip") or ""), str(runtime.get("app_name") or "")
+
+
+def _cached_template_match(cache_key: tuple[Any, ...]) -> dict[str, float] | None | object:
+    with _TEMPLATE_MATCH_CACHE_LOCK:
+        if cache_key not in _TEMPLATE_MATCH_CACHE:
+            return ...
+        cached = _TEMPLATE_MATCH_CACHE[cache_key]
+    return dict(cached) if cached is not None else None
+
+
+def _store_template_match(cache_key: tuple[Any, ...], result: dict[str, float] | None) -> None:
+    with _TEMPLATE_MATCH_CACHE_LOCK:
+        if len(_TEMPLATE_MATCH_CACHE) >= TEMPLATE_MATCH_CACHE_MAX_SIZE:
+            _TEMPLATE_MATCH_CACHE.clear()
+        _TEMPLATE_MATCH_CACHE[cache_key] = dict(result) if result is not None else None
+
+
 def match_template_with_region(
     image: Any,
     template: Path,
@@ -362,12 +420,35 @@ def match_template_with_region(
             raise TemplateMatchRegionMissingError(key)
     else:
         region = None
+    if config.get("enable_template_match_cache", True) is not False:
+        cache_key = (
+            _runtime_scope(config),
+            _image_fingerprint(image),
+            _template_file_signature(template),
+            str(key),
+            round(float(threshold), 4),
+            tuple(round(float(value), 6) for value in region) if region is not None else None,
+            id(match_func),
+        )
+        cached = _cached_template_match(cache_key)
+        if cached is not ...:
+            return cached
+    else:
+        cache_key = None
     if region is None:
-        return match_func(image, template, threshold=threshold)
+        result = match_func(image, template, threshold=threshold)
+        if cache_key is not None:
+            _store_template_match(cache_key, result)
+        return result
     result = match_func(crop_region(image, region), template, threshold=threshold)
     if not result:
+        if cache_key is not None:
+            _store_template_match(cache_key, None)
         return None
-    return map_match_result_from_region(result, region)
+    mapped = map_match_result_from_region(result, region)
+    if cache_key is not None:
+        _store_template_match(cache_key, mapped)
+    return mapped
 
 
 def popup_template_paths(config: dict[str, Any]) -> list[Path]:
@@ -375,6 +456,13 @@ def popup_template_paths(config: dict[str, Any]) -> list[Path]:
     if not root.exists():
         return []
     return sorted(root.glob(POPUP_TEMPLATE_RULE.match_pattern))
+
+
+def popup_template_region_key(path: Path | str) -> str:
+    stem = Path(path).stem.strip()
+    if not stem:
+        return CUSTOM_POPUP
+    return f"{CUSTOM_POPUP}.{stem}"
 
 
 def _back_button_sort_key(path: Path) -> tuple[int, str]:
@@ -525,7 +613,7 @@ def asset_rules_for_tool() -> dict[str, Any]:
                 "match_pattern": POPUP_TEMPLATE_RULE.match_pattern,
                 "phase": POPUP_TEMPLATE_RULE.phase,
                 "multiple": POPUP_TEMPLATE_RULE.multiple,
-                "match_region_supported": False,
+                "match_region_supported": True,
                 "description": POPUP_TEMPLATE_RULE.description,
             }
         ],

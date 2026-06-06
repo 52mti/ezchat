@@ -43,6 +43,7 @@ class HuanyouApp(BaseApp):
         self.idle_points_checked = False
         self.idle_waiting = False
         self._last_step_detail = ""
+        self._startup_back_button_checked = False
 
     def _reporter(self, step: str, label: str, log_label: str | None = None) -> None:
         self._last_step_detail = str(log_label or label or step)
@@ -50,6 +51,42 @@ class HuanyouApp(BaseApp):
 
     def _mark_activity(self) -> None:
         self.last_activity_at = time.monotonic()
+
+    def _ensure_startup_back_button(self, reporter: Callable[..., None]) -> bool:
+        if self._startup_back_button_checked:
+            return True
+        if steps.cache_startup_back_button(self.robot, self.config, reporter=reporter):
+            self._startup_back_button_checked = True
+            self.emit_runtime_log("info", "huanyou_startup_back_button_cached", {})
+            return True
+        message = "启动检查未找到返回按钮，停止进程"
+        self.set_runtime_step("startup_back_button_missing", message)
+        self.status.last_error = message
+        self.status.is_circuit_open = True
+        self.recover_error_count = 0
+        self.emit_runtime_log("warning", "huanyou_startup_back_button_missing", {"error": message})
+        return False
+
+    def _reset_round_metrics(self) -> None:
+        cache = self.config.setdefault("_runtime_cache", {})
+        if isinstance(cache, dict):
+            cache["metrics"] = {"ocr_count": 0, "capture_count": 0}
+
+    def _emit_round_metrics(self, started_at: float) -> None:
+        cache = self.config.get("_runtime_cache", {})
+        metrics = cache.get("metrics", {}) if isinstance(cache, dict) else {}
+        if not isinstance(metrics, dict):
+            metrics = {}
+        self.emit_runtime_log(
+            "info",
+            "huanyou_round_metrics",
+            {
+                "ocr_count": int(metrics.get("ocr_count", 0) or 0),
+                "capture_count": int(metrics.get("capture_count", 0) or 0),
+                "seconds": round(time.monotonic() - started_at, 3),
+                "last_ocr": metrics.get("last_ocr"),
+            },
+        )
 
     @staticmethod
     def _balance_from_points(points: Any) -> str:
@@ -270,21 +307,39 @@ class HuanyouApp(BaseApp):
     def run_once(self) -> None:
         if self.status.is_circuit_open:
             return
+        round_started_at = time.monotonic()
+        self._reset_round_metrics()
         try:
             reporter = self._reporter
+            if not self._ensure_startup_back_button(reporter):
+                self._emit_round_metrics(round_started_at)
+                return
+            entry_image = self.capture_entry_image()
             if self.idle_waiting:
-                target = steps.rescan_unread_target(self.robot, self.config, reporter=reporter)
+                target = self.call_step_with_optional_image(
+                    steps.rescan_unread_target,
+                    self.robot,
+                    self.config,
+                    reporter=reporter,
+                    image=entry_image,
+                )
             else:
                 reporter("popup_check", "检查并关闭弹窗")
-                target = steps.find_unread_target(self.robot, self.config, reporter=reporter)
+                target = self.call_step_with_optional_image(
+                    steps.find_unread_target,
+                    self.robot,
+                    self.config,
+                    reporter=reporter,
+                    image=entry_image,
+                )
             if not target:
                 self.idle_waiting = True
                 reporter("empty_list_target", "暂无消息，进入防熄屏等待")
                 self._run_idle_maintenance(reporter)
+                self._emit_round_metrics(round_started_at)
                 self.mark_success()
                 return
 
-            round_started_at = time.monotonic()
             self.idle_waiting = False
             self.idle_points_checked = False
             self.emit_runtime_log(
@@ -312,6 +367,7 @@ class HuanyouApp(BaseApp):
             chat_image, stopped_without_next, advanced_by_greetings = self._prepare_chat_window(reporter, expected_name=current_name)
             if stopped_without_next:
                 steps.go_back(self.robot, self.config, reporter=reporter)
+                self._emit_round_metrics(round_started_at)
                 self.record_reply_round(time.monotonic() - round_started_at)
                 self.mark_success()
                 return
@@ -326,6 +382,7 @@ class HuanyouApp(BaseApp):
                     reporter("skip_reply", "跳过本轮回复")
                     steps.go_back(self.robot, self.config, reporter=reporter)
                     self._mark_activity()
+                    self._emit_round_metrics(round_started_at)
                     self.mark_success()
                     return
                 input_box_opened = self._send_action(reporter, action, message)
@@ -346,6 +403,7 @@ class HuanyouApp(BaseApp):
                     steps.go_back(self.robot, self.config, reporter=reporter, click_count=2)
                     self._mark_activity()
                     reporter("wait_next_round", "等待下一轮扫描")
+                    self._emit_round_metrics(round_started_at)
                     self.record_reply_round(time.monotonic() - round_started_at)
                     self.mark_success()
                     return
@@ -381,6 +439,7 @@ class HuanyouApp(BaseApp):
                     steps.go_back(self.robot, self.config, reporter=reporter)
                     self._mark_activity()
                     reporter("wait_next_round", "等待下一轮扫描")
+                    self._emit_round_metrics(round_started_at)
                     self.record_reply_round(time.monotonic() - round_started_at)
                     self.mark_success()
                     return
