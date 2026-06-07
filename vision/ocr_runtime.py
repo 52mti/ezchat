@@ -35,6 +35,8 @@ PADDLEX_VERSION = "3.4.3"
 DEFAULT_MODEL_TIER = "lite"
 SUPPORTED_BACKENDS = ("auto", "paddle_cuda", "onnx_directml", "cpu")
 SUPPORTED_EXECUTION_MODES = ("auto", "inprocess", "subprocess")
+DEFAULT_OCR_GPU_ALLOCATOR_STRATEGY = "auto_growth"
+DEFAULT_OCR_GPU_MEMORY_FRACTION = "0.6"
 CUDA_LANE_INDEXES = {
     "cu118": "https://www.paddlepaddle.org.cn/packages/stable/cu118/",
     "cu126": "https://www.paddlepaddle.org.cn/packages/stable/cu126/",
@@ -685,14 +687,16 @@ def _path_anchor_exists(path: Path) -> bool:
 
 def _resolve_runtime_cache_home(root: Path, configured: object = "") -> Path:
     raw = str(configured or "").strip()
+    configured_is_staging = False
     if raw:
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             return (root / candidate).resolve()
         normalized = str(candidate).replace("\\", "/").lower()
+        configured_is_staging = "/dist/_staging/" in normalized
         if "/dist/_staging/" not in normalized and _path_anchor_exists(candidate):
             return candidate.resolve()
-    env_cache = str(os.environ.get("PADDLE_PDX_CACHE_HOME", "") or "").strip()
+    env_cache = "" if configured_is_staging else str(os.environ.get("PADDLE_PDX_CACHE_HOME", "") or "").strip()
     if env_cache:
         candidate = Path(env_cache).expanduser()
         if not candidate.is_absolute():
@@ -1106,6 +1110,8 @@ class SubprocessOcrRuntimeEngine:
             "use_angle_cls",
             "use_doc_orientation_classify",
             "use_doc_unwarping",
+            "ocr_gpu_allocator_strategy",
+            "ocr_gpu_memory_fraction",
             "text_detection_model_name",
             "text_recognition_model_name",
             "text_detection_model_dir",
@@ -1146,6 +1152,12 @@ class SubprocessOcrRuntimeEngine:
         env["PYTHONNOUSERSITE"] = "1"
         env["PIP_USER"] = "0"
         env["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+        env["FLAGS_allocator_strategy"] = str(
+            self.config.get("ocr_gpu_allocator_strategy", DEFAULT_OCR_GPU_ALLOCATOR_STRATEGY) or DEFAULT_OCR_GPU_ALLOCATOR_STRATEGY
+        )
+        env["FLAGS_fraction_of_gpu_memory_to_use"] = str(
+            self.config.get("ocr_gpu_memory_fraction", DEFAULT_OCR_GPU_MEMORY_FRACTION) or DEFAULT_OCR_GPU_MEMORY_FRACTION
+        )
         cache_home = _resolve_runtime_cache_home(root, load_installed_runtime_state(root).get("cache_home", ""))
         env["PADDLE_PDX_CACHE_HOME"] = str(cache_home)
         env["PADDLEX_HOME"] = str(cache_home)
@@ -1364,6 +1376,8 @@ def get_ocr_runtime_engine(config: dict[str, Any]) -> Any:
             "use_angle_cls",
             "use_doc_orientation_classify",
             "use_doc_unwarping",
+            "ocr_gpu_allocator_strategy",
+            "ocr_gpu_memory_fraction",
             "text_detection_model_name",
             "text_recognition_model_name",
             "text_detection_model_dir",

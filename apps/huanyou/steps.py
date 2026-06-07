@@ -4,6 +4,7 @@ from decimal import Decimal, InvalidOperation
 import random
 import re
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -128,7 +129,15 @@ def _runtime_cache(config: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(cache, dict):
         cache = {}
         config["_runtime_cache"] = cache
-    for section in ("screen_anchors", "template_points", "current_frame_matches", "ocr_regions", "current_chat", "metrics"):
+    for section in (
+        "screen_anchors",
+        "template_points",
+        "current_frame_matches",
+        "ocr_regions",
+        "current_chat",
+        "metrics",
+        "contact_send_counts",
+    ):
         value = cache.setdefault(section, {})
         if not isinstance(value, dict):
             cache[section] = {}
@@ -162,6 +171,51 @@ def _normalize_text(text: Any) -> str:
     return re.sub(r"\s+", "", str(text or "")).strip()
 
 
+def _same_contact_send_limit(config: dict[str, Any]) -> int:
+    try:
+        return max(1, int(config.get("same_contact_send_limit_per_run", 3) or 3))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _contact_send_count_key(name: Any) -> str:
+    return unicodedata.normalize("NFKC", _normalize_text(name)).casefold()
+
+
+def record_contact_send(config: dict[str, Any], name: Any, count: int = 1) -> int:
+    key = _contact_send_count_key(name)
+    if not key:
+        return 0
+    counts = _runtime_cache(config).setdefault("contact_send_counts", {})
+    if not isinstance(counts, dict):
+        counts = {}
+        _runtime_cache(config)["contact_send_counts"] = counts
+    try:
+        current = int(counts.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        current = 0
+    current += max(1, int(count or 1))
+    counts[key] = current
+    return current
+
+
+def contact_send_count(config: dict[str, Any], name: Any) -> int:
+    key = _contact_send_count_key(name)
+    if not key:
+        return 0
+    counts = _runtime_cache(config).get("contact_send_counts", {})
+    if not isinstance(counts, dict):
+        return 0
+    try:
+        return int(counts.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _contact_send_limit_reached(config: dict[str, Any], name: Any) -> bool:
+    return bool(_contact_send_count_key(name)) and contact_send_count(config, name) >= _same_contact_send_limit(config)
+
+
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     merged = dict(base)
     for key, value in override.items():
@@ -172,8 +226,18 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return merged
 
 
-def _threshold(config: dict[str, Any]) -> float:
-    return float(config.get("match_threshold", 0.85))
+def _threshold(config: dict[str, Any], key: str | None = None) -> float:
+    thresholds = config.get("template_match_thresholds")
+    if key and isinstance(thresholds, dict) and key in thresholds:
+        return float(thresholds[key])
+    return float(config.get("match_threshold", 0.7))
+
+
+def _popup_threshold(config: dict[str, Any], key: str | None = None) -> float:
+    thresholds = config.get("template_match_thresholds")
+    if key and isinstance(thresholds, dict) and key in thresholds:
+        return float(thresholds[key])
+    return float(config.get("popup_match_threshold", 0.8))
 
 
 def _step_timeout(config: dict[str, Any]) -> float:
@@ -272,7 +336,7 @@ def _match_any(image: Any, paths: list[Path], config: dict[str, Any], key: str) 
             path,
             config,
             key,
-            threshold=_threshold(config),
+            threshold=_threshold(config, key),
             match_func=match,
         )
         if result:
@@ -292,7 +356,7 @@ def _match_any_with_path(
             path,
             config,
             key,
-            threshold=_threshold(config),
+            threshold=_threshold(config, key),
             match_func=match,
         )
         if result:
@@ -613,7 +677,7 @@ def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> di
         popup_template,
         config,
         popup_template_region_key(popup_template),
-        threshold=_threshold(config),
+        threshold=_popup_threshold(config, popup_template_region_key(popup_template)),
         match_func=match,
     )
     if not result:
@@ -631,7 +695,7 @@ def current_screen(image: Any, config: dict[str, Any]) -> str:
             state.path,
             config,
             state.name,
-            threshold=_threshold(config),
+            threshold=_threshold(config, state.name),
             match_func=match,
         ):
             return state.name
@@ -950,7 +1014,7 @@ def find_unread_target(
         if _matches_chat_list_screen(image, cfg, reporter=reporter):
             _report(reporter, "chat_list_ocr", "列表 OCR 扫描")
             ocr_result = run_unread_list_ocr(image, cfg, reporter=reporter)
-            return _select_unread_target_from_ocr_result(ocr_result, reporter=reporter)
+            return _select_unread_target_from_ocr_result(ocr_result, cfg, reporter=reporter)
         _cache_pop(cfg, "screen_anchors", "bottom_message")
         image = ensure_list_screen(robot, cfg, reporter=reporter)
         if image is None:
@@ -965,7 +1029,7 @@ def find_unread_target(
         _report(reporter, "chat_list_ocr", "列表 OCR 复扫")
         ocr_result = run_unread_list_ocr(image, cfg, reporter=reporter)
 
-    return _select_unread_target_from_ocr_result(ocr_result, reporter=reporter)
+    return _select_unread_target_from_ocr_result(ocr_result, cfg, reporter=reporter)
 
 
 def run_unread_list_ocr(
@@ -991,14 +1055,23 @@ def run_unread_list_ocr(
 
 def _select_unread_target_from_ocr_result(
     ocr_result: dict[str, Any],
+    config: dict[str, Any] | None = None,
     reporter: Reporter | None = None,
 ) -> dict[str, Any] | None:
-    
+    cfg = _config(config)
     rows = ocr_result["result"].get("message_list", [])
     candidates: list[tuple[int, int, int, dict[str, Any]]] = []
     for index, row in enumerate(rows):
         bounds = row.get("bounds")
         if not isinstance(bounds, list) or len(bounds) != 4:
+            continue
+        if _contact_send_limit_reached(cfg, row.get("name", "")):
+            _report(
+                reporter,
+                "target_send_limit_filtered",
+                "过滤本次启动已发送满 3 次的联系人",
+                log_label=f"过滤本次启动已发送满 3 次的联系人：{row.get('name', '')}",
+            )
             continue
         if _unread_rank(row) <= 0:
             continue
@@ -1042,7 +1115,7 @@ def rescan_unread_target(
     if image is None:
         return None
     ocr_result = run_unread_list_ocr(image, cfg, reporter=reporter)
-    return _select_unread_target_from_ocr_result(ocr_result, reporter=reporter)
+    return _select_unread_target_from_ocr_result(ocr_result, cfg, reporter=reporter)
 
 
 def find_unread(

@@ -18,10 +18,17 @@ def test_each_app_owns_dialogue_and_list_ocr_modes():
 
 
 def test_each_app_uses_shared_runtime_defaults():
-    for config in [WECHAT_CONFIG, XINYU_CONFIG, HUANYOU_CONFIG]:
+    for config in [WECHAT_CONFIG, XINYU_CONFIG]:
         assert config["poll_interval"] == 1
         assert config["keep_awake_interval_seconds"] == 200
         assert config["persona"]["requestPersona"] == DEFAULT_PERSONA_ID
+    assert HUANYOU_CONFIG["poll_interval"] == 1
+    assert HUANYOU_CONFIG["persona"]["requestPersona"] == DEFAULT_PERSONA_ID
+
+
+def test_huanyou_uses_optimized_idle_intervals():
+    assert HUANYOU_CONFIG["idle_poll_interval_seconds"] == 20
+    assert HUANYOU_CONFIG["keep_awake_interval_seconds"] == 20
 
 
 def test_huanyou_runtime_ocr_is_enabled_by_default():

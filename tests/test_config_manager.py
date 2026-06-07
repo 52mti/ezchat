@@ -4,6 +4,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 
 from apps.wechat.config import DEFAULT_CONFIG as WECHAT_DEFAULT_CONFIG
+from apps.xinyu.config import DEFAULT_CONFIG as XINYU_DEFAULT_CONFIG
 from services.config_manager import ConfigManager
 
 
@@ -344,11 +345,22 @@ def test_config_manager_keeps_saved_match_threshold(tmp_path):
     manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
     app_dir = tmp_path / "apps" / "xinyu"
     app_dir.mkdir(parents=True)
-    (app_dir / "config.json").write_text('{"match_threshold": 0.85}', encoding="utf-8")
+    (app_dir / "config.json").write_text('{"match_threshold": 0.7}', encoding="utf-8")
 
     config = manager.get_app_config("1.1.1.1", "xinyu", {})
 
-    assert config["match_threshold"] == 0.85
+    assert config["match_threshold"] == 0.7
+
+
+def test_config_manager_defaults_invalid_match_threshold(tmp_path):
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    app_dir = tmp_path / "apps" / "xinyu"
+    app_dir.mkdir(parents=True)
+    (app_dir / "config.json").write_text('{"match_threshold": "bad"}', encoding="utf-8")
+
+    config = manager.get_app_config("1.1.1.1", "xinyu", {})
+
+    assert config["match_threshold"] == 0.7
 
 
 def test_config_manager_updates_device_app_offsets_independently(tmp_path):
@@ -403,6 +415,47 @@ def test_config_manager_keeps_template_match_regions_in_app_scope(tmp_path):
     assert regions["screen.chat_list"] == [0.0, 0.1, 1.0, 0.8]
     assert "template_match_regions" not in saved["devices"][0].get("app_overrides", {}).get("huanyou", {})
     assert merged["template_match_regions"]["button.send"] == [0.1, 0.7, 0.8, 0.2]
+
+
+def test_config_manager_keeps_template_match_thresholds_in_app_scope(tmp_path):
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+
+    manager.update_app_config(
+        "xinyu",
+        {
+            "template_match_thresholds": {
+                "screen.chat_window": 0.7,
+            }
+        },
+    )
+
+    app_saved = _read_app_config(tmp_path, "xinyu")
+    merged = manager.get_app_config("1.1.1.1", "xinyu", XINYU_DEFAULT_CONFIG)
+
+    assert app_saved["template_match_thresholds"]["screen.chat_window"] == 0.7
+    assert merged["template_match_thresholds"]["screen.chat_window"] == 0.7
+
+
+def test_xinyu_partial_app_config_keeps_default_template_regions(tmp_path):
+    app_dir = tmp_path / "apps" / "xinyu"
+    app_dir.mkdir(parents=True)
+    (app_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "template_match_regions": {
+                    "popup.custom.popup_custom_4": [0.037, 0.282, 0.954, 0.443]
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+
+    merged = manager.get_app_config("1.1.1.1", "xinyu", XINYU_DEFAULT_CONFIG)
+
+    assert merged["template_match_regions"]["screen.chat_window"] == [0.007, 0.476, 0.261, 0.523]
+    assert merged["template_match_regions"]["popup.custom.popup_custom_4"] == [0.037, 0.282, 0.954, 0.443]
 
 
 def test_config_manager_migrates_legacy_app_level_offsets_to_device_app_scope(tmp_path):

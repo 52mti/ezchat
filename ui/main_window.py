@@ -3,17 +3,22 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+import os
 import queue
 import re
 import signal
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
+import requests
+from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, QUrl
+from PyQt6.QtGui import QColor, QDesktopServices, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QAbstractItemView,
@@ -35,6 +40,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QProgressDialog,
     QRubberBand,
     QScrollArea,
     QSpinBox,
@@ -49,6 +55,7 @@ from PIL import Image
 
 from apps import get_default_app_name, get_registered_apps, resolve_app_name
 from apps.defaults import DEFAULT_RUNTIME_CONFIG, with_app_defaults
+from apps.photo_capture import capture_transform_image
 from apps.visual_assets import (
     CHAT_LIST_SCREEN,
     CHAT_WINDOW_SCREEN,
@@ -67,10 +74,20 @@ from apps.visual_assets import (
     import_target_path,
     is_back_button_template_name,
     is_popup_template_name,
+    popup_template_region_key,
     template_variant_paths,
 )
 from lgb.lgb import RobotInterface, scan_devices
-from services import ConfigManager, LicenseClient
+from services import (
+    ConfigManager,
+    LicenseClient,
+    ReleaseDecision,
+    ReleaseManifestError,
+    ResolvedUpdatePackage,
+    UpdateSourceError,
+    resolve_lanzou_update_package,
+    resolve_release_decision,
+)
 from vision.screen import ensure_portrait_image
 from workers import DeviceWorker, WorkerEvent
 
@@ -388,6 +405,7 @@ UNATTENDED_COLUMN_WIDTH = 112
 BALANCE_COLUMN_WIDTH = 86
 
 STATUS_COORDINATE_RE = re.compile(r"\s*[：:,-]?\s*\(?\s*-?\d+(?:\.\d+)?\s*[,，]\s*-?\d+(?:\.\d+)?\s*\)?\s*$")
+UPDATE_DOWNLOAD_CHUNK_SIZE = 1024 * 256
 
 
 def mask_secret(value: str) -> str:
@@ -461,11 +479,17 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config_manager = config_manager or ConfigManager()
         self.events: "queue.Queue[WorkerEvent]" = queue.Queue()
+        self.update_events: "queue.Queue[tuple[str, dict[str, Any]]]" = queue.Queue()
         self.workers: dict[str, DeviceWorker] = {}
         self.log_events: list[WorkerEvent] = []
         self.log_event_times: dict[int, str] = {}
         self.unattended_started_at: dict[str, float] = {}
         self.unattended_elapsed_seconds: dict[str, float] = {}
+        self._update_check_in_progress = False
+        self._download_cancel_event: threading.Event | None = None
+        self._download_progress_dialog: QProgressDialog | None = None
+        self._pending_update_decision: ReleaseDecision | None = None
+        self._pending_update_package: ResolvedUpdatePackage | None = None
         self.setWindowTitle("机械臂视觉控制系统")
         self.resize(1180, 720)
         self.setStyleSheet(APP_STYLESHEET)
@@ -516,6 +540,9 @@ class MainWindow(QMainWindow):
         self.ocr_mode_label = QLabel(_ocr_mode_label(self.config_manager))
         self.ocr_mode_label.setObjectName("OcrModeLabel")
         top_bar.addWidget(self.ocr_mode_label)
+        self.check_update_button = self._button("检查更新")
+        self.check_update_button.clicked.connect(lambda: self._start_release_check(manual=True))
+        top_bar.addWidget(self.check_update_button)
         top_bar.addStretch(1)
         layout.addWidget(top_panel)
 
@@ -601,6 +628,7 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._drain_events)
         self.timer.start(100)
+        QTimer.singleShot(800, lambda: self._start_release_check(manual=False))
 
     def _button(self, text: str, variant: str = "default") -> QPushButton:
         button = QPushButton(text)
@@ -622,6 +650,209 @@ class MainWindow(QMainWindow):
         group.addWidget(caption)
         layout.addLayout(group)
         return value
+
+    def _package_root(self) -> Path:
+        return Path(getattr(self.config_manager, "config_path", Path("config.json"))).resolve().parent
+
+    def _startup_update_check_enabled(self) -> bool:
+        root = self._package_root()
+        return (root / "runtime_manifest.json").is_file() and (root / "runtime" / "install_state.json").is_file()
+
+    def _skip_update_version(self) -> str:
+        return str(self.config_manager.get("update_skip_version", default="") or "").strip()
+
+    def _set_skip_update_version(self, version: str) -> None:
+        self.config_manager.set("update_skip_version", value=str(version or "").strip())
+
+    def _start_release_check(self, *, manual: bool) -> None:
+        if not manual and not self._startup_update_check_enabled():
+            return
+        if self._update_check_in_progress:
+            if manual:
+                QMessageBox.information(self, "检查更新", "正在检查更新，请稍后。")
+            return
+        self._update_check_in_progress = True
+        self.check_update_button.setEnabled(False)
+        self.check_update_button.setText("检查中...")
+        threading.Thread(
+            target=self._run_release_check,
+            kwargs={"manual": manual},
+            daemon=True,
+        ).start()
+
+    def _run_release_check(self, *, manual: bool) -> None:
+        try:
+            decision = resolve_release_decision(package_root=self._package_root())
+        except ReleaseManifestError as exc:
+            self.update_events.put(("check_error", {"manual": manual, "message": str(exc)}))
+            return
+        self.update_events.put(("check_complete", {"manual": manual, "decision": decision}))
+
+    def _finish_release_check(self) -> None:
+        self._update_check_in_progress = False
+        self.check_update_button.setEnabled(True)
+        self.check_update_button.setText("检查更新")
+
+    def _show_release_decision_dialog(self, decision: ReleaseDecision) -> None:
+        notes = decision.release_notes.strip()
+        details = [
+            f"当前版本：{decision.current_app_version}",
+            f"目标版本：{decision.target_app_version}",
+        ]
+        if notes:
+            details.append(f"更新说明：{notes}")
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Icon.Information)
+        if decision.action == "incremental":
+            message.setWindowTitle("发现更新")
+            message.setText("发现新的更新包。")
+            proceed_button = message.addButton("立即更新", QMessageBox.ButtonRole.AcceptRole)
+        else:
+            message.setWindowTitle("需要下载全量包")
+            message.setText("当前版本需要下载新的全量包。")
+            proceed_button = message.addButton("前往下载", QMessageBox.ButtonRole.AcceptRole)
+        skip_button = message.addButton("本次更新不再提示", QMessageBox.ButtonRole.DestructiveRole)
+        later_button = message.addButton("稍后再说", QMessageBox.ButtonRole.RejectRole)
+        message.setInformativeText("\n".join(details))
+        message.exec()
+        clicked = message.clickedButton()
+        if clicked is skip_button:
+            self._set_skip_update_version(decision.target_app_version)
+            return
+        if clicked is later_button:
+            return
+        self._set_skip_update_version("")
+        if clicked is proceed_button:
+            if decision.action == "incremental":
+                self._start_update_download(decision)
+            else:
+                QDesktopServices.openUrl(QUrl(decision.full_package_url))
+
+    def _start_update_download(self, decision: ReleaseDecision) -> None:
+        if self._download_cancel_event is not None:
+            QMessageBox.information(self, "更新下载", "当前已有更新下载任务在进行。")
+            return
+        self._pending_update_decision = decision
+        self._pending_update_package = None
+        self._download_cancel_event = threading.Event()
+        self._download_progress_dialog = QProgressDialog("正在解析更新包...", "取消", 0, 0, self)
+        self._download_progress_dialog.setWindowTitle("下载更新")
+        self._download_progress_dialog.setAutoClose(False)
+        self._download_progress_dialog.setAutoReset(False)
+        self._download_progress_dialog.setMinimumDuration(0)
+        self._download_progress_dialog.canceled.connect(self._cancel_update_download)
+        self._download_progress_dialog.show()
+        threading.Thread(
+            target=self._run_update_download,
+            kwargs={"decision": decision, "cancel_event": self._download_cancel_event},
+            daemon=True,
+        ).start()
+
+    def _cancel_update_download(self) -> None:
+        if self._download_cancel_event is not None:
+            self._download_cancel_event.set()
+
+    def _run_update_download(self, *, decision: ReleaseDecision, cancel_event: threading.Event) -> None:
+        target_path: Path | None = None
+        try:
+            with requests.Session() as http:
+                resolved = resolve_lanzou_update_package(
+                    share_url=decision.update_share_url,
+                    file_name=decision.update_file_name,
+                    session=http,
+                )
+                self.update_events.put(
+                    (
+                        "download_resolved",
+                        {"file_name": resolved.file_name, "size": resolved.size, "package": resolved},
+                    )
+                )
+                target_dir = self._package_root() / "runtime" / "tmp" / "updates"
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target_path = target_dir / resolved.file_name
+                with http.get(
+                    resolved.download_url,
+                    stream=True,
+                    timeout=30,
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Referer": resolved.detail_url,
+                    },
+                ) as response:
+                    response.raise_for_status()
+                    total = int(response.headers.get("Content-Length", "0") or "0")
+                    self.update_events.put(
+                        (
+                            "download_started",
+                            {"file_name": resolved.file_name, "total": total},
+                        )
+                    )
+                    downloaded = 0
+                    with target_path.open("wb") as handle:
+                        for chunk in response.iter_content(chunk_size=UPDATE_DOWNLOAD_CHUNK_SIZE):
+                            if cancel_event.is_set():
+                                raise RuntimeError("cancelled")
+                            if not chunk:
+                                continue
+                            handle.write(chunk)
+                            downloaded += len(chunk)
+                            self.update_events.put(
+                                (
+                                    "download_progress",
+                                    {"downloaded": downloaded, "total": total},
+                                )
+                            )
+            self.update_events.put(
+                (
+                    "download_complete",
+                    {
+                        "archive_path": str(target_path),
+                        "package": resolved,
+                    },
+                )
+            )
+        except RuntimeError as exc:
+            if str(exc) == "cancelled":
+                if target_path is not None:
+                    target_path.unlink(missing_ok=True)
+                self.update_events.put(("download_cancelled", {}))
+                return
+            self.update_events.put(("download_error", {"message": str(exc)}))
+        except (UpdateSourceError, requests.RequestException, OSError) as exc:
+            if target_path is not None:
+                target_path.unlink(missing_ok=True)
+            self.update_events.put(("download_error", {"message": str(exc)}))
+
+    def _close_download_progress_dialog(self) -> None:
+        if self._download_progress_dialog is not None:
+            self._download_progress_dialog.close()
+            self._download_progress_dialog.deleteLater()
+            self._download_progress_dialog = None
+        self._download_cancel_event = None
+
+    def _launch_update_apply(self, archive_path: str) -> None:
+        root = self._package_root()
+        updater = root / "update_apply.py"
+        if not updater.is_file():
+            QMessageBox.critical(self, "更新失败", f"缺少更新脚本：{updater}")
+            return
+        command = [
+            sys.executable,
+            str(updater),
+            "--package-root",
+            str(root),
+            "--archive",
+            str(archive_path),
+            "--pid",
+            str(os.getpid()),
+        ]
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        try:
+            subprocess.Popen(command, cwd=root, creationflags=creationflags)
+        except OSError as exc:
+            QMessageBox.critical(self, "更新失败", f"无法启动更新程序：{exc}")
+            return
+        QApplication.instance().quit()
 
     def _load_devices(self) -> None:
         devices = self.config_manager.devices()
@@ -1024,6 +1255,9 @@ class MainWindow(QMainWindow):
                 "ocr_modes",
                 "templates",
                 "match_threshold",
+                "popup_match_threshold",
+                "template_match_regions",
+                "template_match_thresholds",
             )
             if key in values
         }
@@ -1151,6 +1385,27 @@ class MainWindow(QMainWindow):
             return f"[{event.level}] {event.device_ip}: 心遇回复 [{contact}] {reply_text}"
         if event.message == "xinyu_send_clicks":
             return f"[{event.level}] {event.device_ip}: 心遇发送点击次数 {payload.get('clicks', '')}"
+        if event.message == "xinyu_send_flow_summary":
+            contact = str(payload.get("contact", "") or "")
+            return (
+                f"[{event.level}] {event.device_ip}: 心遇发送摘要 [{contact}] "
+                f"输入框={payload.get('input_box_source', '') or '-'}"
+                f"{('/' + str(payload.get('input_box_template', ''))) if payload.get('input_box_template') else ''}，"
+                f"麦克风={payload.get('microphone_template', '') or '-'}，"
+                f"TTS={'成功' if payload.get('tts_success') else '失败'}，"
+                f"重试 {payload.get('tts_retry_count', 0)} 次，"
+                f"发送点击 {payload.get('send_clicks', '')} 次，"
+                f"补点 {payload.get('send_clear_extra_clicks', 0)} 次，"
+                f"返回 {payload.get('return_clicks', '')} 次，"
+                f"原因={payload.get('return_reason', '') or '-'}"
+            )
+        if event.message == "xinyu_round_metrics":
+            return (
+                f"[{event.level}] {event.device_ip}: 心遇本轮统计 "
+                f"OCR {payload.get('ocr_count', '')} 次，截图 {payload.get('capture_count', '')} 次，"
+                f"详情回退 {payload.get('dialogue_compact_fallback_count', 0)} 次，"
+                f"耗时 {payload.get('seconds', '')} 秒"
+            )
         if event.message == "xinyu_balance":
             return f"[{event.level}] {event.device_ip}: 心遇余额 {payload.get('balance', '')}"
         if event.message == "xinyu_balance_failed":
@@ -1182,6 +1437,72 @@ class MainWindow(QMainWindow):
             return f"[{event.level}] {event.device_ip}: 欢友余额 {payload.get('balance', '')}"
         if event.message == "huanyou_balance_failed":
             return f"[{event.level}] {event.device_ip}: 欢友余额读取失败 {payload.get('error', '')}"
+        if event.message == "huanyou_message_input":
+            contact = str(payload.get("contact", "") or "")
+            content = str(payload.get("content", "") or "")
+            source = str(payload.get("source", "") or "")
+            return f"[{event.level}] {event.device_ip}: 欢友输入来源 {source} [{contact}] {content}"
+        if event.message == "huanyou_reply_text":
+            contact = str(payload.get("contact", "") or "")
+            reply_text = str(payload.get("reply_text", "") or "")
+            if bool(payload.get("skip")):
+                reason = str(payload.get("reason", "") or "")
+                return f"[{event.level}] {event.device_ip}: 欢友跳过 [{contact}] {reason}"
+            return f"[{event.level}] {event.device_ip}: 欢友回复 [{contact}] {reply_text}"
+        if event.message == "huanyou_round_metrics":
+            return (
+                f"[{event.level}] {event.device_ip}: 欢友本轮统计 "
+                f"OCR {payload.get('ocr_count', '')} 次，截图 {payload.get('capture_count', '')} 次，"
+                f"耗时 {payload.get('seconds', '')} 秒"
+            )
+        if event.message == "huanyou_new_greetings":
+            return f"[{event.level}] {event.device_ip}: 欢友新招呼处理 {payload.get('count', '')} 次"
+        if event.message == "huanyou_chat_window_swipe":
+            start = payload.get("start", {}) if isinstance(payload.get("start", {}), dict) else {}
+            end = payload.get("end", {}) if isinstance(payload.get("end", {}), dict) else {}
+            return (
+                f"[{event.level}] {event.device_ip}: 欢友聊天上滑 "
+                f"({start.get('x', '')}, {start.get('y', '')}) -> ({end.get('x', '')}, {end.get('y', '')})"
+            )
+        if event.message == "huanyou_send_clicks":
+            return f"[{event.level}] {event.device_ip}: 欢友发送点击次数 {payload.get('clicks', '')}"
+        if event.message == "huanyou_contact_send_count":
+            contact = str(payload.get("contact", "") or "")
+            count = payload.get("count", "")
+            return f"[{event.level}] {event.device_ip}: 欢友本次启动已给 [{contact}] 发送 {count} 次"
+        if event.message == "huanyou_next_chat_verified":
+            previous = str(payload.get("previous_name", "") or "")
+            current = str(payload.get("current_name", "") or "")
+            clicks = payload.get("clicks", "")
+            return f"[{event.level}] {event.device_ip}: 欢友下一条已切人 {previous} -> {current}，点击 {clicks} 次"
+        if event.message == "huanyou_next_chat_missing":
+            previous = str(payload.get("previous_name", "") or "")
+            reason = str(payload.get("reason", "") or "")
+            return f"[{event.level}] {event.device_ip}: 欢友未找到下一条 [{previous}] {reason}"
+        if event.message == "huanyou_input_box_retracted":
+            return f"[{event.level}] {event.device_ip}: 欢友已收回输入框 ({payload.get('x', '')}, {payload.get('y', '')})"
+        if event.message == "huanyou_target_selected":
+            name = str(payload.get("name", "") or "")
+            content = str(payload.get("content", "") or "")
+            unread_count = payload.get("unread_count")
+            favorability = payload.get("favorability")
+            return f"[{event.level}] {event.device_ip}: 欢友选中目标 [{name}] 未读 {unread_count} 好感度 {favorability} 内容：{content}"
+        if event.message == "huanyou_startup_back_button_cached":
+            return f"[{event.level}] {event.device_ip}: 欢友启动检查已缓存返回按钮"
+        if event.message == "huanyou_startup_back_button_missing":
+            return f"[{event.level}] {event.device_ip}: 欢友启动检查未找到返回按钮，停止进程 {payload.get('error', '')}"
+        if event.message == "no_phone_detected":
+            return f"[{event.level}] {event.device_ip}: 检测到无手机 {payload.get('error', '')}"
+        if event.message == "black_screen_detected":
+            return f"[{event.level}] {event.device_ip}: 检测到黑屏 {payload.get('error', '')}"
+        if event.message == "keep_awake_failed":
+            return f"[{event.level}] {event.device_ip}: 防熄屏失败 {payload.get('error', '')}"
+        if event.message.startswith("欢友步骤不可用："):
+            count = payload.get("error_count", "")
+            threshold = payload.get("circuit_breaker_threshold", "")
+            if count != "" and threshold != "":
+                return f"[{event.level}] {event.device_ip}: {event.message}（错误计数 {count}/{threshold}）"
+            return f"[{event.level}] {event.device_ip}: {event.message}"
         if event.message == "app_error":
             label = str(payload.get("label", "") or payload.get("step", "") or "")
             error = str(payload.get("error", "") or "")
@@ -1242,6 +1563,105 @@ class MainWindow(QMainWindow):
             self._refresh_unattended_durations()
         except Exception as exc:
             self.logs.append(f"[{time.strftime('%H:%M:%S')}] [error] UI: 无干预时长刷新失败：{exc}")
+
+        self._drain_update_events()
+
+    def _drain_update_events(self) -> None:
+        while True:
+            try:
+                event_type, payload = self.update_events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self._handle_update_event(event_type, payload)
+            except Exception as exc:
+                self.logs.append(f"[{time.strftime('%H:%M:%S')}] [error] UI: 更新事件处理失败：{exc}")
+
+    def _handle_update_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        if event_type in {"check_complete", "check_error"}:
+            self._finish_release_check()
+
+        if event_type == "check_error":
+            message = str(payload.get("message", "") or "检查更新失败")
+            manual = bool(payload.get("manual"))
+            if manual:
+                QMessageBox.warning(self, "检查更新", message)
+            else:
+                self.logs.append(f"[{time.strftime('%H:%M:%S')}] [warning] UI: {message}")
+            return
+
+        if event_type == "check_complete":
+            decision = payload.get("decision")
+            manual = bool(payload.get("manual"))
+            if not isinstance(decision, ReleaseDecision):
+                return
+            if decision.action == "none":
+                if manual:
+                    QMessageBox.information(self, "检查更新", "当前已经是最新版本。")
+                return
+            if not manual and self._skip_update_version() == decision.target_app_version:
+                return
+            self._show_release_decision_dialog(decision)
+            return
+
+        if event_type == "download_resolved":
+            package = payload.get("package")
+            if isinstance(package, ResolvedUpdatePackage):
+                self._pending_update_package = package
+            if self._download_progress_dialog is not None:
+                file_name = str(payload.get("file_name", "") or "")
+                size = str(payload.get("size", "") or "")
+                suffix = f" ({size})" if size else ""
+                self._download_progress_dialog.setLabelText(f"正在下载：{file_name}{suffix}")
+            return
+
+        if event_type == "download_started":
+            if self._download_progress_dialog is not None:
+                total = int(payload.get("total") or 0)
+                if total > 0:
+                    self._download_progress_dialog.setRange(0, total)
+                    self._download_progress_dialog.setValue(0)
+                else:
+                    self._download_progress_dialog.setRange(0, 0)
+            return
+
+        if event_type == "download_progress":
+            if self._download_progress_dialog is not None:
+                total = int(payload.get("total") or 0)
+                downloaded = int(payload.get("downloaded") or 0)
+                if total > 0:
+                    self._download_progress_dialog.setRange(0, total)
+                    self._download_progress_dialog.setValue(min(downloaded, total))
+            return
+
+        if event_type == "download_cancelled":
+            self._close_download_progress_dialog()
+            QMessageBox.information(self, "下载更新", "已取消本次更新下载。")
+            return
+
+        if event_type == "download_error":
+            self._close_download_progress_dialog()
+            QMessageBox.warning(self, "下载更新", str(payload.get("message", "") or "下载更新失败"))
+            return
+
+        if event_type == "download_complete":
+            self._close_download_progress_dialog()
+            archive_path = str(payload.get("archive_path", "") or "").strip()
+            if not archive_path:
+                QMessageBox.warning(self, "下载更新", "更新包已下载，但路径无效。")
+                return
+            answer = QMessageBox.question(
+                self,
+                "下载完成",
+                "更新包已下载完成。\n点击“是”将关闭当前程序并开始应用更新。\n更新完成后会提示你重新打开主程序。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._launch_update_apply(archive_path)
+            else:
+                QMessageBox.information(self, "下载完成", f"更新包已保存在：{archive_path}")
+            return
 
     def _handle_worker_event(self, event: WorkerEvent) -> None:
         payload = event.payload if isinstance(event.payload, dict) else {}
@@ -1352,7 +1772,12 @@ class _LegacyAppConfigDialog(QDialog):
         self.match_threshold = QDoubleSpinBox()
         self.match_threshold.setRange(0.1, 1.0)
         self.match_threshold.setSingleStep(0.01)
-        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.85)))
+        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.7)))
+        self.popup_match_threshold = QDoubleSpinBox()
+        self.popup_match_threshold.setRange(0.1, 1.0)
+        self.popup_match_threshold.setSingleStep(0.01)
+        self.popup_match_threshold.setValue(float(overrides.get("popup_match_threshold", 0.8)))
+        layout.addRow("\u5f39\u7a97\u9608\u503c", self.popup_match_threshold)
         layout.addRow("模板阈值", self.match_threshold)
 
         ocr = overrides.get("ocr", {}) if isinstance(overrides.get("ocr", {}), dict) else {}
@@ -1514,6 +1939,7 @@ class _LegacyAppConfigDialog(QDialog):
             "poll_interval": self.poll_interval.value(),
             "step_timeout": self.step_timeout.value(),
             "match_threshold": self.match_threshold.value(),
+            "popup_match_threshold": self.popup_match_threshold.value(),
             "ocr": ocr,
             "ocr_modes": ocr_modes,
             "templates": {
@@ -1585,14 +2011,15 @@ class _LegacyTemplateManagerWidget(QWidget):
         list_title = QLabel("当前模板清单")
         list_title.setObjectName("SectionLabel")
         list_layout.addWidget(list_title)
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["类型", "文件", "操作"])
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["类型", "文件", "匹配范围", "操作"])
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(40)
         table_header = self.table.horizontalHeader()
         table_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         table_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         table_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         list_layout.addWidget(self.table)
         layout.addWidget(list_panel)
 
@@ -1720,6 +2147,7 @@ class PopupCropDialog(QDialog):
         self,
         image: Image.Image,
         template_label: str = "模板",
+        help_text: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -1733,8 +2161,9 @@ class PopupCropDialog(QDialog):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        help_label = QLabel(f"在截图中拖拽框选要保存的{template_label}区域。")
+        help_label = QLabel(help_text or f"在截图中拖拽框选要保存的{template_label}区域。")
         help_label.setObjectName("HelperLabel")
+        help_label.setWordWrap(True)
         root.addWidget(help_label)
 
         self.crop_label = PopupCropLabel(_pixmap_from_pil_image(self.source_image))
@@ -1772,6 +2201,224 @@ class PopupCropDialog(QDialog):
             round((bottom - top) / height, 3),
         ]
         self.cropped_image = self.source_image.crop(box)
+        self.accept()
+
+
+class PopupDualRegionLabel(QWidget):
+    def __init__(self, pixmap: QPixmap, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.origin = QPoint()
+        self.active_region = "template"
+        self.selections: dict[str, QRect] = {}
+        self.on_selection_changed: Any | None = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setMouseTracking(True)
+        self.set_pixmap(pixmap)
+
+    def set_pixmap(self, pixmap: QPixmap) -> None:
+        self.source_pixmap = pixmap
+        self.display_pixmap = pixmap.scaled(
+            760,
+            1200,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.origin = QPoint()
+        self.selections = {}
+        self.setFixedSize(self.display_pixmap.size())
+        self.update()
+
+    def set_active_region(self, key: str) -> None:
+        self.active_region = key
+        self.update()
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self.origin = self._clamp_point(event.position().toPoint())
+        self.selections[self.active_region] = QRect(self.origin, self.origin)
+        self._emit_selection_changed()
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        if not event.buttons() & Qt.MouseButton.LeftButton:
+            return
+        self.selections[self.active_region] = QRect(
+            self.origin,
+            self._clamp_point(event.position().toPoint()),
+        ).normalized()
+        self._emit_selection_changed()
+        self.update()
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self.selections[self.active_region] = QRect(
+            self.origin,
+            self._clamp_point(event.position().toPoint()),
+        ).normalized()
+        self._emit_selection_changed()
+        self.update()
+
+    def paintEvent(self, event: Any) -> None:
+        painter = QPainter(self)
+        painter.drawPixmap(0, 0, self.display_pixmap)
+        styles = {
+            "template": (QColor(249, 115, 22), QColor(249, 115, 22, 40)),
+            "match": (QColor(37, 99, 235), QColor(37, 99, 235, 36)),
+        }
+        for key in ("template", "match"):
+            rect = self.selections.get(key)
+            if rect is None or not rect.isValid() or rect.isNull():
+                continue
+            pen_color, brush_color = styles[key]
+            painter.setPen(QPen(pen_color, 3 if key == self.active_region else 2))
+            painter.setBrush(brush_color)
+            painter.drawRect(rect)
+
+    def crop_box(self, key: str) -> tuple[int, int, int, int] | None:
+        rect = self.selections.get(key, QRect()).intersected(
+            QRect(0, 0, self.display_pixmap.width(), self.display_pixmap.height())
+        )
+        if rect.width() < 4 or rect.height() < 4:
+            return None
+        scale_x = self.source_pixmap.width() / self.display_pixmap.width()
+        scale_y = self.source_pixmap.height() / self.display_pixmap.height()
+        left = int(rect.left() * scale_x)
+        top = int(rect.top() * scale_y)
+        right = int((rect.left() + rect.width()) * scale_x)
+        bottom = int((rect.top() + rect.height()) * scale_y)
+        return left, top, right, bottom
+
+    def normalized_region(self, key: str) -> list[float] | None:
+        box = self.crop_box(key)
+        if box is None:
+            return None
+        width = max(1, self.source_pixmap.width())
+        height = max(1, self.source_pixmap.height())
+        left, top, right, bottom = box
+        return [
+            round(left / width, 3),
+            round(top / height, 3),
+            round((right - left) / width, 3),
+            round((bottom - top) / height, 3),
+        ]
+
+    def _emit_selection_changed(self) -> None:
+        if callable(self.on_selection_changed):
+            self.on_selection_changed()
+
+    def _clamp_point(self, point: QPoint) -> QPoint:
+        return QPoint(
+            max(0, min(point.x(), self.display_pixmap.width())),
+            max(0, min(point.y(), self.display_pixmap.height())),
+        )
+
+
+class PopupDualRegionDialog(QDialog):
+    def __init__(self, image: Image.Image, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.source_image = image.convert("RGB")
+        self.cropped_image: Image.Image | None = None
+        self.template_region_norm: list[float] | None = None
+        self.match_region_norm: list[float] | None = None
+        self.setWindowTitle("添加弹窗")
+        self.resize(1080, 760)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        root.addLayout(body, 1)
+
+        self.crop_label = PopupDualRegionLabel(_pixmap_from_pil_image(self.source_image))
+        self.crop_label.on_selection_changed = self._refresh_region_labels
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        scroll.setWidget(self.crop_label)
+        body.addWidget(scroll, 1)
+
+        side_panel = QFrame()
+        side_panel.setObjectName("InsetPanel")
+        side = QVBoxLayout(side_panel)
+        side.setContentsMargins(14, 12, 14, 12)
+        side.setSpacing(10)
+        title = QLabel("弹窗位置")
+        title.setObjectName("SectionLabel")
+        side.addWidget(title)
+        help_label = QLabel("在左侧同一张截图上分别画两个框：当前图片位置用于裁剪保存弹窗模板；匹配范围用于运行时限定这张弹窗的查找区域。")
+        help_label.setObjectName("HelperLabel")
+        help_label.setWordWrap(True)
+        side.addWidget(help_label)
+
+        self.template_button = QPushButton("设置当前图片位置")
+        self.template_button.setObjectName("PrimaryButton")
+        self.template_button.clicked.connect(lambda: self._set_active_region("template"))
+        side.addWidget(self.template_button)
+        self.template_region_label = QLabel("当前图片位置：未设置")
+        self.template_region_label.setWordWrap(True)
+        side.addWidget(self.template_region_label)
+
+        self.match_button = QPushButton("设置匹配范围")
+        self.match_button.clicked.connect(lambda: self._set_active_region("match"))
+        side.addWidget(self.match_button)
+        self.match_region_label = QLabel("匹配范围：未设置")
+        self.match_region_label.setWordWrap(True)
+        side.addWidget(self.match_region_label)
+        side.addStretch(1)
+        body.addWidget(side_panel)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        if ok_button:
+            ok_button.setText("保存")
+            ok_button.setObjectName("PrimaryButton")
+        if cancel_button:
+            cancel_button.setText("取消")
+        buttons.accepted.connect(self._accept_regions)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self._set_active_region("template")
+        self._refresh_region_labels()
+
+    def _set_active_region(self, key: str) -> None:
+        self.crop_label.set_active_region(key)
+        self.template_button.setObjectName("PrimaryButton" if key == "template" else "")
+        self.match_button.setObjectName("PrimaryButton" if key == "match" else "")
+        self.template_button.style().unpolish(self.template_button)
+        self.template_button.style().polish(self.template_button)
+        self.match_button.style().unpolish(self.match_button)
+        self.match_button.style().polish(self.match_button)
+
+    def _refresh_region_labels(self) -> None:
+        template_region = self.crop_label.normalized_region("template")
+        match_region = self.crop_label.normalized_region("match")
+        self.template_region_label.setText(f"当前图片位置：{self._region_text(template_region)}")
+        self.match_region_label.setText(f"匹配范围：{self._region_text(match_region)}")
+
+    @staticmethod
+    def _region_text(region: list[float] | None) -> str:
+        if region is None:
+            return "未设置"
+        return ", ".join(f"{float(value):.3f}" for value in region)
+
+    def _accept_regions(self) -> None:
+        template_box = self.crop_label.crop_box("template")
+        match_region = self.crop_label.normalized_region("match")
+        if template_box is None:
+            QMessageBox.warning(self, "未选择当前图片位置", "请先框选当前弹窗图片位置")
+            return
+        if match_region is None:
+            QMessageBox.warning(self, "未选择匹配范围", "请先框选这张弹窗的匹配范围")
+            return
+        self.cropped_image = self.source_image.crop(template_box)
+        self.template_region_norm = self.crop_label.normalized_region("template")
+        self.match_region_norm = match_region
         self.accept()
 
 
@@ -1862,14 +2509,15 @@ class TemplateManagerWidget(QWidget):
         list_title = QLabel("当前纠错模板")
         list_title.setObjectName("SectionLabel")
         list_layout.addWidget(list_title)
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["类型", "文件", "操作"])
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["类型", "文件", "匹配范围", "操作"])
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(40)
         table_header = self.table.horizontalHeader()
         table_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         table_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         table_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         list_layout.addWidget(self.table)
         layout.addWidget(list_panel)
         self.reload()
@@ -1901,9 +2549,10 @@ class TemplateManagerWidget(QWidget):
         for row, (kind, path) in enumerate(unique_files):
             self.table.setItem(row, 0, QTableWidgetItem(kind))
             self.table.setItem(row, 1, QTableWidgetItem(path.name))
+            self.table.setItem(row, 2, QTableWidgetItem(self._template_region_text(path)))
             delete_button = QPushButton("删除")
             delete_button.clicked.connect(lambda checked=False, p=path: self._delete_template(p))
-            self.table.setCellWidget(row, 2, delete_button)
+            self.table.setCellWidget(row, 3, delete_button)
 
     def _capture_popup_template(self) -> None:
         self._capture_template(CUSTOM_POPUP, "弹窗模板")
@@ -1914,15 +2563,22 @@ class TemplateManagerWidget(QWidget):
     def _capture_template(self, target_key: str, label: str) -> None:
         try:
             robot = RobotInterface(self.device_ip)
-            image_bytes = robot.get_transform_image(pre_move=True)
+            image_bytes = capture_transform_image(robot, pre_move=True, label="template_capture")
             image = ensure_portrait_image(image_bytes)
         except Exception as exc:
             QMessageBox.critical(self, "截图失败", f"无法从机械臂获取截图：{exc}")
             return
 
-        dialog = PopupCropDialog(image, label, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.cropped_image is None:
-            return
+        if target_key == CUSTOM_POPUP:
+            dialog = PopupDualRegionDialog(image, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted or dialog.cropped_image is None:
+                return
+            match_region = dialog.match_region_norm
+        else:
+            dialog = PopupCropDialog(image, label, parent=self)
+            if dialog.exec() != QDialog.DialogCode.Accepted or dialog.cropped_image is None:
+                return
+            match_region = None
 
         target = import_target_path(target_key, self.buttons_dir, self.screens_dir)
         try:
@@ -1930,14 +2586,17 @@ class TemplateManagerWidget(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "保存失败", f"无法保存{label}：{exc}")
             return
-        self._update_template_match_region(target_key, dialog.crop_region_norm)
+        if target_key == CUSTOM_POPUP:
+            self._update_template_match_region(target_key, match_region, target)
         self.reload()
         QMessageBox.information(self, "已保存", f"{label}已保存：{target.name}")
 
-    def _update_template_match_region(self, target_key: str, region: list[float] | None) -> None:
-        if target_key == CUSTOM_POPUP or region is None:
+    def _update_template_match_region(self, target_key: str, region: list[float] | None, target: Path | None = None) -> None:
+        if region is None:
             return
-        region_key = BACK_BUTTON if target_key == CUSTOM_BACK_BUTTON else target_key
+        if target_key != CUSTOM_POPUP or target is None:
+            return
+        region_key = popup_template_region_key(target)
         if not isinstance(self.overrides, dict):
             return
         regions = self.overrides.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY, {})
@@ -1946,7 +2605,25 @@ class TemplateManagerWidget(QWidget):
         regions[region_key] = region
         self.overrides[TEMPLATE_MATCH_REGIONS_CONFIG_KEY] = regions
 
+    def _template_region_text(self, path: Path) -> str:
+        if not is_popup_template_name(path.name) or not isinstance(self.overrides, dict):
+            return "-"
+        regions = self.overrides.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY, {})
+        if not isinstance(regions, dict):
+            return "未设置"
+        region = regions.get(popup_template_region_key(path))
+        if not isinstance(region, (list, tuple)) or len(region) != 4:
+            return "未设置"
+        try:
+            return ", ".join(f"{float(value):.3f}" for value in region)
+        except (TypeError, ValueError):
+            return "未设置"
+
     def _delete_template(self, path: Path) -> None:
+        if is_popup_template_name(path.name) and isinstance(self.overrides, dict):
+            regions = self.overrides.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY, {})
+            if isinstance(regions, dict):
+                regions.pop(popup_template_region_key(path), None)
         path.unlink(missing_ok=True)
         self.reload()
 
@@ -2299,7 +2976,12 @@ class AppConfigDialog(QDialog):
         self.match_threshold = NoWheelDoubleSpinBox()
         self.match_threshold.setRange(0.1, 1.0)
         self.match_threshold.setSingleStep(0.01)
-        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.85)))
+        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.7)))
+        self.popup_match_threshold = NoWheelDoubleSpinBox()
+        self.popup_match_threshold.setRange(0.1, 1.0)
+        self.popup_match_threshold.setSingleStep(0.01)
+        self.popup_match_threshold.setValue(float(overrides.get("popup_match_threshold", 0.8)))
+        form.addRow("\u5f39\u7a97\u9608\u503c", self.popup_match_threshold)
         form.addRow("模板阈值", self.match_threshold)
 
         ocr = overrides.get("ocr", {}) if isinstance(overrides.get("ocr", {}), dict) else {}
@@ -2564,6 +3246,7 @@ class AppConfigDialog(QDialog):
             "keep_awake_interval_seconds": self.keep_awake_interval_seconds.value(),
             "exclude_ocr_wait_from_step_timeout": self.exclude_ocr_wait_from_step_timeout.isChecked(),
             "match_threshold": self.match_threshold.value(),
+            "popup_match_threshold": self.popup_match_threshold.value(),
             "ocr": ocr,
             "ocr_modes": ocr_modes,
             "templates": {
@@ -2888,7 +3571,12 @@ class DeviceSettingsDialogInteractive(QDialog):
         original_text = self.refresh_screenshot_button.text()
         self.refresh_screenshot_button.setText("刷新中...")
         try:
-            image_bytes = RobotInterface(self.device_ip).get_transform_image(pre_move=True)
+            image_bytes = capture_transform_image(
+                RobotInterface(self.device_ip),
+                {"_runtime": {"device_ip": self.device_ip, "app_name": self.app_name}},
+                pre_move=True,
+                label="device_settings",
+            )
             image = ensure_portrait_image(image_bytes)
             self._set_screenshot(image)
         except Exception as exc:

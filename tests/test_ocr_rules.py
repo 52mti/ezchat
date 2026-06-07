@@ -268,6 +268,10 @@ def test_dialogue_result_returns_excluded_reasons():
         for item in excluded
     )
     assert any(item["reason"] == "after_line_and_below_cutoff" and item["text"] == "after_cutoff" for item in excluded)
+    stats = result["debug"]["stats"]
+    assert stats["filter_reasons"]["ocr_keyword"] == 1
+    assert stats["filter_reasons"]["line_excluded_keyword"] == 1
+    assert stats["filtered_total"] >= 2
 
 
 def test_dialogue_rules_filter_time_and_merge_sender_lines():

@@ -349,6 +349,12 @@ def build_dialogue_result(
     line_excluded = _keywords(rules["line_excluded_keywords"])
     line_and_below = _keywords(rules["line_and_below_keywords"])
     excluded_entries: list[dict[str, Any]] = []
+    filter_reason_counts: dict[str, int] = {}
+    sender_stats = {
+        "color_unclear": 0,
+        "position_fallback": 0,
+        "color_unclear_position_fallback": 0,
+    }
     user_name_top_ratio = float(rules.get("user_name_top_ratio", 0.12))
     user_name_center_x_min_ratio = float(rules.get("user_name_center_x_min_ratio", 0.0))
     user_name_center_x_max_ratio = float(rules.get("user_name_center_x_max_ratio", 1.0))
@@ -409,13 +415,18 @@ def build_dialogue_result(
             return "non_cjk"
         return None
 
+    def count_filter_reason(reason: str) -> None:
+        filter_reason_counts[reason] = filter_reason_counts.get(reason, 0) + 1
+
     def sender_for(item: dict[str, Any]) -> str:
         method = str(sender_detection["method"])
         sender2_min_x_ratio = float(sender_detection["sender2_min_x_ratio"])
         center_position_sender = "sender2" if item["center_x"] > image_width * sender2_min_x_ratio else "sender1"
         if method == "position":
+            sender_stats["position_fallback"] += 1
             return "sender2" if item["min_x"] > image_width * sender2_min_x_ratio else "sender1"
         if method == "center_position":
+            sender_stats["position_fallback"] += 1
             return center_position_sender
         if method == "bubble_color":
             hue = item.get("background_hue")
@@ -445,12 +456,19 @@ def build_dialogue_result(
                     and blue_red_ratio >= blue_red_ratio_min
                 )
                 return "sender2" if is_sender2_hue or is_sender2_blue else "sender1"
+            sender_stats["color_unclear"] += 1
+            sender_stats["position_fallback"] += 1
+            sender_stats["color_unclear_position_fallback"] += 1
+            item["debug_sender_fallback"] = "color_unclear_position"
             return center_position_sender
         saturation_threshold = float(sender_detection["color_saturation_threshold"])
         if method == "color" and item.get("background_saturation", 0.0) >= saturation_threshold:
             return "sender2"
         if bool(sender_detection["enable_color_fallback"]) and item.get("background_saturation", 0.0) >= saturation_threshold:
             return "sender2"
+        if method in {"color", "bubble_color"}:
+            sender_stats["color_unclear"] += 1
+        sender_stats["position_fallback"] += 1
         if item["min_x"] > image_width * sender2_min_x_ratio:
             return "sender2"
         return "sender1"
@@ -459,6 +477,7 @@ def build_dialogue_result(
     for item in rule_items:
         reason = invalid_reason(item)
         if reason:
+            count_filter_reason(reason)
             item["debug_stage"] = "filtered_before_merge"
             item["debug_reason"] = reason
             matched_keyword = find_keyword(item["text"], result_excluded) if reason == "ocr_keyword" else None
@@ -561,6 +580,7 @@ def build_dialogue_result(
             dialogues.append({"sender": item["sender"], "content": content})
             continue
         if content:
+            count_filter_reason("line_excluded_keyword")
             excluded_entries.append(
                 _debug_excluded_entry(
                     entry_type="dialogue",
@@ -586,10 +606,18 @@ def build_dialogue_result(
         for item in rule_items
         if is_user_name_candidate(item)
     ]
+    debug_payload: dict[str, Any] = {"excluded": excluded_entries}
+    if bool(rules.get("enable_debug_stats", True)):
+        debug_payload["stats"] = {
+            "filtered_total": sum(filter_reason_counts.values()),
+            "filter_reasons": dict(sorted(filter_reason_counts.items())),
+            "sender_detection": sender_stats,
+        }
+
     return {
         "user_name": name_candidates[0] if name_candidates else "",
         "dialogues": dialogues,
-        "debug": {"excluded": excluded_entries},
+        "debug": debug_payload,
     }
 
 
@@ -713,7 +741,12 @@ def _build_bottom_nav_result(
     ]
 
 
-def _strip_unread_prefix(text: str) -> tuple[int | None, str]:
+def _strip_unread_prefix(
+    text: str,
+    *,
+    enable_inline_prefix: bool = True,
+    inline_follow_pattern: str = r"[\u4e00-\u9fffA-Za-z]",
+) -> tuple[int | None, str]:
     cleaned = normalize_ocr_text(text)
     if cleaned.startswith("["):
         close_index = cleaned.find("]")
@@ -728,7 +761,12 @@ def _strip_unread_prefix(text: str) -> tuple[int | None, str]:
     compact = compact.translate(str.maketrans({"?": "+", "?": "+", "?": ".", "?": ".", "?": "F", "?": "f"}))
     if re.fullmatch(r"99(?:[+Ff.])?", compact):
         return 99, ""
-    match = re.match(r"^([1-9]\d?)(?=[\u4e00-\u9fffA-Za-z])", compact)
+    if not enable_inline_prefix:
+        return None, cleaned
+    try:
+        match = re.match(rf"^([1-9]\d?)(?={inline_follow_pattern})", compact)
+    except re.error:
+        match = re.match(r"^([1-9]\d?)(?=[\u4e00-\u9fffA-Za-z])", compact)
     if not match:
         return None, cleaned
     unread_count = int(match.group(1))
@@ -736,8 +774,17 @@ def _strip_unread_prefix(text: str) -> tuple[int | None, str]:
         return None, cleaned
     return unread_count, compact[len(match.group(1)) :]
 
-def _extract_list_name(text: str) -> str:
-    _unread, cleaned = _strip_unread_prefix(text)
+def _extract_list_name(
+    text: str,
+    *,
+    enable_unread_prefix: bool = True,
+    unread_prefix_follow_pattern: str = r"[\u4e00-\u9fffA-Za-z]",
+) -> str:
+    _unread, cleaned = _strip_unread_prefix(
+        text,
+        enable_inline_prefix=enable_unread_prefix,
+        inline_follow_pattern=unread_prefix_follow_pattern,
+    )
     cleaned = cleaned.strip("[](){} ")
     cleaned = re.sub(r"\d{1,2}[:.]\d{2}$", "", cleaned).strip(" :|-_")
     leading_cjk = re.match(r"^[\u4e00-\u9fff]{1,12}", cleaned)
@@ -758,8 +805,18 @@ def _strip_list_name_suffixes(name: str, rules: dict[str, Any]) -> str:
     return name
 
 
-def _clean_list_content(text: str, name: str) -> str:
-    _unread, cleaned = _strip_unread_prefix(text)
+def _clean_list_content(
+    text: str,
+    name: str,
+    *,
+    enable_unread_prefix: bool = True,
+    unread_prefix_follow_pattern: str = r"[\u4e00-\u9fffA-Za-z]",
+) -> str:
+    _unread, cleaned = _strip_unread_prefix(
+        text,
+        enable_inline_prefix=enable_unread_prefix,
+        inline_follow_pattern=unread_prefix_follow_pattern,
+    )
     cleaned = normalize_ocr_text(cleaned).strip("[](){} ")
     if name and cleaned.startswith(name):
         cleaned = cleaned[len(name) :].lstrip(" :|-_")
@@ -1184,6 +1241,8 @@ def build_list_result(
     content_excluded_keywords = _keywords(rules["content_excluded_keywords"])
     unread_count_excluded_keywords = _keywords(rules.get("unread_count_excluded_keywords", ()))
     content_force_unread_keywords = _keywords(rules.get("content_force_unread_keywords", ()))
+    enable_unread_prefix = bool(rules.get("enable_unread_prefix", True))
+    unread_prefix_follow_pattern = str(rules.get("unread_prefix_follow_pattern", r"[\u4e00-\u9fffA-Za-z]") or r"[\u4e00-\u9fffA-Za-z]")
     bottom_nav_keywords = _keywords(rules["bottom_nav_keywords"])
     max_unread_count = int(rules["max_unread_count"])
     right_meta_min = image_width * float(rules["right_meta_min_ratio"])
@@ -1357,8 +1416,19 @@ def build_list_result(
                 )
             )
             continue
-        unread_count, header_text = _strip_unread_prefix(header_line["left_text"])
-        name = _strip_list_name_suffixes(_extract_list_name(header_text), rules)
+        unread_count, header_text = _strip_unread_prefix(
+            header_line["left_text"],
+            enable_inline_prefix=enable_unread_prefix,
+            inline_follow_pattern=unread_prefix_follow_pattern,
+        )
+        name = _strip_list_name_suffixes(
+            _extract_list_name(
+                header_text,
+                enable_unread_prefix=enable_unread_prefix,
+                unread_prefix_follow_pattern=unread_prefix_follow_pattern,
+            ),
+            rules,
+        )
         matched_name_excluded = find_keyword(name, excluded_keywords) if name else None
         if not name or matched_name_excluded:
             excluded_entries.append(
@@ -1381,7 +1451,12 @@ def build_list_result(
             )
             continue
         content_parts = [
-            _clean_list_content(line["left_text"], name)
+            _clean_list_content(
+                line["left_text"],
+                name,
+                enable_unread_prefix=enable_unread_prefix,
+                unread_prefix_follow_pattern=unread_prefix_follow_pattern,
+            )
             for line in row["content_lines"]
             if line["left_text"] and not looks_like_time_text(line["left_text"])
         ]

@@ -342,6 +342,7 @@ def test_xinyu_dialogue_bubble_color_method_keeps_white_blue_bubble_as_sender1()
     )
 
     assert result["dialogues"] == [{"sender": "sender1", "content": "浅色气泡"}]
+    assert "stats" not in result["debug"]
 
 
 def test_xinyu_dialogue_bubble_color_method_does_not_treat_dark_blue_header_as_sender2():

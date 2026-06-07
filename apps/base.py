@@ -153,14 +153,43 @@ class BaseApp:
             self.status.is_circuit_open = True
 
     def _try_recover(self) -> None:
+        self.emit_runtime_log(
+            "info",
+            "准备执行设备复位",
+            {
+                "step": self.status.current_step,
+                "label": self.status.current_step_label,
+                "last_error": self.status.last_error,
+            },
+        )
         try:
             self.recover()
             self.recover_error_count = 0
+            self.emit_runtime_log(
+                "info",
+                "设备复位完成",
+                {
+                    "step": self.status.current_step,
+                    "label": self.status.current_step_label,
+                    "will_circuit_open": self.status.error_count >= self.circuit_breaker_threshold,
+                },
+            )
         except Exception as recover_exc:
             self.recover_error_count += 1
             self.status.last_error = f"{self.status.last_error}；设备复位失败：{recover_exc}"
             if self.recover_error_count >= self.recover_failure_limit:
                 self.status.is_circuit_open = True
+            self.emit_runtime_log(
+                "warning",
+                "设备复位失败",
+                {
+                    "step": self.status.current_step,
+                    "label": self.status.current_step_label,
+                    "error": str(recover_exc),
+                    "recover_error_count": self.recover_error_count,
+                    "is_circuit_open": self.status.is_circuit_open,
+                },
+            )
 
     def _save_error_capture(self) -> None:
         from apps.photo_capture import capture_transform_image

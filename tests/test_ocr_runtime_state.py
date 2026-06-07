@@ -151,6 +151,8 @@ def test_subprocess_runtime_start_uses_backend_env_and_cache_home(tmp_path, monk
     assert captured["command"][0] == str(runtime_python)
     assert env["PADDLE_PDX_CACHE_HOME"] == str(cache_home)
     assert env["PADDLEX_HOME"] == str(cache_home)
+    assert env["FLAGS_allocator_strategy"] == "auto_growth"
+    assert env["FLAGS_fraction_of_gpu_memory_to_use"] == "0.6"
     assert env["PYTHONNOUSERSITE"] == "1"
     assert str(runtime_python.parent) in env["PATH"]
     assert str(scripts_dir) in env["PATH"]

@@ -19,6 +19,7 @@ from .visual_assets import (
     SEND_BUTTON,
     VOICE_INPUT_BUTTON,
     back_button_template_paths,
+    popup_template_region_key,
     popup_template_paths,
     region_rule,
     match_template_with_region,
@@ -38,7 +39,14 @@ def _report(reporter: Reporter | None, step: str, label: str, log_label: str | N
 
 
 def _threshold(config: dict[str, Any]) -> float:
-    return float(config.get("match_threshold", 0.85))
+    return float(config.get("match_threshold", 0.7))
+
+
+def _popup_threshold(config: dict[str, Any], key: str | None = None) -> float:
+    thresholds = config.get("template_match_thresholds")
+    if key and isinstance(thresholds, dict) and key in thresholds:
+        return float(thresholds[key])
+    return float(config.get("popup_match_threshold", 0.8))
 
 
 def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = None) -> dict[str, Any]:
@@ -47,7 +55,14 @@ def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = N
 
 
 def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> dict[str, float] | None:
-    result = match(image, popup_template, threshold=_threshold(config))
+    result = match_template_with_region(
+        image,
+        popup_template,
+        config,
+        popup_template_region_key(popup_template),
+        threshold=_popup_threshold(config, popup_template_region_key(popup_template)),
+        match_func=match,
+    )
     if not result:
         return None
     max_x = float(config.get("popup_max_x", POPUP_MAX_X) or POPUP_MAX_X)

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from apps import visual_assets
+from apps import visual_assets, visual_steps
 from apps.huanyou import app as huanyou_app
 from apps.huanyou import steps as huanyou_steps
 from apps.wechat import app as wechat_app
@@ -321,6 +321,26 @@ def test_popup_match_uses_template_specific_region(monkeypatch, tmp_path):
 
     assert seen_sizes == [(50, 200)]
     assert result == {"x": 0.55, "y": 0.2, "w": 0.2, "h": 0.3, "score": 0.99}
+
+
+@pytest.mark.parametrize("steps_module", [visual_steps, wechat_steps, huanyou_steps, xinyu_steps])
+def test_popup_match_defaults_to_popup_threshold(monkeypatch, tmp_path, steps_module):
+    popup_template = tmp_path / "popup_custom_1.jpg"
+    popup_template.write_bytes(b"template")
+    seen_thresholds: list[float] = []
+
+    def fake_match(image, template, threshold=0.85):
+        seen_thresholds.append(threshold)
+        return {"x": 0.1, "y": 0.2, "w": 0.4, "h": 0.3, "score": 0.99}
+
+    monkeypatch.setattr(steps_module, "match", fake_match)
+    image = Image.new("RGB", (100, 200), "white")
+    config = {"match_threshold": 0.95}
+
+    result = steps_module._popup_match(image, popup_template, config)
+
+    assert result is not None
+    assert seen_thresholds == [0.8]
 
 
 def test_popup_match_drops_results_beyond_right_edge(monkeypatch, tmp_path):

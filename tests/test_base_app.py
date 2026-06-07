@@ -78,6 +78,25 @@ def test_base_app_opens_circuit_after_recover_limit():
     assert "设备复位失败" in app.get_status()["last_error"]
 
 
+def test_base_app_recover_logs_include_current_step():
+    logs = []
+    app = FailingRecoverApp(
+        robot=object(),
+        config={"circuit_breaker_threshold": 99, "recover_failure_limit": 1},
+    )
+    app.set_log_callback(lambda level, message, payload=None: logs.append((level, message, payload)))
+    app.set_runtime_step("input_box_click", "点击输入框")
+
+    app.on_error(RuntimeError("input failed"))
+
+    assert ("info", "准备执行设备复位") in [(level, message) for level, message, _payload in logs]
+    failure = [entry for entry in logs if entry[1] == "设备复位失败"][-1]
+    assert failure[0] == "warning"
+    assert failure[2]["step"] == "input_box_click"
+    assert failure[2]["label"] == "点击输入框"
+    assert failure[2]["is_circuit_open"] is True
+
+
 def test_base_app_error_capture_is_saved_under_photo(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     robot = CaptureRobot()

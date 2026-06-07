@@ -174,7 +174,6 @@ def test_worker_stops_on_startup_when_back_button_template_missing(tmp_path, mon
         {"ip": "192.168.1.108", "selected_app": "dummy"},
         app_config={
             "poll_interval": 1,
-            "robot_monitor": {"enabled": False},
             "templates": {"buttons": str(buttons_dir), "screens": str(screens_dir)},
         },
         events=events,
@@ -205,7 +204,6 @@ def test_worker_startup_back_button_check_accepts_app_template(tmp_path, monkeyp
         {"ip": "192.168.1.108", "selected_app": "dummy"},
         app_config={
             "poll_interval": 1,
-            "robot_monitor": {"enabled": False},
             "templates": {"buttons": str(buttons_dir), "screens": str(screens_dir)},
         },
         events=queue.Queue(),
@@ -223,14 +221,14 @@ def test_worker_exception_is_isolated_to_that_device(tmp_path, monkeypatch):
     manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
     bad_worker = DeviceWorker(
         {"ip": "192.168.1.108", "selected_app": "bad"},
-        app_config={"poll_interval": 0.01, "robot_monitor": {"enabled": False}},
+        app_config={"poll_interval": 0.01},
         events=events,
         config_manager=manager,
         robot=object(),
     )
     good_worker = DeviceWorker(
         {"ip": "192.168.1.109", "selected_app": "good"},
-        app_config={"poll_interval": 0.01, "robot_monitor": {"enabled": False}},
+        app_config={"poll_interval": 0.01},
         events=events,
         config_manager=manager,
         robot=object(),

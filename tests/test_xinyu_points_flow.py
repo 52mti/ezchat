@@ -30,15 +30,17 @@ def _config(tmp_path: Path) -> dict[str, object]:
     screens_dir = tmp_path / "screens"
     for path in [
         buttons_dir / "btn_返回按钮.jpg",
-        buttons_dir / "btn_我的按钮.jpg",
-        buttons_dir / "btn_消息按钮.jpg",
         screens_dir / "screen_聊天列表.jpg",
         screens_dir / "screen_聊天界面.jpg",
         screens_dir / "screen_我的界面.jpg",
         screens_dir / "screen_黑屏异常.jpg",
     ]:
         _touch(path)
-    return {"templates": {"buttons": str(buttons_dir), "screens": str(screens_dir)}, "step_timeout": 0.2}
+    return {
+        "templates": {"buttons": str(buttons_dir), "screens": str(screens_dir)},
+        "step_timeout": 0.2,
+        "template_match_regions": None,
+    }
 
 
 def test_xinyu_read_my_points_clicks_my_reads_points_and_returns_message(monkeypatch, tmp_path):
@@ -50,16 +52,22 @@ def test_xinyu_read_my_points_clicks_my_reads_points_and_returns_message(monkeyp
         name = Path(template).name
         if image == "list" and name == "screen_聊天列表.jpg":
             return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
-        if image == "list" and name == "btn_我的按钮.jpg":
-            return {"x": 0.78, "y": 0.86, "w": 0.12, "h": 0.08, "score": 0.99}
         if image == "my" and name == "screen_我的界面.jpg":
             return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
-        if image == "my" and name == "btn_消息按钮.jpg":
-            return {"x": 0.56, "y": 0.86, "w": 0.12, "h": 0.08, "score": 0.99}
         return None
 
     def fake_ocr(image, cfg, mode, region=None):
         seen_modes.append(mode)
+        if mode == "list":
+            return {
+                "result": {
+                    "bottom_nav": [
+                        {"name": "消息", "bounds": [0.56, 0.86, 0.68, 0.94]},
+                        {"name": "我的", "bounds": [0.78, 0.86, 0.90, 0.94]},
+                    ]
+                },
+                "ocr_items": [],
+            }
         return {"result": {"points": "1288", "balance": "1288"}, "ocr_items": []}
 
     monkeypatch.setattr(steps, "match", fake_match)
@@ -67,8 +75,88 @@ def test_xinyu_read_my_points_clicks_my_reads_points_and_returns_message(monkeyp
     monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
 
     assert steps.read_my_points(robot, config) == "1288"
-    assert seen_modes == ["points"]
+    assert seen_modes == ["list", "points"]
     assert robot.clicks == [pytest.approx((0.84, 0.9)), pytest.approx((0.62, 0.9))]
+
+
+def test_xinyu_read_my_points_reuses_cached_my_coordinate(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    config["_runtime_cache"] = {"screen_anchors": {"bottom_my": (0.91, 0.93), "bottom_message": (0.62, 0.9)}}
+    robot = FakeRobot(["list", "list", "my", "list"])
+
+    def fake_match(image, template, threshold=0.85):
+        name = Path(template).name
+        if image == "list" and name == "screen_聊天列表.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        if image == "my" and name == "screen_我的界面.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+    monkeypatch.setattr(steps, "run_ocr_mode", lambda image, cfg, mode, region=None: {"result": {"points": "100"}, "ocr_items": []})
+    monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
+
+    assert steps.read_my_points(robot, config) == "100"
+    assert config["_runtime_cache"]["screen_anchors"]["bottom_my"] == (0.91, 0.93)
+    assert robot.clicks[0] == pytest.approx((0.91, 0.93))
+
+
+def test_xinyu_read_my_points_skips_when_bottom_nav_has_no_my(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list", "list"])
+    reports: list[tuple[str, str, str | None]] = []
+
+    def fake_match(image, template, threshold=0.85):
+        if image == "list" and Path(template).name == "screen_聊天列表.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "result": {"bottom_nav": [{"name": "消息", "bounds": [0.56, 0.86, 0.68, 0.94]}]},
+            "ocr_items": [],
+        },
+    )
+
+    assert steps.read_my_points(
+        robot,
+        config,
+        reporter=lambda step, label, log_label=None: reports.append((step, label, log_label)),
+    ) is None
+    assert robot.clicks == []
+    assert any(label == "底部导航未识别到我的，跳过积分读取" for _step, label, _log_label in reports)
+
+
+def test_xinyu_read_my_points_skips_when_bottom_nav_has_no_message(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list", "list"])
+    reports: list[tuple[str, str, str | None]] = []
+
+    def fake_match(image, template, threshold=0.85):
+        if image == "list" and Path(template).name == "screen_聊天列表.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        return None
+
+    monkeypatch.setattr(steps, "match", fake_match)
+    monkeypatch.setattr(
+        steps,
+        "run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "result": {"bottom_nav": [{"name": "我的", "bounds": [0.78, 0.86, 0.90, 0.94]}]},
+            "ocr_items": [],
+        },
+    )
+
+    assert steps.read_my_points(
+        robot,
+        config,
+        reporter=lambda step, label, log_label=None: reports.append((step, label, log_label)),
+    ) is None
+    assert robot.clicks == []
+    assert any(label == "底部导航未识别到消息，跳过积分读取" for _step, label, _log_label in reports)
 
 
 def test_xinyu_app_reads_points_once_per_idle_wait_and_reports_balance(monkeypatch, tmp_path):
@@ -99,6 +187,7 @@ def test_xinyu_app_reads_points_once_per_idle_wait_and_reports_balance(monkeypat
 
     assert calls == ["keep_awake", "points"]
     assert ("xinyu_balance", {"balance": "128", "points": "1288"}) in logs
+    assert ("心遇本轮空闲已读取余额，跳过重复读取", {}) in logs
 
 
 def test_xinyu_balance_display_truncates_decimals_after_dividing_by_ten():
@@ -124,7 +213,7 @@ def test_xinyu_app_reads_points_again_after_real_message_resets_idle_wait(monkey
     monkeypatch.setattr(xinyu_app.steps, "focus_input_box", lambda robot, config, reporter=None: None)
     monkeypatch.setattr(xinyu_app.steps, "play_voice_reply", lambda robot, text, config, reporter=None: None)
     monkeypatch.setattr(xinyu_app.steps, "send_reply", lambda robot, config, reporter=None: 1)
-    monkeypatch.setattr(xinyu_app.steps, "go_back", lambda robot, config, reporter=None: None)
+    monkeypatch.setattr(xinyu_app.steps, "go_back", lambda robot, config, reporter=None, double_click_on_first_attempt=False: 0)
 
     app = xinyu_app.XinyuApp(robot, config, reply_provider=lambda message: "AI")
     app.run_once()

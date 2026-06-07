@@ -86,5 +86,8 @@
         }
       }
     }
-  }
+  },
+  "appVersion": "app-e02101e3e6a4eadf",
+  "runtimeVersion": "2026.06.02-full-package",
+  "modelVersion": "2026.06.02-full-package-lite"
 }

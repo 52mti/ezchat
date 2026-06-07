@@ -52,6 +52,12 @@ class HuanyouApp(BaseApp):
     def _mark_activity(self) -> None:
         self.last_activity_at = time.monotonic()
 
+    def _mark_recovered_progress(self) -> None:
+        self.status.last_error = ""
+        self.status.error_count = 0
+        self.status.is_circuit_open = False
+        self.recover_error_count = 0
+
     def _ensure_startup_back_button(self, reporter: Callable[..., None]) -> bool:
         if self._startup_back_button_checked:
             return True
@@ -255,6 +261,15 @@ class HuanyouApp(BaseApp):
         self._input_box_opened = True
         send_clicks = steps.send_reply(self.robot, self.config, reporter=reporter)
         self.emit_runtime_log("info", "huanyou_send_clicks", {"clicks": send_clicks})
+        contact = message.get("contact", "")
+        send_count = steps.record_contact_send(self.config, contact)
+        if send_count:
+            self.emit_runtime_log(
+                "info",
+                "huanyou_contact_send_count",
+                {"contact": contact, "count": send_count},
+            )
+        self._mark_recovered_progress()
         self._mark_activity()
         if self.sent_callback:
             reporter("mark_sent", "记录发送结果")
@@ -284,13 +299,59 @@ class HuanyouApp(BaseApp):
         )
         return chat_image, next_name, next_clicks, next_name_point
 
+    def _try_recover_to_list_after_step_unavailable(
+        self,
+        exc: steps.StepUnavailable,
+        step_detail: str,
+    ) -> bool:
+        try:
+            image = steps.ensure_list_screen(self.robot, self.config, reporter=self._reporter)
+        except Exception as recover_exc:
+            self.emit_runtime_log(
+                "warning",
+                "欢友兜底恢复失败",
+                {
+                    "detail": step_detail,
+                    "error": str(exc),
+                    "recover_error": str(recover_exc),
+                },
+            )
+            return False
+        if image is None:
+            self.emit_runtime_log(
+                "warning",
+                "欢友兜底恢复失败",
+                {
+                    "detail": step_detail,
+                    "error": str(exc),
+                    "recover_error": "未能恢复到聊天列表",
+                },
+            )
+            return False
+        self.emit_runtime_log(
+            "warning",
+            "欢友步骤不可用，已恢复到聊天列表",
+            {
+                "detail": step_detail,
+                "error": str(exc),
+            },
+        )
+        self._mark_activity()
+        self._mark_recovered_progress()
+        self.set_runtime_step("step_recovered_to_list", "异常已恢复到聊天列表")
+        return True
+
     def _handle_step_unavailable(self, exc: steps.StepUnavailable) -> None:
+        step_detail = self._last_step_detail or self.status.current_step_label or self.status.current_step
+        if self._try_recover_to_list_after_step_unavailable(exc, step_detail):
+            return
+
         self.status.error_count += 1
         self.status.last_error = str(exc)
         self._save_error_capture()
         self.recover_error_count = 0
-        step_detail = self._last_step_detail or self.status.current_step_label or self.status.current_step
         message = f"欢友步骤不可用：{step_detail} -> {exc}" if step_detail else f"欢友步骤不可用：{exc}"
+        will_circuit_open = self.status.error_count >= self.circuit_breaker_threshold
         self.emit_runtime_log(
             "warning",
             message,
@@ -299,9 +360,12 @@ class HuanyouApp(BaseApp):
                 "label": self.status.current_step_label,
                 "detail": step_detail,
                 "error": str(exc),
+                "error_count": self.status.error_count,
+                "circuit_breaker_threshold": self.circuit_breaker_threshold,
+                "will_circuit_open": will_circuit_open,
             },
         )
-        if self.status.error_count >= self.circuit_breaker_threshold:
+        if will_circuit_open:
             self.status.is_circuit_open = True
 
     def run_once(self) -> None:
@@ -427,6 +491,7 @@ class HuanyouApp(BaseApp):
 
                 normalized_next = re.sub(r"\s+", "", str(next_name or "")).strip()
                 if normalized_next:
+                    self._mark_recovered_progress()
                     current_name = next_name
                 current_target = dict(current_target)
                 current_target["name"] = current_name

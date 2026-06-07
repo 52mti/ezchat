@@ -191,7 +191,7 @@
   <g>
     <rect class="node action" x="1048" y="620" width="390" height="84" rx="18"/>
     <text class="node-text" x="1243" y="648">没有新招呼：先上滑</text>
-    <text class="node-sub" x="1243" y="674">robot.swipe(0.5, 0.8 → 0.5, 0.2)</text>
+    <text class="node-sub" x="1243" y="674">robot.swipe(0.5, 0.6 → 0.5, 0.3)</text>
   </g>
   <g>
     <rect class="node ocr" x="1048" y="746" width="390" height="98" rx="18"/>

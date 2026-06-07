@@ -56,6 +56,19 @@ def test_bundled_dependency_specs_exclude_shared_runtime_packages(tmp_path):
     assert build._bundled_dependency_specs(tmp_path) == ["opencv-python", "PyQt6"]
 
 
+def test_copy_sources_does_not_package_release_manifest(tmp_path):
+    root = tmp_path / "repo"
+    package_root = tmp_path / "package"
+    root.mkdir()
+    (root / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    (root / "release.json").write_text('{"app_version": "remote"}', encoding="utf-8")
+
+    build._copy_sources(root, package_root)
+
+    assert (package_root / "main.py").is_file()
+    assert not (package_root / "release.json").exists()
+
+
 def test_copy_sources_keeps_app_config_json_but_excludes_root_config_json(tmp_path):
     root = tmp_path / "repo"
     package_root = tmp_path / "package"
@@ -220,6 +233,203 @@ def test_write_cmd_launchers_emit_ascii_crlf_scripts(tmp_path):
     assert ".runtime_env" not in launcher_text
 
 
+def test_write_package_release_metadata_updates_runtime_manifest_versions(tmp_path):
+    package_root = tmp_path / build.PACKAGE_NAME
+    package_root.mkdir()
+    (package_root / "runtime_manifest.json").write_text(
+        json.dumps({"version": "2026.06.02-full-package"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    build._write_package_release_metadata(
+        package_root,
+        app_version="app-deadbeefcafebabe",
+        runtime_version="2026.06.02-full-package",
+        model_version="2026.06.02-lite",
+    )
+
+    payload = json.loads((package_root / "runtime_manifest.json").read_text(encoding="utf-8"))
+    assert payload["appVersion"] == "app-deadbeefcafebabe"
+    assert payload["runtimeVersion"] == "2026.06.02-full-package"
+    assert payload["modelVersion"] == "2026.06.02-lite"
+
+
+def test_write_release_manifest_writes_uploadable_dist_payload(tmp_path):
+    dist_root = tmp_path / "dist"
+
+    manifest_path = build._write_release_manifest(
+        dist_root,
+        app_version="app-deadbeefcafebabe",
+        runtime_version="2026.06.02-full-package",
+        model_version="2026.06.02-lite",
+        update_file_name="jixiebijiaoben_update_20260607_0904.zip",
+    )
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert payload == {
+        "app_version": "app-deadbeefcafebabe",
+        "runtime_version": "2026.06.02-full-package",
+        "model_version": "2026.06.02-lite",
+        "requires_full_package": False,
+        "update_share_url": build.DEFAULT_UPDATE_SHARE_URL,
+        "update_file_name": "jixiebijiaoben_update_20260607_0904.zip",
+        "full_package_url": build.DEFAULT_FULL_PACKAGE_PAGE_URL,
+        "release_notes": "",
+        "release_manifest_url": build.DEFAULT_RELEASE_MANIFEST_URL,
+    }
+
+
+class _FakeCosResponse:
+    def __init__(self, status_code: int = 200) -> None:
+        self.status_code = status_code
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise build.requests.HTTPError(f"{self.status_code} error")
+
+
+class _FakeCosSession:
+    def __init__(self) -> None:
+        self.put_calls: list[dict[str, object]] = []
+        self.get_calls: list[dict[str, object]] = []
+
+    def put(self, url, data=None, headers=None, timeout=None):  # noqa: ANN001
+        self.put_calls.append({"url": url, "data": data, "headers": headers, "timeout": timeout})
+        return _FakeCosResponse(200)
+
+    def get(self, url, headers=None, timeout=None):  # noqa: ANN001
+        self.get_calls.append({"url": url, "headers": headers, "timeout": timeout})
+        return _FakeCosResponse(200)
+
+
+def test_upload_release_manifest_puts_public_json_and_verifies_readback():
+    payload = build._release_manifest_payload(
+        app_version="app-deadbeefcafebabe",
+        runtime_version="2026.06.02-full-package",
+        model_version="2026.06.02-lite",
+        update_file_name="jixiebijiaoben_update_20260607_0904.zip",
+    )
+    session = _FakeCosSession()
+
+    build._upload_release_manifest(
+        payload=payload,
+        secret_id="test-secret-id",
+        secret_key="test-secret-key",
+        session=session,
+    )
+
+    assert len(session.put_calls) == 1
+    put_call = session.put_calls[0]
+    assert put_call["url"] == build.DEFAULT_RELEASE_MANIFEST_URL
+    assert put_call["data"] == build._release_manifest_bytes(payload)
+    assert put_call["headers"]["Host"] == "jixiebi-1311918180.cos.ap-shanghai.myqcloud.com"
+    assert put_call["headers"]["Content-Type"] == "application/json; charset=utf-8"
+    assert put_call["headers"]["x-cos-acl"] == "public-read"
+    assert "Authorization" in put_call["headers"]
+    assert len(session.get_calls) == 1
+    assert session.get_calls[0]["url"] == build.DEFAULT_RELEASE_MANIFEST_URL
+
+
+def test_apply_local_env_files_loads_nested_env_dir_txt_file(tmp_path, monkeypatch):
+    env_dir = tmp_path / ".env"
+    env_dir.mkdir()
+    (env_dir / "cos.txt").write_text(
+        "\n".join(
+            [
+                "TENCENT_COS_SECRET_ID=test-secret-id",
+                "TENCENT_COS_SECRET_KEY=test-secret-key",
+                "TENCENT_COS_SESSION_TOKEN=test-session-token",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("TENCENT_COS_SECRET_ID", raising=False)
+    monkeypatch.delenv("TENCENT_COS_SECRET_KEY", raising=False)
+    monkeypatch.delenv("TENCENT_COS_SESSION_TOKEN", raising=False)
+
+    build._apply_local_env_files(tmp_path)
+
+    assert build.os.environ["TENCENT_COS_SECRET_ID"] == "test-secret-id"
+    assert build.os.environ["TENCENT_COS_SECRET_KEY"] == "test-secret-key"
+    assert build.os.environ["TENCENT_COS_SESSION_TOKEN"] == "test-session-token"
+
+
+def test_lanzou_find_folder_id_matches_exact_name():
+    folders = [
+        {"fol_id": "1", "name": "测试"},
+        {"fol_id": "13580356", "name": "机械臂更新"},
+    ]
+
+    assert build._lanzou_find_folder_id(folders, "机械臂更新") == 13580356
+    assert build._lanzou_find_folder_id(folders, "不存在") is None
+
+
+def test_publish_update_package_to_lanzou_uploads_then_deletes_old_files(monkeypatch, tmp_path):
+    update_zip = tmp_path / "jixiebijiaoben_update_20260607_1743.zip"
+    update_zip.write_bytes(b"zip")
+    fake_session = object()
+    deleted_ids: list[int] = []
+
+    monkeypatch.setattr(
+        build,
+        "_lanzou_credentials_from_env",
+        lambda: ("user", "pass", 13580356, "机械臂更新"),
+    )
+    monkeypatch.setattr(
+        build,
+        "_lanzou_login_session",
+        lambda **kwargs: (fake_session, 2680763),
+    )
+    monkeypatch.setattr(
+        build,
+        "_lanzou_resolve_update_folder_id",
+        lambda *args, **kwargs: 13580356,
+    )
+    states = [
+        [{"id": "289469534", "name_all": "jixiebijiaoben_update_20260607_1706.zip"}],
+        [
+            {"id": "289469534", "name_all": "jixiebijiaoben_update_20260607_1706.zip"},
+            {"id": "289500000", "name_all": update_zip.name},
+        ],
+        [{"id": "289500000", "name_all": update_zip.name}],
+    ]
+    monkeypatch.setattr(build, "_lanzou_list_files", lambda *args, **kwargs: states.pop(0))
+    uploaded: list[str] = []
+    monkeypatch.setattr(
+        build,
+        "_lanzou_upload_file",
+        lambda session, *, file_path, folder_id, timeout_seconds=3600: uploaded.append(f"{folder_id}:{file_path.name}"),
+    )
+    monkeypatch.setattr(
+        build,
+        "_lanzou_delete_file",
+        lambda session, *, file_id, timeout_seconds=build.DEFAULT_LANZOU_TIMEOUT_SECONDS: deleted_ids.append(file_id),
+    )
+
+    build._publish_update_package_to_lanzou(update_zip)
+
+    assert uploaded == [f"13580356:{update_zip.name}"]
+    assert deleted_ids == [289469534]
+
+
+def test_publish_release_manifest_requires_package_in_lanzou(monkeypatch):
+    monkeypatch.setattr(
+        "services.update_sources.resolve_lanzou_update_package",
+        lambda **kwargs: (_ for _ in ()).throw(
+            __import__("services.update_sources", fromlist=["UpdateSourceError"]).UpdateSourceError("missing")
+        ),
+    )
+
+    with __import__("pytest").raises(RuntimeError, match="not available in the configured Lanzou share yet"):
+        build._publish_release_manifest(
+            app_version="app-deadbeefcafebabe",
+            runtime_version="2026.06.02-full-package",
+            model_version="2026.06.02-lite",
+            update_file_name="jixiebijiaoben_update_20260607_0904.zip",
+        )
+
+
 def test_install_runtime_into_package_emits_expected_command(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     package_root = tmp_path / "package"
@@ -342,6 +552,58 @@ def test_runtime_cache_key_changes_with_cuda_lane(tmp_path):
     assert lane_a != lane_b
 
 
+def test_runtime_cache_key_ignores_local_release_metadata_fields(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    for relative, content in (
+        ("runtime_builder.py", "print('builder')\n"),
+        ("runtime_manifest.json", '{\n  "version": "2026.06.02-full-package"\n}\n'),
+        ("requirements.txt", "opencv-python\n"),
+        ("runtime_layout.py", "print('layout')\n"),
+        ("ocr_subprocess_entry.py", "print('ocr')\n"),
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    key_a = build._runtime_cache_key(
+        root,
+        runtime_name="ocr_nvidia",
+        install_scope="backend",
+        backend="paddle_cuda",
+        model_tier="lite",
+        cuda_lane="cu118",
+        skip_validation=True,
+        bundle_models=False,
+    )
+    (root / "runtime_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": "2026.06.02-full-package",
+                "appVersion": "app-deadbeefcafebabe",
+                "runtimeVersion": "2026.06.02-full-package",
+                "modelVersion": "2026.06.02-lite",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    key_b = build._runtime_cache_key(
+        root,
+        runtime_name="ocr_nvidia",
+        install_scope="backend",
+        backend="paddle_cuda",
+        model_tier="lite",
+        cuda_lane="cu118",
+        skip_validation=True,
+        bundle_models=False,
+    )
+
+    assert key_a == key_b
+
+
 def test_package_cache_key_changes_with_source_update(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
@@ -374,6 +636,53 @@ def test_package_cache_key_changes_with_source_update(tmp_path):
     key_b = build._package_cache_key(root, model_tier="lite", nvidia_cuda_lane="cu118", include_full_payload=False)
 
     assert key_a != key_b
+
+
+def test_package_cache_key_ignores_local_release_metadata_fields(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "apps" / "xinyu").mkdir(parents=True)
+    (root / "apps" / "xinyu" / "app.py").write_text("print('a')\n", encoding="utf-8")
+    (root / "vision").mkdir()
+    (root / "vision" / "ocr.py").write_text("print('ocr')\n", encoding="utf-8")
+    (root / "services").mkdir()
+    (root / "ui").mkdir()
+    (root / "workers").mkdir()
+    (root / "lgb").mkdir()
+    for relative, content in (
+        ("main.py", "print('main')\n"),
+        ("launcher_entry.py", "print('launcher')\n"),
+        ("ocr_subprocess_entry.py", "print('ocr_sub')\n"),
+        ("runtime_builder.py", "print('builder')\n"),
+        ("runtime_layout.py", "print('layout')\n"),
+        ("requirements.txt", "opencv-python\n"),
+        ("pyproject.toml", "[build-system]\n"),
+        ("config.json.example", "{}\n"),
+        ("runtime_manifest.json", '{\n  "version": "2026.06.02-full-package"\n}\n'),
+        ("build.py", "print('build')\n"),
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    key_a = build._package_cache_key(root, model_tier="lite", nvidia_cuda_lane="cu118", include_full_payload=False)
+    (root / "runtime_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": "2026.06.02-full-package",
+                "appVersion": "app-deadbeefcafebabe",
+                "runtimeVersion": "2026.06.02-full-package",
+                "modelVersion": "2026.06.02-lite",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    key_b = build._package_cache_key(root, model_tier="lite", nvidia_cuda_lane="cu118", include_full_payload=False)
+
+    assert key_a == key_b
 
 
 def test_restore_package_from_cache_restores_zip_and_package_dir(tmp_path, monkeypatch):
@@ -512,6 +821,6 @@ def test_main_default_builds_update_only(tmp_path, monkeypatch):
     monkeypatch.setattr(build, "_cleanup_staging", lambda *args, **kwargs: None)
     monkeypatch.setattr(build, "_package_cache_complete", lambda *args, **kwargs: False)
 
-    assert build.main([]) == 0
+    assert build.main(["--skip-release-upload"]) == 0
     assert runtime_calls == []
     assert full_calls == []

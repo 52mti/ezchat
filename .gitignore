@@ -17,7 +17,9 @@ wheelhouse/
 config.json
 *_ocr_config.json
 outbox.json
+.env
 .env/
+.emv
 runtime/logs/*
 !runtime/logs/.gitkeep
 runtime/errors/*

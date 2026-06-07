@@ -44,8 +44,36 @@ class XinyuApp(BaseApp):
         self.idle_points_checked = False
         self._last_selected_signature: tuple[str, str, int] | None = None
 
+    def _reset_round_metrics(self) -> None:
+        cache = self.config.setdefault("_runtime_cache", {})
+        if isinstance(cache, dict):
+            cache["metrics"] = {"ocr_count": 0, "capture_count": 0}
+
+    def _emit_round_metrics(self, started_at: float) -> None:
+        cache = self.config.get("_runtime_cache", {})
+        metrics = cache.get("metrics", {}) if isinstance(cache, dict) else {}
+        if not isinstance(metrics, dict):
+            metrics = {}
+        self.emit_runtime_log(
+            "info",
+            "xinyu_round_metrics",
+            {
+                "ocr_count": int(metrics.get("ocr_count", 0) or 0),
+                "capture_count": int(metrics.get("capture_count", 0) or 0),
+                "dialogue_compact_fallback_count": int(metrics.get("dialogue_compact_fallback_count", 0) or 0),
+                "seconds": round(time.monotonic() - started_at, 3),
+                "last_ocr": metrics.get("last_ocr"),
+            },
+        )
+
     def _mark_activity(self) -> None:
         self.last_activity_at = time.monotonic()
+
+    def _mark_recovered_progress(self) -> None:
+        self.status.last_error = ""
+        self.status.error_count = 0
+        self.status.is_circuit_open = False
+        self.recover_error_count = 0
 
     @staticmethod
     def _balance_from_points(points: Any) -> str:
@@ -69,6 +97,7 @@ class XinyuApp(BaseApp):
                     self._mark_activity()
 
         if self.idle_points_checked:
+            self.emit_runtime_log("info", "心遇本轮空闲已读取余额，跳过重复读取", {})
             return
         self.idle_points_checked = True
         reporter("points_check_due", "首次防熄屏读取余额")
@@ -122,6 +151,8 @@ class XinyuApp(BaseApp):
     def run_once(self) -> None:
         if self.status.is_circuit_open:
             return
+        round_started_at = time.monotonic()
+        self._reset_round_metrics()
         try:
             reporter = self.set_runtime_step
             entry_image = self.capture_entry_image()
@@ -136,9 +167,9 @@ class XinyuApp(BaseApp):
             if not target:
                 reporter("empty_list_target", "暂无消息，进入防熄屏等待")
                 self._run_idle_maintenance(reporter)
+                self._emit_round_metrics(round_started_at)
                 return
 
-            round_started_at = time.monotonic()
             self.emit_runtime_log(
                 "info",
                 "target_selected",
@@ -154,6 +185,10 @@ class XinyuApp(BaseApp):
                 self._clean_content(target.get("content", "")),
                 int(target.get("unread_count") or 0),
             )
+            previous_name = self._last_selected_signature[0] if self._last_selected_signature else ""
+            current_name = target_signature[0]
+            if previous_name and current_name and previous_name != current_name:
+                self._mark_recovered_progress()
             if self._last_selected_signature == target_signature:
                 self.emit_runtime_log(
                     "warning",
@@ -168,8 +203,11 @@ class XinyuApp(BaseApp):
             if self._is_empty_list_target(target):
                 reporter("empty_list_target", "暂无消息，本轮不进入聊天")
                 self._run_idle_maintenance(reporter)
+                self._emit_round_metrics(round_started_at)
                 self.mark_success()
                 return
+            if self.idle_points_checked:
+                self.emit_runtime_log("info", "心遇检测到真实消息，重置空闲余额读取标记", {})
             self.idle_points_checked = False
 
             list_content = self._clean_content(target.get("content", ""))
@@ -193,6 +231,7 @@ class XinyuApp(BaseApp):
                 self._mark_activity()
                 reporter("wait_next_round", "等待下一轮扫描")
                 self.record_reply_round(time.monotonic() - round_started_at)
+                self._emit_round_metrics(round_started_at)
                 self.mark_success()
                 return
 
@@ -259,6 +298,7 @@ class XinyuApp(BaseApp):
                 reporter("skip_reply", "跳过本轮回复")
                 steps.go_back(self.robot, self.config, reporter=reporter)
                 self._mark_activity()
+                self._emit_round_metrics(round_started_at)
                 self.mark_success()
                 return
             if not action.text:
@@ -271,6 +311,7 @@ class XinyuApp(BaseApp):
             self._mark_activity()
             send_clicks = steps.send_reply(self.robot, self.config, reporter=reporter)
             self.emit_runtime_log("info", "xinyu_send_clicks", {"clicks": send_clicks})
+            self._mark_recovered_progress()
             if send_clicks > 1:
                 self.emit_runtime_log(
                     "warning",
@@ -285,7 +326,12 @@ class XinyuApp(BaseApp):
                 reporter("mark_sent", "记录发送结果")
                 self.sent_callback(action, message)
             try:
-                steps.go_back(self.robot, self.config, double_click_on_first_attempt=True, reporter=reporter)
+                return_clicks = steps.go_back(
+                    self.robot,
+                    self.config,
+                    double_click_on_first_attempt=True,
+                    reporter=reporter,
+                )
             except Exception:
                 self.emit_runtime_log(
                     "warning",
@@ -296,9 +342,29 @@ class XinyuApp(BaseApp):
                     },
                 )
                 raise
+            self.emit_runtime_log(
+                "info",
+                "xinyu_send_flow_summary",
+                {
+                    "contact": message.get("contact", ""),
+                    "input_focused": input_focused,
+                    "input_box_source": self.config.get("_runtime_cache", {}).get("metrics", {}).get("input_box_source", ""),
+                    "input_box_template": self.config.get("_runtime_cache", {}).get("metrics", {}).get("input_box_template", ""),
+                    "microphone_template": self.config.get("_runtime_cache", {}).get("metrics", {}).get("microphone_template", ""),
+                    "tts_success": self.config.get("_runtime_cache", {}).get("metrics", {}).get("tts_success", False),
+                    "tts_retry_count": self.config.get("_runtime_cache", {}).get("metrics", {}).get("tts_retry_count", 0),
+                    "send_clicks": send_clicks,
+                    "send_clear_extra_clicks": self.config.get("_runtime_cache", {}).get("metrics", {}).get("send_clear_extra_clicks", 0),
+                    "send_clear_reason": self.config.get("_runtime_cache", {}).get("metrics", {}).get("send_clear_reason", ""),
+                    "return_clicks": return_clicks,
+                    "return_reason": self.config.get("_runtime_cache", {}).get("metrics", {}).get("return_reason", ""),
+                    "after_send_double_back_allowed": True,
+                },
+            )
             self._mark_activity()
             reporter("wait_next_round", "等待下一轮扫描")
             self.record_reply_round(time.monotonic() - round_started_at)
+            self._emit_round_metrics(round_started_at)
             self.mark_success()
         except steps.NoPhoneScreenError as exc:
             self.set_runtime_step("no_phone_waiting", "无手机异常，等待用户放回手机")

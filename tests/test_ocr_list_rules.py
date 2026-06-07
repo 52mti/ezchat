@@ -372,6 +372,48 @@ def test_huanyou_list_rules_use_red_badge_block_as_unread_one(monkeypatch):
     assert result["message_list"][0]["unread_count"] == 1
 
 
+def test_huanyou_list_rules_force_cupid_gift_content_as_unread(monkeypatch):
+    items = [
+        _item("珍惜当下", 128, 260, 265, 297),
+        _item("丘比特牵线礼物", 128, 360, 305, 338),
+    ]
+
+    monkeypatch.setattr(ocr_rules, "_detect_red_badge_bounds", lambda *args, **kwargs: None)
+
+    result = build_list_result(
+        items,
+        (560, 997),
+        _huanyou_rules(min_box_height_ratio=0.01),
+        source_image=Image.new("RGB", (560, 997), "white"),
+        ocr_config={"runtime_enabled": True, "preprocess": "original"},
+    )
+
+    assert result["message_list"][0]["name"] == "珍惜当下"
+    assert result["message_list"][0]["content"] == "丘比特牵线礼物"
+    assert result["message_list"][0]["unread_count"] == 1
+
+
+def test_huanyou_list_rules_force_fate_assistant_content_as_unread(monkeypatch):
+    items = [
+        _item("珍惜当下", 128, 260, 265, 297),
+        _item("缘分小助手", 128, 360, 305, 338),
+    ]
+
+    monkeypatch.setattr(ocr_rules, "_detect_red_badge_bounds", lambda *args, **kwargs: None)
+
+    result = build_list_result(
+        items,
+        (560, 997),
+        _huanyou_rules(min_box_height_ratio=0.01),
+        source_image=Image.new("RGB", (560, 997), "white"),
+        ocr_config={"runtime_enabled": True, "preprocess": "original"},
+    )
+
+    assert result["message_list"][0]["name"] == "珍惜当下"
+    assert result["message_list"][0]["content"] == "缘分小助手"
+    assert result["message_list"][0]["unread_count"] == 1
+
+
 def test_detect_red_badge_bounds_ignore_small_red_patch_for_huanyou():
     rules = _huanyou_rules()
     image = Image.new("RGB", (560, 997), "white")
@@ -612,6 +654,22 @@ def test_huanyou_list_rules_accept_left_ocr_unread_badge():
 
     assert result["message_list"][0]["name"] == "爱听歌的猕猴桃"
     assert result["message_list"][0]["unread_count"] == 1
+
+
+def test_huanyou_list_rules_do_not_split_numeric_username_as_unread():
+    rules = HUANYOU_LIST_OCR_MODE["rules"]
+    items = [
+        _item("12z", 128, 190, 580, 615),
+        _item("附近", 205, 250, 582, 612),
+        _item("Hello，我是那个想和你一起创造记忆的人", 128, 520, 630, 660),
+        _item("08:13", 500, 545, 635, 655),
+    ]
+
+    result = build_list_result(items, (560, 997), rules)
+
+    assert result["message_list"][0]["name"] == "12z"
+    assert result["message_list"][0]["unread_count"] is None
+    assert result["message_list"][0]["content"].startswith("Hello")
 
 
 def test_huanyou_list_rules_read_left_badge_from_zoomed_row_crop(monkeypatch):

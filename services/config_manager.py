@@ -39,13 +39,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 DEFAULT_OUTBOX: dict[str, Any] = {"schema_version": 1, "messages": []}
 CURRENT_SCHEMA_VERSION = 3
+DEFAULT_MATCH_THRESHOLD = 0.7
 
 APP_LEVEL_KEYS = {
     "ocr",
     "ocr_modes",
     "templates",
     "match_threshold",
+    "popup_match_threshold",
     "template_match_regions",
+    "template_match_thresholds",
 }
 DEVICE_LEVEL_KEYS = {
     "poll_interval",
@@ -135,6 +138,15 @@ def _normalize_app_templates(app_name: str, app_config: dict[str, Any]) -> None:
             templates[group] = app_template_path
 
 
+def _normalize_match_threshold(app_config: dict[str, Any]) -> None:
+    if not isinstance(app_config, dict):
+        return
+    try:
+        app_config["match_threshold"] = float(app_config.get("match_threshold", DEFAULT_MATCH_THRESHOLD))
+    except (TypeError, ValueError):
+        app_config["match_threshold"] = DEFAULT_MATCH_THRESHOLD
+
+
 def _normalize_huanyou_dialogue_rules(app_name: str, app_config: dict[str, Any]) -> None:
     if str(app_name) != "huanyou" or not isinstance(app_config, dict):
         return
@@ -176,6 +188,7 @@ def _normalize_app_configs(app_configs: dict[str, Any]) -> None:
     for app_name, app_config in app_configs.items():
         if isinstance(app_config, dict):
             _normalize_app_templates(str(app_name), app_config)
+            _normalize_match_threshold(app_config)
             _normalize_huanyou_dialogue_rules(str(app_name), app_config)
 
 
@@ -275,6 +288,7 @@ def _load_app_override_file(app_config_root: Path, app_name: str) -> dict[str, A
     payload = _deep_merge(payload, _load_app_ocr_mode_override_files(app_config_root, app_name))
     app_level, _, _ = _split_override_scopes(payload)
     _normalize_app_templates(app_name, app_level)
+    _normalize_match_threshold(app_level)
     _normalize_huanyou_dialogue_rules(app_name, app_level)
     return app_level
 
@@ -322,6 +336,7 @@ def _merge_app_level_config(app_config_root: Path, app_name: str, updates: dict[
     existing = _load_app_override_file(app_config_root, app_name)
     merged = _deep_merge(existing, updates)
     _normalize_app_templates(app_name, merged)
+    _normalize_match_threshold(merged)
     ocr_modes = merged.get("ocr_modes", {})
     ocr_modes = copy.deepcopy(ocr_modes) if isinstance(ocr_modes, dict) else {}
     dialogue_mode = ocr_modes.pop("dialogue", None)
@@ -666,7 +681,9 @@ class ConfigManager:
         )
         merged = _deep_merge(default_config, app_level)
         merged = _deep_merge(merged, runtime_overrides)
-        return _deep_merge(merged, device_app_overrides)
+        merged = _deep_merge(merged, device_app_overrides)
+        _normalize_match_threshold(merged)
+        return merged
 
     def get_app_overrides(self, app_name: str) -> dict[str, Any]:
         with self._lock:

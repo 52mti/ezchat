@@ -71,7 +71,14 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def _threshold(config: dict[str, Any]) -> float:
-    return float(config.get("match_threshold", 0.85))
+    return float(config.get("match_threshold", 0.7))
+
+
+def _popup_threshold(config: dict[str, Any], key: str | None = None) -> float:
+    thresholds = config.get("template_match_thresholds")
+    if key and isinstance(thresholds, dict) and key in thresholds:
+        return float(thresholds[key])
+    return float(config.get("popup_match_threshold", 0.8))
 
 
 def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> dict[str, float] | None:
@@ -80,7 +87,7 @@ def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> di
         popup_template,
         config,
         popup_template_region_key(popup_template),
-        threshold=_threshold(config),
+        threshold=_popup_threshold(config, popup_template_region_key(popup_template)),
         match_func=match,
     )
     if not result:

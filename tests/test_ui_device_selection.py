@@ -150,6 +150,49 @@ def test_edit_app_config_only_updates_current_device_current_app(qtbot, tmp_path
     assert second["app_overrides"]["wechat"]["persona"]["name"] == "wechat-second"
 
 
+def test_edit_app_config_saves_template_match_regions_to_app_config(qtbot, tmp_path, monkeypatch):
+    window = _window(
+        qtbot,
+        tmp_path,
+        [
+            {
+                "ip": "192.168.1.108",
+                "selected_app": "xinyu",
+            },
+        ],
+    )
+
+    class FakeDialog:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def values(self):
+            return {
+                "template_match_regions": {
+                    "screen.chat_window": [0.007, 0.476, 0.261, 0.523],
+                    "popup.custom.popup_custom_4": [0.037, 0.282, 0.954, 0.443],
+                },
+                "template_match_thresholds": {
+                    "screen.chat_window": 0.7,
+                },
+                "persona": {"name": "xinyu"},
+            }
+
+    monkeypatch.setattr("ui.main_window.AppConfigDialog", FakeDialog)
+    monkeypatch.setattr("ui.main_window.QMessageBox.information", lambda *args, **kwargs: None)
+
+    window._edit_app_config(0)
+
+    app_config_path = tmp_path / "apps" / "xinyu" / "config.json"
+    saved = json.loads(app_config_path.read_text(encoding="utf-8"))
+    assert saved["template_match_regions"]["screen.chat_window"] == [0.007, 0.476, 0.261, 0.523]
+    assert saved["template_match_regions"]["popup.custom.popup_custom_4"] == [0.037, 0.282, 0.954, 0.443]
+    assert saved["template_match_thresholds"]["screen.chat_window"] == 0.7
+
+
 def test_edit_device_settings_only_updates_current_device_current_app_offsets(qtbot, tmp_path, monkeypatch):
     window = _window(
         qtbot,
@@ -527,6 +570,103 @@ def test_log_panel_shows_ocr_message_and_ai_reply_payload(qtbot, tmp_path):
     assert "\u65e0\u654c\u963f\u5f3a" in logs_text
     assert "AI" in logs_text
     assert "\u6211\u4e5f\u60f3\u770b\uff0c\u4f60\u63a8\u8350\u54ea\u4e00\u573a\uff1f" in logs_text
+
+
+def test_log_panel_shows_huanyou_runtime_logs_in_chinese(qtbot, tmp_path):
+    window = _window(qtbot, tmp_path, [{"ip": "192.168.1.108", "selected_app": "huanyou"}])
+
+    window.events.put(
+        WorkerEvent(
+            "192.168.1.108",
+            "info",
+            "huanyou_message_input",
+            {"contact": "相逢何必曾相识", "content": "你好", "source": "dialogue"},
+        )
+    )
+    window.events.put(
+        WorkerEvent(
+            "192.168.1.108",
+            "info",
+            "huanyou_reply_text",
+            {"contact": "相逢何必曾相识", "reply_text": "你好呀", "skip": False},
+        )
+    )
+    window.events.put(
+        WorkerEvent(
+            "192.168.1.108",
+            "info",
+            "huanyou_round_metrics",
+            {"ocr_count": 2, "capture_count": 3, "seconds": 4.2},
+        )
+    )
+    window.events.put(
+        WorkerEvent(
+            "192.168.1.108",
+            "warning",
+            "huanyou_startup_back_button_missing",
+            {"error": "启动检查未找到返回按钮，停止进程"},
+        )
+    )
+    window.events.put(
+        WorkerEvent(
+            "192.168.1.108",
+            "warning",
+            "欢友步骤不可用：确认聊天界面 -> 匹配失败：没有匹配到聊天界面",
+            {"error_count": 4, "circuit_breaker_threshold": 5},
+        )
+    )
+    window._drain_events()
+
+    logs_text = window.logs.toPlainText()
+    assert "huanyou_message_input" not in logs_text
+    assert "huanyou_reply_text" not in logs_text
+    assert "huanyou_round_metrics" not in logs_text
+    assert "huanyou_startup_back_button_missing" not in logs_text
+    assert "欢友输入来源 dialogue [相逢何必曾相识] 你好" in logs_text
+    assert "欢友回复 [相逢何必曾相识] 你好呀" in logs_text
+    assert "欢友本轮统计 OCR 2 次，截图 3 次，耗时 4.2 秒" in logs_text
+    assert "欢友启动检查未找到返回按钮，停止进程" in logs_text
+    assert "欢友步骤不可用：确认聊天界面 -> 匹配失败：没有匹配到聊天界面（错误计数 4/5）" in logs_text
+
+
+def test_log_panel_shows_xinyu_send_summary_in_chinese(qtbot, tmp_path):
+    window = _window(qtbot, tmp_path, [{"ip": "192.168.1.108", "selected_app": "xinyu"}])
+
+    window.events.put(
+        WorkerEvent(
+            "192.168.1.108",
+            "info",
+            "xinyu_send_flow_summary",
+            {
+                "contact": "清雅如茶",
+                "input_box_source": "cache",
+                "microphone_template": "btn_麦克风按钮.jpg",
+                "tts_success": True,
+                "tts_retry_count": 1,
+                "send_clicks": 1,
+                "send_clear_extra_clicks": 0,
+                "return_clicks": 2,
+                "return_reason": "after_send_double_back",
+            },
+        )
+    )
+    window.events.put(
+        WorkerEvent(
+            "192.168.1.108",
+            "info",
+            "xinyu_round_metrics",
+            {"ocr_count": 2, "capture_count": 5, "dialogue_compact_fallback_count": 1, "seconds": 6.7},
+        )
+    )
+    window._drain_events()
+
+    logs_text = window.logs.toPlainText()
+    assert "xinyu_send_flow_summary" not in logs_text
+    assert "xinyu_round_metrics" not in logs_text
+    assert "心遇发送摘要 [清雅如茶] 输入框=cache" in logs_text
+    assert "麦克风=btn_麦克风按钮.jpg" in logs_text
+    assert "TTS=成功，重试 1 次，发送点击 1 次，补点 0 次，返回 2 次" in logs_text
+    assert "心遇本轮统计 OCR 2 次，截图 5 次，详情回退 1 次，耗时 6.7 秒" in logs_text
 
 
 def test_log_panel_filters_by_selected_device_ip(qtbot, tmp_path):

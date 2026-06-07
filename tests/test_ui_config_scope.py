@@ -9,7 +9,14 @@ from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QAbstractSpinBox, QPushButton, QScrollArea
 
 from ui import main_window as main_window_module
-from ui.main_window import AppConfigDialog, DeviceSettingsDialog, PopupCropDialog, PopupCropLabel
+from ui.main_window import (
+    AppConfigDialog,
+    DeviceSettingsDialog,
+    PopupCropDialog,
+    PopupCropLabel,
+    PopupDualRegionDialog,
+    TemplateManagerWidget,
+)
 
 
 DEFAULT_PERSONA_ID = "REMOVED-BEARER-TOKEN"
@@ -198,6 +205,125 @@ def test_template_manager_exposes_all_template_actions(qtbot, tmp_path):
     assert not any(text.startswith("导入") for text in button_texts)
 
 
+def test_template_manager_popup_capture_uses_second_region_as_match_range(qtbot, tmp_path, monkeypatch):
+    image = Image.new("RGB", (200, 400), "white")
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG")
+    overrides: dict[str, object] = {}
+    dialog_calls: list[str] = []
+
+    class FakeRobot:
+        def __init__(self, ip: str) -> None:
+            self.ip = ip
+
+        def get_status(self) -> dict:
+            return {
+                "data": {
+                    "transform_width": 200,
+                    "transform_height": 400,
+                    "points": [
+                        {"x": 0, "y": 0},
+                        {"x": 199, "y": 0},
+                        {"x": 199, "y": 399},
+                        {"x": 0, "y": 399},
+                    ],
+                }
+            }
+
+        def get_capture_image(self, pre_move: bool = True) -> bytes:
+            return buffer.getvalue()
+
+    class FakeDualRegionDialog:
+        def __init__(self, source_image, parent=None) -> None:
+            dialog_calls.append("popup_dual_region")
+            self.cropped_image = Image.new("RGB", (20, 20), "white")
+            self.template_region_norm = [0.100, 0.100, 0.200, 0.200]
+            self.match_region_norm = [0.500, 0.250, 0.400, 0.300]
+
+        def exec(self):
+            return main_window_module.QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module, "RobotInterface", FakeRobot)
+    monkeypatch.setattr(main_window_module, "PopupDualRegionDialog", FakeDualRegionDialog)
+    monkeypatch.setattr(main_window_module.QMessageBox, "information", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main_window_module.QMessageBox, "critical", lambda *args, **kwargs: None)
+
+    manager = TemplateManagerWidget(
+        tmp_path / "templates",
+        device_ip="192.168.1.133",
+        app_name="huanyou",
+        overrides=overrides,
+    )
+    qtbot.addWidget(manager)
+
+    manager._capture_template(main_window_module.CUSTOM_POPUP, "弹窗模板")
+
+    target = tmp_path / "templates" / "buttons" / "popup_custom_1.jpg"
+    region_key = main_window_module.popup_template_region_key(target)
+    assert target.exists()
+    assert dialog_calls == ["popup_dual_region"]
+    assert "template_match_regions" in overrides
+    assert overrides["template_match_regions"][region_key] == [0.500, 0.250, 0.400, 0.300]
+    assert manager.table.item(0, 2).text() == "0.500, 0.250, 0.400, 0.300"
+
+
+def test_template_manager_non_popup_capture_does_not_write_match_range(qtbot, tmp_path, monkeypatch):
+    image = Image.new("RGB", (200, 400), "white")
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG")
+    overrides: dict[str, object] = {}
+    dialog_count = 0
+
+    class FakeRobot:
+        def __init__(self, ip: str) -> None:
+            self.ip = ip
+
+        def get_status(self) -> dict:
+            return {
+                "data": {
+                    "transform_width": 200,
+                    "transform_height": 400,
+                    "points": [
+                        {"x": 0, "y": 0},
+                        {"x": 199, "y": 0},
+                        {"x": 199, "y": 399},
+                        {"x": 0, "y": 399},
+                    ],
+                }
+            }
+
+        def get_capture_image(self, pre_move: bool = True) -> bytes:
+            return buffer.getvalue()
+
+    class FakeCropDialog:
+        def __init__(self, source_image, template_label="模板", help_text=None, parent=None) -> None:
+            nonlocal dialog_count
+            dialog_count += 1
+            self.cropped_image = Image.new("RGB", (20, 20), "white")
+            self.crop_region_norm = [0.100, 0.100, 0.200, 0.200]
+
+        def exec(self):
+            return main_window_module.QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module, "RobotInterface", FakeRobot)
+    monkeypatch.setattr(main_window_module, "PopupCropDialog", FakeCropDialog)
+    monkeypatch.setattr(main_window_module.QMessageBox, "information", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main_window_module.QMessageBox, "critical", lambda *args, **kwargs: None)
+
+    manager = TemplateManagerWidget(
+        tmp_path / "templates",
+        device_ip="192.168.1.133",
+        app_name="huanyou",
+        overrides=overrides,
+    )
+    qtbot.addWidget(manager)
+
+    manager._capture_template(main_window_module.SEND_BUTTON, "发送按钮模板")
+
+    assert dialog_count == 1
+    assert "template_match_regions" not in overrides
+
+
 def test_popup_crop_label_maps_display_selection_to_source_coordinates(qtbot):
     image = Image.new("RGB", (200, 100), "white")
     label = PopupCropLabel(QPixmap.fromImage(ImageQt(image)))
@@ -206,6 +332,29 @@ def test_popup_crop_label_maps_display_selection_to_source_coordinates(qtbot):
     label.selection = QRect(0, 0, label.display_pixmap.width(), label.display_pixmap.height())
 
     assert label.crop_box() == (0, 0, 200, 100)
+
+
+def test_popup_dual_region_dialog_shows_template_and_match_region_labels(qtbot):
+    image = Image.new("RGB", (200, 100), "white")
+    dialog = PopupDualRegionDialog(image)
+    qtbot.addWidget(dialog)
+
+    dialog.crop_label.selections["template"] = QRect(
+        0,
+        0,
+        dialog.crop_label.display_pixmap.width() // 2,
+        dialog.crop_label.display_pixmap.height() // 2,
+    )
+    dialog.crop_label.selections["match"] = QRect(
+        dialog.crop_label.display_pixmap.width() // 4,
+        dialog.crop_label.display_pixmap.height() // 4,
+        dialog.crop_label.display_pixmap.width() // 2,
+        dialog.crop_label.display_pixmap.height() // 2,
+    )
+    dialog._refresh_region_labels()
+
+    assert "当前图片位置：0.000, 0.000, 0.500, 0.500" in dialog.template_region_label.text()
+    assert "匹配范围：0.250, 0.250, 0.500, 0.500" in dialog.match_region_label.text()
 
 
 def test_huanyou_app_config_values_do_not_save_next_message_offsets(qtbot, tmp_path):
@@ -258,7 +407,21 @@ def test_device_settings_dialog_can_refresh_screenshot_and_test_click(qtbot, mon
         def __init__(self, ip: str) -> None:
             self.ip = ip
 
-        def get_transform_image(self, pre_move: bool = True) -> bytes:
+        def get_status(self) -> dict:
+            return {
+                "data": {
+                    "transform_width": 200,
+                    "transform_height": 400,
+                    "points": [
+                        {"x": 0, "y": 0},
+                        {"x": 199, "y": 0},
+                        {"x": 199, "y": 399},
+                        {"x": 0, "y": 399},
+                    ],
+                }
+            }
+
+        def get_capture_image(self, pre_move: bool = True) -> bytes:
             return buffer.getvalue()
 
         def move_click(self, x: float, y: float) -> None:
@@ -313,7 +476,21 @@ def test_device_settings_refresh_screenshot_handles_display_errors(qtbot, monkey
         def __init__(self, ip: str) -> None:
             self.ip = ip
 
-        def get_transform_image(self, pre_move: bool = True) -> bytes:
+        def get_status(self) -> dict:
+            return {
+                "data": {
+                    "transform_width": 200,
+                    "transform_height": 400,
+                    "points": [
+                        {"x": 0, "y": 0},
+                        {"x": 199, "y": 0},
+                        {"x": 199, "y": 399},
+                        {"x": 0, "y": 399},
+                    ],
+                }
+            }
+
+        def get_capture_image(self, pre_move: bool = True) -> bytes:
             return buffer.getvalue()
 
     monkeypatch.setattr(main_window_module, "RobotInterface", FakeRobot)
