@@ -55,6 +55,7 @@ from PIL import Image
 
 from apps import get_default_app_name, get_registered_apps, resolve_app_name
 from apps.defaults import DEFAULT_RUNTIME_CONFIG, with_app_defaults
+from apps.coordinates import robot_point_with_jitter
 from apps.photo_capture import capture_transform_image
 from apps.visual_assets import (
     CHAT_LIST_SCREEN,
@@ -3671,11 +3672,17 @@ class DeviceSettingsDialogInteractive(QDialog):
             QMessageBox.warning(self, "未选择坐标", "请先刷新截图，并在图片上点击一个基点位置。")
             return
         try:
-            RobotInterface(self.device_ip).move_click(*point)
+            robot = RobotInterface(self.device_ip)
+            try:
+                setattr(robot, "_codex_click_jitter_enabled", True)
+            except Exception:
+                pass
+            click_x, click_y = robot_point_with_jitter(robot, *point)
+            robot.move_click(click_x, click_y)
         except Exception as exc:
             QMessageBox.critical(self, "测试点击失败", f"机械臂点击失败：{exc}")
             return
-        QMessageBox.information(self, "测试点击完成", f"已点击坐标：({point[0]:.4f}, {point[1]:.4f})")
+        QMessageBox.information(self, "测试点击完成", f"已点击坐标：({click_x:.4f}, {click_y:.4f})")
 
     def values(self) -> dict[str, Any]:
         values: dict[str, Any] = {}

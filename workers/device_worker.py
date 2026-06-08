@@ -73,6 +73,10 @@ class DeviceWorker(threading.Thread):
             runtime_context["should_stop"] = self._stop_event.is_set
         self.robot = robot or RobotInterface(str(device["ip"]))
         try:
+            setattr(self.robot, "_codex_click_jitter_enabled", True)
+        except Exception:
+            pass
+        try:
             setattr(self.robot, "_codex_should_stop", self._stop_event.is_set)
         except Exception:
             pass
