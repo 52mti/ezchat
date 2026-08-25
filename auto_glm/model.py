@@ -68,6 +68,7 @@ class AutoGLMClient:
         history: list[str] | None = None,
         system_prompt: str | None = None,
         reference_images: list[tuple[str, Any]] | None = None,
+        previous_screenshot: Any | None = None,
     ) -> ModelDecision:
         instruction = f"当前原子任务：{task.strip()}"
         if history:
@@ -76,6 +77,13 @@ class AutoGLMClient:
             {"type": "text", "text": "当前完整截图（动作坐标必须基于此图输出）："},
             {"type": "image_url", "image_url": {"url": _as_data_url(screenshot)}},
         ]
+        if previous_screenshot is not None:
+            content.extend(
+                [
+                    {"type": "text", "text": "上一轮动作前截图（只用于比较页面变化，不得以此图坐标输出动作）："},
+                    {"type": "image_url", "image_url": {"url": _as_data_url(previous_screenshot)}},
+                ]
+            )
         for label, reference_image in reference_images or []:
             content.extend(
                 [
