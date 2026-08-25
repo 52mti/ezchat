@@ -177,15 +177,24 @@ class XinyuApp(BaseApp):
                 reporter("empty_list_target", "暂无消息，进入防熄屏等待")
                 if not self.idle_online_photo_attempted:
                     self.idle_online_photo_attempted = True
-                    reporter("online_photo_due", "无消息，尝试在线用户发照片")
                     try:
-                        sent_photo = steps.send_photo_to_online_target(self.robot, self.config, reporter=reporter)
-                    except Exception as online_photo_exc:
-                        sent_photo = False
-                        self.emit_runtime_log("warning", "在线用户发照片失败", {"error": str(online_photo_exc)})
-                    if sent_photo:
+                        planned_count = max(0, int(self.config.get("online_photo_send_count", 3) or 0))
+                    except (TypeError, ValueError):
+                        planned_count = 3
+                    reporter("online_photo_due", f"无消息，尝试向 {planned_count} 位在线用户发照片")
+                    sent_count = 0
+                    for index in range(planned_count):
+                        try:
+                            sent_photo = steps.send_photo_to_online_target(self.robot, self.config, reporter=reporter)
+                        except Exception as online_photo_exc:
+                            self.emit_runtime_log("warning", "在线用户发照片失败", {"第几位": index + 1, "error": str(online_photo_exc)})
+                            break
+                        if not sent_photo:
+                            break
+                        sent_count += 1
                         self._mark_activity()
-                        self.emit_runtime_log("info", "在线用户照片已发送", {})
+                    if sent_count:
+                        self.emit_runtime_log("info", "在线用户照片已发送", {"人数": sent_count, "计划人数": planned_count})
                 self._run_idle_maintenance(reporter)
                 self._emit_round_metrics(round_started_at)
                 return

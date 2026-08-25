@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, QUrl
+from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, QUrl, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QFont, QImage, QPainter, QPen, QPixmap, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
@@ -127,6 +127,48 @@ def _pixmap_from_pil_image(image: Image.Image) -> QPixmap:
     if pixmap.isNull():
         raise ValueError("截图数据无法转换为 Qt 画面")
     return pixmap
+
+
+class DeviceScreenshotThread(QThread):
+    """在后台获取设备截图，避免机械臂网络请求阻塞 Qt 主线程。"""
+
+    image_ready = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, device_ip: str, app_name: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.device_ip = str(device_ip)
+        self.app_name = str(app_name)
+
+    def run(self) -> None:
+        try:
+            image_bytes = capture_transform_image(
+                RobotInterface(self.device_ip),
+                {"_runtime": {"device_ip": self.device_ip, "app_name": self.app_name}},
+                pre_move=True,
+                label="device_settings",
+            )
+            self.image_ready.emit(ensure_portrait_image(image_bytes))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class TemplatePreviewThread(QThread):
+    """模板匹配预览在后台执行，避免多模板检测卡住设置窗口。"""
+
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, image: Image.Image, callback: Any, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.image = image.copy()
+        self.callback = callback
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(self.callback(self.image))
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -1526,6 +1568,7 @@ try {
                 "template_match_regions",
                 "template_match_thresholds",
                 "photo_sent_cooldown_seconds",
+                "online_photo_send_count",
             )
             if key in values
         }
@@ -3331,6 +3374,12 @@ class AppConfigDialog(QDialog):
         self.photo_sent_cooldown_seconds.setToolTip("主动照片发送成功后，同一用户在此时间内不会再次收到主动照片。")
         form.addRow("同一用户发图冷却（秒，0不限制）", self.photo_sent_cooldown_seconds)
 
+        self.online_photo_send_count = QSpinBox()
+        self.online_photo_send_count.setRange(0, 50)
+        self.online_photo_send_count.setValue(int(overrides.get("online_photo_send_count", 3) or 0))
+        self.online_photo_send_count.setToolTip("没有消息进入空闲状态时，主动给多少位在线用户发送照片。0 表示关闭主动发图。")
+        form.addRow("每次空闲主动发图人数（0关闭）", self.online_photo_send_count)
+
         self.ocr_toggle_button = QPushButton("显示OCR设置")
         self.ocr_toggle_button.clicked.connect(self._toggle_ocr_tab)
         panel_root.addWidget(self.ocr_toggle_button, 0, Qt.AlignmentFlag.AlignLeft)
@@ -3640,6 +3689,7 @@ class AppConfigDialog(QDialog):
             "step_timeout": self.step_timeout.value(),
             "keep_awake_interval_seconds": self.keep_awake_interval_seconds.value(),
             "photo_sent_cooldown_seconds": self.photo_sent_cooldown_seconds.value(),
+            "online_photo_send_count": self.online_photo_send_count.value(),
             "exclude_ocr_wait_from_step_timeout": self.exclude_ocr_wait_from_step_timeout.isChecked(),
             "match_threshold": self.match_threshold.value(),
             "popup_match_threshold": self.popup_match_threshold.value(),
@@ -3791,6 +3841,8 @@ class DeviceSettingsDialogInteractive(QDialog):
         self.current_screenshot: Image.Image | None = None
         self.offset_spin_boxes: dict[str, tuple[QDoubleSpinBox, QDoubleSpinBox]] = {}
         self.test_target_combo: QComboBox | None = None
+        self._screenshot_thread: DeviceScreenshotThread | None = None
+        self._template_preview_thread: TemplatePreviewThread | None = None
         self.setWindowTitle(f"设备设置 - {device_ip} / {app_name}")
         self.resize(1180, 760)
 
@@ -3978,25 +4030,37 @@ class DeviceSettingsDialogInteractive(QDialog):
         return spin
 
     def _refresh_screenshot(self) -> None:
+        if self._screenshot_thread is not None and self._screenshot_thread.isRunning():
+            return
         self.refresh_screenshot_button.setEnabled(False)
-        original_text = self.refresh_screenshot_button.text()
         self.refresh_screenshot_button.setText("刷新中...")
+        self.template_match_summary.setText("正在获取设备截图，请稍候...")
+        thread = DeviceScreenshotThread(self.device_ip, self.app_name, self)
+        self._screenshot_thread = thread
+        thread.image_ready.connect(self._on_screenshot_ready)
+        thread.failed.connect(self._on_screenshot_failed)
+        thread.finished.connect(self._finish_screenshot_refresh)
+        thread.start()
+
+    def _on_screenshot_ready(self, image: Image.Image) -> None:
+        if self._screenshot_thread is None:
+            return
         try:
-            image_bytes = capture_transform_image(
-                RobotInterface(self.device_ip),
-                {"_runtime": {"device_ip": self.device_ip, "app_name": self.app_name}},
-                pre_move=True,
-                label="device_settings",
-            )
-            image = ensure_portrait_image(image_bytes)
             self._set_screenshot(image)
             self._detect_saved_templates(image)
         except Exception as exc:
             QMessageBox.critical(self, "截图失败", f"无法从当前设备获取截图：{exc}")
-            return
-        finally:
-            self.refresh_screenshot_button.setEnabled(True)
-            self.refresh_screenshot_button.setText(original_text)
+
+    def _on_screenshot_failed(self, message: str) -> None:
+        QMessageBox.critical(self, "截图失败", f"无法从当前设备获取截图：{message}")
+
+    def _finish_screenshot_refresh(self) -> None:
+        thread = self._screenshot_thread
+        self._screenshot_thread = None
+        self.refresh_screenshot_button.setEnabled(True)
+        self.refresh_screenshot_button.setText("刷新截图")
+        if thread is not None:
+            thread.deleteLater()
 
     def _set_screenshot(self, image: Image.Image) -> None:
         self.current_screenshot = image.copy()
@@ -4006,7 +4070,7 @@ class DeviceSettingsDialogInteractive(QDialog):
         self.point_y_label.setText("--")
         self._update_click_labels()
 
-    def _detect_saved_templates(self, image: Image.Image) -> None:
+    def _collect_saved_template_matches(self, image: Image.Image) -> tuple[list[tuple[str, str, str, str]], list[tuple[float, float]]]:
         """检测当前设备当前 App 的模板，只展示结果，不执行点击。"""
         rows: list[tuple[str, str, str, str]] = []
         points: list[tuple[float, float]] = []
@@ -4057,6 +4121,25 @@ class DeviceSettingsDialogInteractive(QDialog):
                 rows.append((label, "命中", str(result.get("_template_name") or paths[0].name), f"{float(result.get('score', 0.0)):.3f} / {threshold:.2f}"))
             else:
                 rows.append((label, "未命中", "-", f"- / {threshold:.2f}"))
+        return rows, points
+
+    def _detect_saved_templates(self, image: Image.Image) -> None:
+        if self._template_preview_thread is not None and self._template_preview_thread.isRunning():
+            return
+        self.template_match_summary.setText("正在检测已保存模板，请稍候...")
+        thread = TemplatePreviewThread(image, self._collect_saved_template_matches, self)
+        self._template_preview_thread = thread
+        thread.completed.connect(self._apply_template_preview)
+        thread.failed.connect(self._on_template_preview_failed)
+        thread.finished.connect(self._finish_template_preview)
+        thread.start()
+
+    def _apply_template_preview(self, payload: object) -> None:
+        try:
+            rows, points = payload
+        except (TypeError, ValueError):
+            self._on_template_preview_failed("模板检测结果无效")
+            return
         self.template_match_table.setRowCount(len(rows))
         hit_count = 0
         for row, values in enumerate(rows):
@@ -4068,6 +4151,15 @@ class DeviceSettingsDialogInteractive(QDialog):
             hit_count += values[1] == "命中"
         self.template_match_summary.setText(f"模板检测完成：{hit_count}/{len(rows)} 类已命中。这里只显示结果，不会执行点击。")
         self.crop_label.set_match_points(points)
+
+    def _on_template_preview_failed(self, message: str) -> None:
+        self.template_match_summary.setText(f"模板检测失败：{message}")
+
+    def _finish_template_preview(self) -> None:
+        thread = self._template_preview_thread
+        self._template_preview_thread = None
+        if thread is not None:
+            thread.deleteLater()
 
     def _save_current_screenshot_to_error_path(self) -> None:
         if self.current_screenshot is None:

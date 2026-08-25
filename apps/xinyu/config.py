@@ -72,4 +72,5 @@ DEFAULT_CONFIG = {
     "recover_failure_limit": 3,
     "photo_select_random_bounds": [0.3, 0.2, 0.9, 0.5],
     "photo_sent_cooldown_seconds": 86400,
+    "online_photo_send_count": 3,
 }
