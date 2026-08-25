@@ -1613,14 +1613,31 @@ def read_my_points(
         return None
     _cache_message_from_cached_my(cfg, pos)
     _cache_point_once(cfg, "screen_anchors", "bottom_my", pos)
-    _report(reporter, "points_open_my", "打开我的界面", log_label=f"打开我的界面：{format_point(*pos)}")
-    click_image_point(robot, *pos)
-    time.sleep(0.6)
-
-    image = capture_after_popups(robot, cfg, label="my_screen", reporter=reporter)
-    _raise_if_black_screen(image, cfg)
-    if not _matches_screen(image, cfg, MY_SCREEN):
-        raise StepUnavailable(f"未匹配到“我的界面”模板：{_template_failure_detail(cfg, MY_SCREEN, group='screens')}")
+    max_open_attempts = max(1, int(cfg.get("points_open_max_attempts", 3) or 3))
+    my_image: Any | None = None
+    for attempt in range(1, max_open_attempts + 1):
+        _report(
+            reporter,
+            "points_open_my",
+            "打开我的界面" if attempt == 1 else "我的界面未打开，重新点击",
+            log_label=(
+                f"打开我的界面：{format_point(*pos)}"
+                if attempt == 1
+                else f"我的界面未打开，第 {attempt}/{max_open_attempts} 次重新点击：{format_point(*pos)}"
+            ),
+        )
+        click_image_point(robot, *pos)
+        time.sleep(0.6)
+        my_image = capture_after_popups(robot, cfg, label=f"my_screen_{attempt}", reporter=reporter)
+        _raise_if_black_screen(my_image, cfg)
+        if _matches_screen(my_image, cfg, MY_SCREEN):
+            break
+    if my_image is None or not _matches_screen(my_image, cfg, MY_SCREEN):
+        raise StepUnavailable(
+            f"点击我的 {max_open_attempts} 次后仍未匹配到“我的界面”模板："
+            f"{_template_failure_detail(cfg, MY_SCREEN, group='screens')}"
+        )
+    image = my_image
 
     _report(reporter, "points_ocr_read", "积分 OCR 读取")
     ocr_result = _run_ocr_mode(image, cfg, "points", region=_region(cfg, POINTS_REGION))
@@ -1820,15 +1837,31 @@ def send_photo_to_online_target(
     left, top, right, bottom = (float(value) for value in bounds)
     if not (0.0 <= left < right <= 1.0 and 0.0 <= top < bottom <= 1.0):
         raise StepUnavailable("照片随机选择范围配置无效，应满足 0<=左<右<=1 且 0<=上<下<=1")
-    photo_point = (random.uniform(left, right), random.uniform(top, bottom))
-    _report(reporter, "photo_select", "随机选择照片", log_label=f"随机选择照片：{format_point(*photo_point)}")
-    click_image_point(robot, *photo_point)
-    time.sleep(0.5)
-
-    complete_image = capture_after_popups(robot, cfg, label="photo_complete", reporter=reporter)
-    complete_pos = _template_center(complete_image, cfg, COMPLETE_BUTTON, group="buttons")
+    max_photo_attempts = max(1, int(cfg.get("photo_select_max_attempts", 3) or 3))
+    complete_pos: tuple[float, float] | None = None
+    for attempt in range(1, max_photo_attempts + 1):
+        photo_point = (random.uniform(left, right), random.uniform(top, bottom))
+        _report(
+            reporter,
+            "photo_select",
+            "随机选择照片" if attempt == 1 else "未找到完成按钮，重新随机选择照片",
+            log_label=(
+                f"随机选择照片：{format_point(*photo_point)}"
+                if attempt == 1
+                else f"未找到完成按钮，第 {attempt}/{max_photo_attempts} 次重新随机选择照片：{format_point(*photo_point)}"
+            ),
+        )
+        click_image_point(robot, *photo_point)
+        time.sleep(0.5)
+        complete_image = capture_after_popups(robot, cfg, label=f"photo_complete_{attempt}", reporter=reporter)
+        complete_pos = _template_center(complete_image, cfg, COMPLETE_BUTTON, group="buttons")
+        if complete_pos is not None:
+            break
     if complete_pos is None:
-        raise StepUnavailable(f"选择照片后未找到完成按钮模板：{_template_failure_detail(cfg, COMPLETE_BUTTON, group='buttons')}")
+        raise StepUnavailable(
+            f"随机选择照片 {max_photo_attempts} 次后仍未找到完成按钮模板："
+            f"{_template_failure_detail(cfg, COMPLETE_BUTTON, group='buttons')}"
+        )
     _report(reporter, "photo_complete", "点击完成发送照片", log_label=f"点击完成发送照片：{format_point(*complete_pos)}")
     click_image_point(robot, *complete_pos)
     # “完成”即代表照片已提交；返回失败也必须保留冷却记录，避免重复发送。
