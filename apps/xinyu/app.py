@@ -158,8 +158,14 @@ class XinyuApp(BaseApp):
         self._reset_round_metrics()
         try:
             reporter = self.set_runtime_step
-            entry_image = self.capture_entry_image()
             reporter("popup_check", "检查并关闭弹窗")
+            # 启动首图也必须走完整弹窗处理，不能只写状态日志。
+            entry_image = steps.capture_after_popups(
+                self.robot,
+                self.config,
+                label="app_entry_popup_check",
+                reporter=reporter,
+            )
             target = self.call_step_with_optional_image(
                 steps.find_unread_target,
                 self.robot,

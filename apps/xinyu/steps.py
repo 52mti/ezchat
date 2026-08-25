@@ -1345,9 +1345,16 @@ def ensure_list_screen(
             f"启动界面未识别，第 {attempt}/{max_attempts} 轮尝试匹配返回按钮",
         )
         if not _click_back_once(robot, cfg, current_image, reporter=reporter):
-            raise StepUnavailable(
-                f"当前界面无法识别，且未找到返回按钮模板：{_template_failure_detail(cfg, BACK_BUTTON, group='buttons')}"
+            _report(
+                reporter,
+                "startup_recover",
+                "未知界面未找到返回按钮，等待下一轮截图，不执行设备复位",
+                log_label=(
+                    "未知界面未找到返回按钮，等待下一轮截图，不执行设备复位："
+                    f"{_template_failure_detail(cfg, BACK_BUTTON, group='buttons')}"
+                ),
             )
+            return None
         time.sleep(0.4)
         current_image = capture_after_popups(
             robot, cfg, label="after_unknown_back", reporter=reporter
