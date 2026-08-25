@@ -56,7 +56,11 @@ def test_xinyu_list_confirmation_wins_over_false_chat_template(monkeypatch):
     config = dict(DEFAULT_CONFIG)
     reports: list[str] = []
     monkeypatch.setattr(steps, "_matches_chat_list_screen", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(steps, "_matches_screen", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        steps,
+        "_matches_screen",
+        lambda _image, _config, key: key == steps.CHAT_WINDOW_SCREEN,
+    )
     monkeypatch.setattr(steps, "wait_for_call_screen_to_disappear", lambda _robot, _config, image, **_kwargs: image)
 
     image = steps.ensure_list_screen(
