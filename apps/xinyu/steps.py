@@ -1794,7 +1794,8 @@ def send_photo_to_online_target(
     _report(reporter, "photo_complete", "点击完成发送照片", log_label=f"点击完成发送照片：{format_point(*complete_pos)}")
     click_image_point(robot, *complete_pos)
     time.sleep(0.6)
-    go_back(robot, cfg, double_click_on_first_attempt=True, reporter=reporter)
+    # 主动发图后只需退出一次聊天；go_back 会截图确认是否已回到列表。
+    go_back(robot, cfg, double_click_on_first_attempt=False, reporter=reporter)
     _record_photo_sent_contact(cfg, target.get("name"))
     _report(
         reporter,
