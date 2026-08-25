@@ -52,7 +52,14 @@ class AutoGLMClient:
         self.config = config
         self.session = session or requests.Session()
 
-    def decide(self, task: str, screenshot: Any, *, history: list[str] | None = None) -> ModelDecision:
+    def decide(
+        self,
+        task: str,
+        screenshot: Any,
+        *,
+        history: list[str] | None = None,
+        system_prompt: str | None = None,
+    ) -> ModelDecision:
         instruction = f"当前原子任务：{task.strip()}"
         if history:
             instruction += "\n最近动作结果：\n" + "\n".join(history[-5:])
@@ -61,7 +68,7 @@ class AutoGLMClient:
             "max_tokens": self.config.max_tokens,
             "temperature": 0,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": [
