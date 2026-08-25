@@ -30,10 +30,13 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from apps.coordinates import click_image_point  # noqa: E402
 from apps.photo_capture import capture_transform_image  # noqa: E402
+from apps.xinyu import steps as xinyu_steps  # noqa: E402
+from apps.xinyu.config import DEFAULT_CONFIG as XINYU_DEFAULT_CONFIG  # noqa: E402
 from auto_glm.gpt_planner import GPTPlannerClient, GPTPlannerConfig  # noqa: E402
 from auto_glm.model import AutoGLMClient, AutoGLMConfig, AutoGLMProtocolError  # noqa: E402
 from auto_glm.planner import ExecutionPlan, PlanNode  # noqa: E402
 from lgb.lgb import RobotInterface  # noqa: E402
+from services.config_manager import ConfigManager  # noqa: E402
 
 
 AUTOGLM_EXECUTOR_PROMPT = """你是手机界面视觉执行智能体，可以根据连续操作历史和当前状态截图完成任务。
@@ -51,6 +54,8 @@ AUTOGLM_EXECUTOR_PROMPT = """你是手机界面视觉执行智能体，可以根
   仅在输入框已经被上一动作聚焦后输入文本。
 - do(action="Wait", duration="x")
   等待界面加载，x 为秒数。
+- do(action="Back")
+  返回上一层。执行器会在当前截图中匹配已配置的返回按钮模板后由机械臂点击。
 - finish(message="xxx")
   仅在当前节点目标已从截图中确认完成时使用。
 
@@ -60,7 +65,7 @@ AUTOGLM_EXECUTOR_PROMPT = """你是手机界面视觉执行智能体，可以根
 3. 点击前先确认目标在截图中可见；点击后先观察新截图是否生效。页面未变化时，可 Wait 一次，再根据新截图调整一次点击位置。
 4. 当前短目标已满足时必须输出 finish，不能继续重复点击。
 5. 目标不在可见区域时，使用 Swipe 探索；不要在同一位置重复无效点击。
-6. 不要输出 Back、Home、Take_over、Long Press、Double Tap、Note、Call_API 或解释性文本。需要返回时，在截图中定位可见返回或关闭控件，并使用 Tap。
+6. 不要输出 Home、Take_over、Long Press、Double Tap、Note、Call_API 或解释性文本。需要返回时优先输出 Back。
 7. <answer> 内必须包含 do(action=...) 或 finish(message=...)。"""
 
 
@@ -101,9 +106,12 @@ def main() -> int:
         plan = _plan(task, output_dir, log)
         robot = RobotInterface(args.device)
         model = AutoGLMClient(AutoGLMConfig.from_workspace(ROOT))
+        back_config = ConfigManager(ROOT / "config.json").get_app_config(
+            args.device, "xinyu", XINYU_DEFAULT_CONFIG
+        )
         history = [f"总体用户任务：{task}"]
         for index, node in enumerate(plan.nodes, start=1):
-            if not _run_node(robot, model, node, index, output_dir, log, history, args):
+            if not _run_node(robot, model, node, index, output_dir, log, history, args, back_config):
                 log.write("错误", f"节点 {node.id} 未完成，停止整个任务。失败策略：{node.on_failure}")
                 return 3
         log.write("信息", "全部 GPT 节点已由 AutoGLM 完成。请查看截图和每步 JSON 复盘。")
@@ -143,6 +151,7 @@ def _run_node(
     log: RollingLog,
     history: list[str],
     args: argparse.Namespace,
+    back_config: dict[str, Any],
 ) -> bool:
     log.write("信息", f"开始节点 {node.id}：{node.goal}")
     for action_index in range(1, max(1, args.max_actions_per_node) + 1):
@@ -180,7 +189,7 @@ def _run_node(
         if args.dry_run:
             log.write("信息", "诊断模式未执行模型动作，当前节点到此结束")
             return False
-        success, message = _execute(robot, action.name, action.arguments)
+        success, message = _execute(robot, action.name, action.arguments, image, back_config)
         log.write("信息" if success else "错误", message)
         if not success:
             return False
@@ -228,7 +237,13 @@ def _capture(robot: RobotInterface, output_dir: Path, name: str, log: RollingLog
     return image
 
 
-def _execute(robot: RobotInterface, name: str, arguments: dict[str, Any]) -> tuple[bool, str]:
+def _execute(
+    robot: RobotInterface,
+    name: str,
+    arguments: dict[str, Any],
+    screenshot: Image.Image,
+    back_config: dict[str, Any],
+) -> tuple[bool, str]:
     if name == "Tap":
         point = _point(arguments.get("element"))
         if point is None:
@@ -251,6 +266,12 @@ def _execute(robot: RobotInterface, name: str, arguments: dict[str, Any]) -> tup
         seconds = _wait_seconds(arguments.get("duration"))
         time.sleep(seconds)
         return True, f"已等待 {seconds:.1f} 秒"
+    if name == "Back":
+        point = xinyu_steps._template_center(screenshot, back_config, xinyu_steps.BACK_BUTTON, group="buttons")
+        if point is None:
+            return False, "Back 未找到返回按钮模板，未使用固定坐标点击"
+        click_image_point(robot, *point)
+        return True, f"Back 已通过返回按钮模板点击 {point}"
     return False, f"纯视觉测试器不支持模型动作：{name}"
 
 
