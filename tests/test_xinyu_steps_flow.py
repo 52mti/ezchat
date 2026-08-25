@@ -1784,6 +1784,30 @@ def test_xinyu_bottom_nav_coordinates_are_cached_once(monkeypatch, tmp_path):
     anchors = config["_runtime_cache"]["screen_anchors"]
     assert anchors["bottom_message"] == (0.72, 0.91)
     assert anchors["bottom_my"] == (0.88, 0.91)
+
+
+def test_xinyu_caches_all_five_bottom_navigation_positions(tmp_path):
+    config = _config(tmp_path)
+    ocr_result = {
+        "result": {
+            "bottom_nav": [
+                {"name": "缘分", "bounds": [0.02, 0.86, 0.14, 0.94]},
+                {"name": "动态", "bounds": [0.22, 0.86, 0.34, 0.94]},
+                {"name": "娱乐交友", "bounds": [0.42, 0.86, 0.58, 0.94]},
+                {"name": "消息", "bounds": [0.62, 0.86, 0.74, 0.94]},
+                {"name": "我的", "bounds": [0.82, 0.86, 0.94, 0.94]},
+            ]
+        }
+    }
+
+    steps._cache_bottom_nav_from_ocr_result(config, ocr_result)
+
+    anchors = config["_runtime_cache"]["screen_anchors"]
+    assert anchors["bottom_fate"] == pytest.approx((0.08, 0.9))
+    assert anchors["bottom_feed"] == pytest.approx((0.28, 0.9))
+    assert anchors["bottom_entertainment"] == pytest.approx((0.5, 0.9))
+    assert anchors["bottom_message"] == pytest.approx((0.68, 0.9))
+    assert anchors["bottom_my"] == pytest.approx((0.88, 0.9))
     assert robot.clicks == [pytest.approx((0.72, 0.91))]
 
 

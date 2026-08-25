@@ -895,14 +895,29 @@ def _cache_bottom_nav_from_ocr_result(config: dict[str, Any], ocr_result: dict[s
     bottom_nav = result.get("bottom_nav", []) if isinstance(result, dict) else []
     if not isinstance(bottom_nav, list) or not bottom_nav:
         return
-    message = _bottom_nav_item(bottom_nav, ("消息",), min_center_y=0.5)
+    bottom_nav_specs = (
+        ("bottom_fate", ("缘分",)),
+        ("bottom_feed", ("动态",)),
+        ("bottom_entertainment", ("娱乐交友", "娱乐", "交友")),
+        ("bottom_message", ("消息",)),
+        ("bottom_my", ("我的",)),
+    )
+    detected: dict[str, tuple[float, float]] = {}
+    for cache_key, keywords in bottom_nav_specs:
+        item = _bottom_nav_item(bottom_nav, keywords, min_center_y=0.5)
+        if item is None:
+            continue
+        detected[cache_key] = item[1]
+        _cache_point_once(config, "screen_anchors", cache_key, item[1])
+
+    message = detected.get("bottom_message")
     if message is not None:
-        _cache_point_once(config, "screen_anchors", "bottom_message", message[1])
-    my_item = _bottom_nav_item(bottom_nav, ("我的",), min_center_y=0.5)
-    if my_item is not None:
-        _cache_point_once(config, "screen_anchors", "bottom_my", my_item[1])
+        _cache_point_once(config, "screen_anchors", "bottom_message", message)
+    my_pos = detected.get("bottom_my")
+    if my_pos is not None:
+        _cache_point_once(config, "screen_anchors", "bottom_my", my_pos)
     elif message is not None:
-        message_x, message_y = message[1]
+        message_x, message_y = message
         _cache_point_once(config, "screen_anchors", "bottom_my", (min(0.98, message_x + 0.2), message_y))
     bounds_list = [
         item.get("bounds")
