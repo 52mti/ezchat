@@ -50,3 +50,19 @@ def test_xinyu_list_starts_after_detected_top_filter_strip():
 
     assert {item["name"] for item in result["bottom_nav"]} >= {"全部消息", "未回复", "在线", "距离", "亲密度"}
     assert [item["name"] for item in result["message_list"]] == ["薄荷"]
+
+
+def test_xinyu_list_confirmation_wins_over_false_chat_template(monkeypatch):
+    config = dict(DEFAULT_CONFIG)
+    reports: list[str] = []
+    monkeypatch.setattr(steps, "_matches_chat_list_screen", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(steps, "_matches_screen", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(steps, "wait_for_call_screen_to_disappear", lambda _robot, _config, image, **_kwargs: image)
+
+    image = steps.ensure_list_screen(
+        object(), config, image="list", reporter=lambda _step, label, log_label=None: reports.append(log_label or label)
+    )
+
+    assert image == "list"
+    assert "已确认聊天列表（第 1 轮）" in reports
+    assert "启动时在聊天界面，匹配返回按钮回到列表" not in reports

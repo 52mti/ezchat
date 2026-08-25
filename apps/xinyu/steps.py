@@ -1191,6 +1191,10 @@ def current_screen(image: Any, config: dict[str, Any]) -> str:
 
 
 def _is_chat_window_image(image: Any, config: dict[str, Any]) -> bool:
+    # The chat-window template can share bottom controls with the list page.
+    # Confirm the list title first so a false chat match cannot skip popup handling.
+    if _matches_chat_list_screen(image, config):
+        return False
     if _matches_screen(image, config, CHAT_WINDOW_SCREEN):
         return True
     return False
@@ -1353,6 +1357,12 @@ def ensure_list_screen(
         )
         _raise_if_black_screen(current_image, cfg)
 
+        # A list confirmation is stronger than a chat-window template match: the
+        # latter may falsely match a shared bottom control on the list screen.
+        if _matches_chat_list_screen(current_image, cfg, reporter=reporter):
+            _report(reporter, "startup_recover", f"已确认聊天列表（第 {attempt} 轮）")
+            return current_image
+
         # Chat pages must proceed normally; popup matching is skipped there.
         is_chat = _matches_screen(current_image, cfg, CHAT_WINDOW_SCREEN)
         if not is_chat:
@@ -1363,6 +1373,9 @@ def ensure_list_screen(
                 reporter=reporter,
             )
             _raise_if_black_screen(current_image, cfg)
+            if _matches_chat_list_screen(current_image, cfg, reporter=reporter):
+                _report(reporter, "startup_recover", f"已确认聊天列表（第 {attempt} 轮）")
+                return current_image
             is_chat = _matches_screen(current_image, cfg, CHAT_WINDOW_SCREEN)
 
         if is_chat:
@@ -1384,11 +1397,6 @@ def ensure_list_screen(
             read_my_points(robot, cfg, reporter=reporter, image=current_image, assume_my=True)
             current_image = _capture_image(robot, cfg, pre_move=True, label="after_message_button")
             continue
-
-        if _matches_chat_list_screen(current_image, cfg, reporter=reporter):
-            _raise_if_black_screen(current_image, cfg)
-            _report(reporter, "startup_recover", f"已确认聊天列表（第 {attempt} 轮）")
-            return current_image
 
         last_state = "unknown"
         _report(
