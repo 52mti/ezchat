@@ -51,7 +51,7 @@ AUTOGLM_EXECUTOR_PROMPT = """你是手机界面视觉执行智能体，可以根
 - do(action="Swipe", start=[x1,y1], end=[x2,y2])
   从起点滑动至终点；坐标同样为 0 到 999。
 - do(action="Type", text="xxx")
-  仅在输入框已经被上一动作聚焦后输入文本。
+  仅在输入框已经被上一动作聚焦后输入文本。执行器会先模板匹配并点击麦克风，再通过扬声器播放文字。
 - do(action="Wait", duration="x")
   等待界面加载，x 为秒数。
 - do(action="Back")
@@ -203,7 +203,7 @@ def _run_node(
         if args.dry_run:
             log.write("信息", "诊断模式未执行模型动作，当前节点到此结束")
             return "failed"
-        success, message = _execute(robot, action.name, action.arguments, image, back_config)
+        success, message = _execute(robot, action.name, action.arguments, image, back_config, log)
         log.write("信息" if success else "错误", message)
         if not success:
             return "failed"
@@ -258,7 +258,19 @@ def _node_visual_references(node: PlanNode) -> list[tuple[str, Image.Image]]:
         path = button_dir / "btn_照片按钮.jpg"
         if path.is_file():
             references.append(("心遇照片/相册按钮", Image.open(path).convert("RGB")))
-    if any(keyword in text for keyword in ("确认", "完成", "发送已选", "发送照片")):
+    # “完成”“发送照片”等词可能出现在整个任务的描述或后续步骤中，不能据此
+    # 给当前节点塞入完成按钮参考图。只有当前节点明确要求确认已选照片/发送
+    # 已选内容时，才提供该参考图，避免模型把相机或其他入口误认为发送按钮。
+    complete_button_terms = (
+        "确认选择",
+        "确认照片",
+        "确认发送",
+        "完成发送",
+        "点击完成",
+        "发送已选",
+        "点击发送",
+    )
+    if any(keyword in text for keyword in complete_button_terms):
         path = button_dir / "btn_完成按钮.jpg"
         if path.is_file():
             references.append(("心遇完成发送按钮", Image.open(path).convert("RGB")))
@@ -282,6 +294,7 @@ def _execute(
     arguments: dict[str, Any],
     screenshot: Image.Image,
     back_config: dict[str, Any],
+    log: RollingLog,
 ) -> tuple[bool, str]:
     if name == "Tap":
         point = _point(arguments.get("element"))
@@ -295,12 +308,19 @@ def _execute(
             return False, "Swipe 动作没有有效起止坐标"
         robot.swipe(*start, *end, wait=True)
         return True, f"已执行模型滑动 {start} -> {end}"
-    if name == "Type":
+    if name in {"Type", "Type_Name"}:
         text = str(arguments.get("text", "")).strip()
-        if not text or not hasattr(robot, "play_audio"):
-            return False, "Type 动作缺少文本或机械臂不支持语音输入"
-        robot.play_audio(text, wait=True)
-        return True, "已通过机械臂语音输入执行 Type"
+        if not text:
+            return False, "Type 动作缺少要输入的文字"
+
+        def report_voice_input(step: str, label: str, *, log_label: str | None = None) -> None:
+            log.write("信息", f"AutoGLM 语音输入：{log_label or label}")
+
+        try:
+            xinyu_steps.play_voice_reply(robot, text, back_config, reporter=report_voice_input)
+        except Exception as error:
+            return False, f"Type 语音输入失败：{error}"
+        return True, f"已通过麦克风模板匹配和 TTS 输入 {name}"
     if name == "Wait":
         seconds = _wait_seconds(arguments.get("duration"))
         time.sleep(seconds)
