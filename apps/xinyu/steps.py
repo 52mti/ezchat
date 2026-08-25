@@ -893,6 +893,36 @@ def _bottom_nav_item(
     return None
 
 
+def _unread_tab_item(ocr_result: dict[str, Any]) -> tuple[dict[str, Any], tuple[float, float]] | None:
+    """Locate the top "未回复" filter when a banner pushes it below the normal OCR nav band."""
+    result = ocr_result.get("result", {}) if isinstance(ocr_result, dict) else {}
+    bottom_nav = result.get("bottom_nav", []) if isinstance(result, dict) else []
+    if isinstance(bottom_nav, list):
+        item = _bottom_nav_item(bottom_nav, UNREAD_TAB_KEYWORDS)
+        if item is not None:
+            return item
+
+    raw_items = ocr_result.get("ocr_items", []) if isinstance(ocr_result, dict) else []
+    for raw_item in raw_items if isinstance(raw_items, list) else []:
+        if not isinstance(raw_item, dict):
+            continue
+        text = str(raw_item.get("text", "") or "")
+        if not any(keyword in text for keyword in UNREAD_TAB_KEYWORDS):
+            continue
+        try:
+            left = float(raw_item["x"])
+            top = float(raw_item["y"])
+            width = float(raw_item["w"])
+            height = float(raw_item["h"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        bounds = [left, top, left + width, top + height]
+        center = _center_from_bounds(bounds)
+        if 0.08 <= center[1] <= 0.35:
+            return {"name": text, "bounds": bounds}, center
+    return None
+
+
 def _cache_bottom_nav_from_ocr_result(config: dict[str, Any], ocr_result: dict[str, Any]) -> None:
     if not _optimization_enabled(config, "enable_bottom_nav_anchor_reuse"):
         return
@@ -1399,8 +1429,7 @@ def check_unread_button(
     current_image = image if image is not None else capture_after_popups(robot, cfg, label="unread_button", reporter=reporter)
     if ocr_result is None:
         ocr_result = _run_list_ocr(current_image, cfg, reporter=reporter)
-    bottom_nav = ocr_result["result"].get("bottom_nav", [])
-    unread_item = _bottom_nav_item(bottom_nav, UNREAD_TAB_KEYWORDS)
+    unread_item = _unread_tab_item(ocr_result)
     if unread_item is None:
         _mark_unread_tab_red_state(ocr_result, False)
         return current_image, ocr_result
@@ -1435,8 +1464,7 @@ def check_unread_button(
     current_image = capture_after_popups(robot, cfg, label="after_unread_button", reporter=reporter)
     ocr_result = _run_list_ocr(current_image, cfg, reporter=reporter, prefer_compact=True)
     unread_target = _select_list_target_from_ocr_result(ocr_result, require_unread=True)
-    bottom_nav = ocr_result["result"].get("bottom_nav", [])
-    unread_item = _bottom_nav_item(bottom_nav, UNREAD_TAB_KEYWORDS)
+    unread_item = _unread_tab_item(ocr_result)
     if unread_item is None:
         if unread_target is not None:
             _mark_unread_tab_red_state(ocr_result, True)
