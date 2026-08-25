@@ -24,6 +24,7 @@ DEFAULT_CONFIG = {
         "buttons": "apps/xinyu/templates/buttons",
         "screens": "apps/xinyu/templates/screens",
     },
+    "template_description_config": "apps/xinyu/template_descriptions.json",
     "match_threshold": 0.7,
     "popup_match_threshold": 0.8,
     "enable_enhanced_template_match": True,

@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "model_observation_policy": {
+    "reference_image_required": true,
+    "observation_only": true,
+    "output_coordinate_space": "crop_3x3_grid",
+    "must_stay_within_configured_match_region": true,
+    "local_pixel_recheck_required": true,
+    "auto_click_from_model_output": false
+  },
+  "templates": {
+    "button.photo": {
+      "reference_template": "btn_照片按钮.jpg",
+      "label": "照片按钮",
+      "description": "浅蓝灰色圆角方形相册图标，内部有深灰色山峰和圆形太阳。点击后打开系统或应用内照片选择界面。",
+      "visual_features": ["圆角方形", "相册", "山峰", "圆形太阳", "浅蓝灰底色"],
+      "exclude": ["输入框", "麦克风", "底部导航", "普通图片缩略图", "发送按钮"],
+      "fallback": {"enabled": true, "weak_match_threshold": 0.52, "max_calls_per_image": 1}
+    },
+    "button.complete": {
+      "reference_template": "btn_完成按钮.jpg",
+      "label": "完成按钮",
+      "description": "照片选择界面顶部的完成确认控件，用于提交已选照片。",
+      "visual_features": ["完成文字或确认控件", "顶部操作区"],
+      "exclude": ["取消", "返回", "相册缩略图"],
+      "fallback": {"enabled": true, "weak_match_threshold": 0.56, "max_calls_per_image": 1}
+    },
+    "button.back": {
+      "reference_template": "btn_返回按钮.jpg",
+      "label": "返回按钮",
+      "description": "页面中的返回控件，视觉上通常是左箭头或返回图标，用于退出当前聊天或子页面。",
+      "visual_features": ["左箭头", "返回图标", "页面导航控件"],
+      "exclude": ["安卓系统返回键", "底部导航", "关闭弹窗按钮"],
+      "fallback": {"enabled": true, "weak_match_threshold": 0.55, "max_calls_per_image": 1}
+    },
+    "button.input_box": {
+      "reference_template": "btn_输入框.jpg",
+      "label": "输入框",
+      "description": "聊天界面底部用于输入文字的长条输入区域。",
+      "visual_features": ["长条圆角输入区域", "聊天底部", "文本输入位置"],
+      "exclude": ["消息气泡", "搜索框", "底部导航"],
+      "fallback": {"enabled": true, "weak_match_threshold": 0.56, "max_calls_per_image": 1}
+    },
+    "button.microphone": {
+      "reference_template": "btn_麦克风按钮.jpg",
+      "label": "麦克风按钮",
+      "description": "聊天输入区域附近的麦克风图标，点击后切换或进入语音输入。",
+      "visual_features": ["麦克风图标", "聊天输入区", "小型操作按钮"],
+      "exclude": ["扬声器", "相册", "表情", "发送按钮"],
+      "fallback": {"enabled": true, "weak_match_threshold": 0.54, "max_calls_per_image": 1}
+    },
+    "button.send": {
+      "reference_template": "btn_发送按钮.jpg",
+      "label": "发送按钮",
+      "description": "聊天输入区域中用于发送当前语音或文本内容的确认按钮。",
+      "visual_features": ["发送", "确认", "聊天输入区右侧"],
+      "exclude": ["完成", "返回", "底部导航"],
+      "fallback": {"enabled": true, "weak_match_threshold": 0.56, "max_calls_per_image": 1}
+    },
+    "screen.chat_list": {
+      "reference_template": "screen_聊天列表.jpg",
+      "label": "聊天列表界面",
+      "description": "心遇消息页，顶部有消息和通话入口，列表筛选包含全部消息、未回复、在线、距离，底部有五个导航项。",
+      "visual_features": ["消息", "通话", "未回复", "聊天列表", "底部五导航"],
+      "exclude": ["单个聊天详情页", "我的页面", "通话页面"],
+      "fallback": {"enabled": true, "weak_match_threshold": 0.58, "max_calls_per_image": 1}
+    },
+    "screen.chat_window": {
+      "reference_template": "screen_聊天界面.jpg",
+      "label": "聊天界面",
+      "description": "与单个用户的聊天详情页，包含消息气泡和底部聊天输入区域。",
+      "visual_features": ["消息气泡", "聊天输入框", "单个联系人对话"],
+      "exclude": ["聊天列表", "我的页面", "照片选择页"],
+      "fallback": {"enabled": true, "weak_match_threshold": 0.58, "max_calls_per_image": 1}
+    }
+  }
+}
