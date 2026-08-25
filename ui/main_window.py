@@ -3884,18 +3884,6 @@ class DeviceSettingsDialogInteractive(QDialog):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents if column != 2 else QHeaderView.ResizeMode.Stretch)
         control_layout.addWidget(self.template_match_table)
 
-        self.photo_sent_cooldown_seconds: QSpinBox | None = None
-        if self.app_name == "xinyu":
-            photo_form = QFormLayout()
-            photo_form.setContentsMargins(0, 0, 0, 0)
-            photo_form.setSpacing(8)
-            self.photo_sent_cooldown_seconds = QSpinBox()
-            self.photo_sent_cooldown_seconds.setRange(0, 2592000)
-            self.photo_sent_cooldown_seconds.setValue(int(self.overrides.get("photo_sent_cooldown_seconds", 86400) or 0))
-            self.photo_sent_cooldown_seconds.setToolTip("发送成功后，同一用户在此时间内不会再次收到主动照片。0 表示不限制。")
-            photo_form.addRow("同一用户发图冷却（秒，0不限制）", self.photo_sent_cooldown_seconds)
-            control_layout.addLayout(photo_form)
-
         field_specs = self._field_specs()
         if field_specs:
             target_form = QFormLayout()
@@ -4019,27 +4007,56 @@ class DeviceSettingsDialogInteractive(QDialog):
         self._update_click_labels()
 
     def _detect_saved_templates(self, image: Image.Image) -> None:
-        """Probe saved templates only; this view never performs a click."""
+        """检测当前设备当前 App 的模板，只展示结果，不执行点击。"""
         rows: list[tuple[str, str, str, str]] = []
-        config = self.overrides
-        threshold = float(config.get("match_threshold", 0.7) or 0.7)
+        points: list[tuple[float, float]] = []
+        config = _deep_merge(_app_default_config(self.app_name), self.overrides)
+        groups: list[tuple[str, str, list[Path], bool]] = []
         for rule in fixed_template_rules():
-            path = template_path(config, rule.key)
-            if path is None:
+            root = Path(config.get("templates", {}).get(rule.group, ""))
+            paths = back_button_template_paths(config) if rule.key == BACK_BUTTON else template_variant_paths(root, rule.filename)
+            if paths:
+                groups.append((rule.key, rule.label, paths, False))
+        screens_root = Path(config.get("templates", {}).get("screens", ""))
+        for key, label, filename in (("screen.no_phone", "无手机界面", "screen_无手机界面.jpg"), ("screen.black_screen", "黑屏界面", "screen_黑屏异常.jpg"), ("screen.call_window", "通话界面", "screen_通话界面.jpg")):
+            paths = template_variant_paths(screens_root, filename)
+            if paths:
+                groups.append((key, label, paths, False))
+        regions = config.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY, {})
+        buttons_root = Path(config.get("templates", {}).get("buttons", ""))
+        if isinstance(regions, dict):
+            for key in sorted(str(item) for item in regions if str(item).startswith("button.custom.")):
+                name = key[len("button.custom."):].strip()
+                filenames = [f"btn_{name}.jpg"]
+                if name == "相册":
+                    filenames.append("btn_照片按钮.jpg")
+                paths = [p for filename in filenames for p in template_variant_paths(buttons_root, filename)]
+                if paths:
+                    groups.append((key, f"自定义按钮 / {name}", paths, False))
+        for path in popup_template_paths(config):
+            groups.append((popup_template_region_key(path), f"弹窗 / {path.name}", [path], True))
+
+        for key, label, paths, is_popup in groups:
+            thresholds = config.get("template_match_thresholds", {})
+            threshold = float(config.get("popup_match_threshold", 0.8) if is_popup else config.get("match_threshold", 0.7))
+            if isinstance(thresholds, dict) and key in thresholds:
+                threshold = float(thresholds[key])
+            global_key = key in {"screen.no_phone", "screen.black_screen"}
+            region = None if global_key else template_match_region(config, key)
+            if region is None and not global_key:
+                rows.append((label, "未设置范围", "-", f"- / {threshold:.2f}"))
                 continue
             try:
-                result = match_template_with_region(image, path, config, rule.key, threshold=threshold, match_func=match)
-            except Exception:
+                result = match_template_candidates_with_region(image, paths, config, key, threshold=threshold, match_func=match, single_match_func=match_template_with_region)
+            except TemplateMatchRegionMissingError:
                 result = None
-            score = float(result.get("score", 0.0)) if result else 0.0
-            rows.append((rule.label, "命中" if result else "未命中", path.name if result else "-", f"{score:.3f} / {threshold:.2f}"))
-        for path in back_button_template_paths(config):
-            try:
-                result = match_template_with_region(image, path, config, BACK_BUTTON, threshold=threshold, match_func=match)
-            except Exception:
-                result = None
-            score = float(result.get("score", 0.0)) if result else 0.0
-            rows.append(("返回按钮", "命中" if result else "未命中", path.name if result else "-", f"{score:.3f} / {threshold:.2f}"))
+            if result:
+                x = float(result["x"]) + float(result["w"]) / 2
+                y = float(result["y"]) + float(result["h"]) / 2
+                points.append((x, y))
+                rows.append((label, "命中", str(result.get("_template_name") or paths[0].name), f"{float(result.get('score', 0.0)):.3f} / {threshold:.2f}"))
+            else:
+                rows.append((label, "未命中", "-", f"- / {threshold:.2f}"))
         self.template_match_table.setRowCount(len(rows))
         hit_count = 0
         for row, values in enumerate(rows):
@@ -4050,6 +4067,7 @@ class DeviceSettingsDialogInteractive(QDialog):
                 self.template_match_table.setItem(row, column, item)
             hit_count += values[1] == "命中"
         self.template_match_summary.setText(f"模板检测完成：{hit_count}/{len(rows)} 类已命中。这里只显示结果，不会执行点击。")
+        self.crop_label.set_match_points(points)
 
     def _save_current_screenshot_to_error_path(self) -> None:
         if self.current_screenshot is None:
@@ -4145,8 +4163,6 @@ class DeviceSettingsDialogInteractive(QDialog):
         for field_key, (x_spin, y_spin) in self.offset_spin_boxes.items():
             values[f"{field_key}_click_x_offset"] = x_spin.value()
             values[f"{field_key}_click_y_offset"] = y_spin.value()
-        if self.photo_sent_cooldown_seconds is not None:
-            values["photo_sent_cooldown_seconds"] = self.photo_sent_cooldown_seconds.value()
         return values
 
 
