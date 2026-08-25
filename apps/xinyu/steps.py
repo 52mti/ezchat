@@ -1964,6 +1964,23 @@ def _dialogue_message_region(image: Any, config: dict[str, Any]) -> list[float] 
     return region
 
 
+def read_dialogue_continuity(image: Any, config: dict[str, Any] | None = None) -> dict[str, list[str]]:
+    """Read visible dialogue bubbles solely for conversation-memory matching."""
+    cfg = _config(config)
+    ocr_result = _run_ocr_mode(image, cfg, "dialogue", region=None)
+    dialogue_result = ocr_result.get("result", {})
+    dialogues = dialogue_result.get("dialogues", []) if isinstance(dialogue_result, dict) else []
+    result: dict[str, list[str]] = {"sender1": [], "sender2": []}
+    for item in dialogues if isinstance(dialogues, list) else []:
+        if not isinstance(item, dict):
+            continue
+        sender = str(item.get("sender", ""))
+        content = str(item.get("content", "")).strip()
+        if sender in result and content:
+            result[sender].append(content)
+    return {sender: contents[-3:] for sender, contents in result.items()}
+
+
 def _extract_message_from_dialogue_ocr(
     ocr_result: dict[str, Any],
     config: dict[str, Any],
@@ -1974,7 +1991,8 @@ def _extract_message_from_dialogue_ocr(
     if not isinstance(dialogue_result, dict):
         dialogue_result = {}
     dialogues = dialogue_result.get("dialogues", [])
-    dialogue_rules = config["ocr_modes"]["dialogue"]["rules"]
+    dialogue_mode = config.get("ocr_modes", {}).get("dialogue", {})
+    dialogue_rules = dialogue_mode.get("rules", {}) if isinstance(dialogue_mode, dict) else {}
     target_sender = str(dialogue_rules.get("target_sender", "sender1"))
     trailing_target_messages: list[str] = []
     for item in reversed(dialogues if isinstance(dialogues, list) else []):
@@ -1993,6 +2011,14 @@ def _extract_message_from_dialogue_ocr(
     first_text = str(items[0].get("text", "")) if items and isinstance(items[0], dict) else ""
     contact = fallback_contact or str(dialogue_result.get("user_name") or first_text)
     content = "".join(reversed(trailing_target_messages))
+    continuity: dict[str, list[str]] = {"sender1": [], "sender2": []}
+    for item in dialogues if isinstance(dialogues, list) else []:
+        if not isinstance(item, dict):
+            continue
+        sender = str(item.get("sender", ""))
+        dialogue_content = str(item.get("content", "")).strip()
+        if sender in continuity and dialogue_content:
+            continuity[sender].append(dialogue_content)
     return {
         "user": contact,
         "contact": contact,
@@ -2001,6 +2027,7 @@ def _extract_message_from_dialogue_ocr(
         "message_time": "",
         "unread_count": str(target.get("unread_count", "")) if isinstance(target, dict) else "",
         "favorability": str(target.get("favorability", "")) if isinstance(target, dict) else "",
+        "continuity": {sender: values[-3:] for sender, values in continuity.items()},
     }, bool(content)
 
 

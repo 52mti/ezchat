@@ -4,12 +4,12 @@ from datetime import datetime
 from typing import Any, Callable
 
 from apps.base import ReplyAction
-from apps.defaults import with_app_defaults
-
 from .ai_client import AIClient
-from .config_manager import ConfigManager, _deep_merge
+from .chat_history_store import ChatHistoryStore
+from .config_manager import ConfigManager
 from .memory_store import MemoryStore
 from .message_state import build_message_fingerprint, contact_key, find_outbox_entry
+from .persona import resolve_persona
 
 
 class MessageProcessor:
@@ -21,6 +21,7 @@ class MessageProcessor:
         config_manager: ConfigManager,
         ai_client: AIClient,
         memory_store: MemoryStore,
+        chat_history_store: ChatHistoryStore | None = None,
         logger: Callable[[str, str, dict[str, Any] | None], None] | None = None,
     ) -> None:
         self.device = device
@@ -28,6 +29,7 @@ class MessageProcessor:
         self.config_manager = config_manager
         self.ai_client = ai_client
         self.memory_store = memory_store
+        self.chat_history_store = chat_history_store
         self.logger = logger
 
     @property
@@ -39,23 +41,22 @@ class MessageProcessor:
             self.logger(level, message, payload)
 
     def _persona_for(self, contact_name: str) -> dict[str, Any]:
-        global_persona = self.config_manager.get("global", "persona", default={})
-        device = self.config_manager.find_device(self.device_ip) or self.device
-        app_overrides = device.get("app_overrides", {})
-        app_override = app_overrides.get(self.app_name, {}) if isinstance(app_overrides, dict) else {}
-        app_persona = app_override.get("persona", {}) if isinstance(app_override, dict) else {}
-        app_persona = with_app_defaults({"persona": app_persona if isinstance(app_persona, dict) else {}})["persona"]
-        device_persona = device.get("persona", {})
-        device_persona = device_persona if isinstance(device_persona, dict) else {}
-        contact_personas = device.get("contact_personas", {})
-        contact_persona = {}
-        if isinstance(contact_personas, dict):
-            contact_persona = contact_personas.get(contact_name, {}) or {}
-        persona = _deep_merge(global_persona if isinstance(global_persona, dict) else {}, device_persona)
-        persona = _deep_merge(persona, app_persona)
-        return _deep_merge(persona, contact_persona if isinstance(contact_persona, dict) else {})
+        return resolve_persona(
+            self.config_manager,
+            self.device_ip,
+            self.app_name,
+            contact_name,
+            device=self.device,
+        )
 
-    def prepare_reply(self, message: dict[str, str]) -> ReplyAction:
+    def needs_continuity_context(self, message: dict[str, Any]) -> bool:
+        contact = str(message.get("contact") or message.get("user") or "")
+        if not contact:
+            return False
+        persona = self._persona_for(contact)
+        return not bool(self.memory_store.get_conversation_id(self.device_ip, self.app_name, contact, persona))
+
+    def prepare_reply(self, message: dict[str, Any]) -> ReplyAction:
         contact = message.get("contact") or message.get("user") or ""
         content = message.get("content", "")
         message_time = message.get("message_time", "")
@@ -96,6 +97,23 @@ class MessageProcessor:
                 "memory hit" if conversation_id else "memory miss",
                 {"contact": contact, "conversation_id": conversation_id},
             )
+        if not conversation_id:
+            continuity = message.get("continuity", {})
+            if isinstance(continuity, dict):
+                try:
+                    matched = self.memory_store.find_continuity_match(
+                        self.device_ip,
+                        self.app_name,
+                        persona,
+                        sender1_messages=continuity.get("sender1"),
+                        sender2_messages=continuity.get("sender2"),
+                    )
+                except Exception as exc:
+                    self._log("warning", "近期消息连续性匹配失败", {"contact": contact, "error": str(exc)})
+                else:
+                    if matched:
+                        conversation_id = str(matched["conversation_id"])
+                        self._log("info", "近期消息连续性命中，复用会话记忆", {"contact": contact, **matched})
         reply = self.ai_client.chat(content, persona, apikey, conversation_id=conversation_id)
         final_conversation_id = reply.conversation_id or conversation_id
         if final_conversation_id:
@@ -134,6 +152,7 @@ class MessageProcessor:
         if not action.message_fingerprint or action.skip:
             return
         contact = message.get("contact") or message.get("user") or ""
+        outbox_entry = find_outbox_entry(self.config_manager.load_outbox(), action.message_fingerprint) or {}
         self.config_manager.save_outbox_entry(
             {
                 "message_fingerprint": action.message_fingerprint,
@@ -144,3 +163,25 @@ class MessageProcessor:
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
         )
+        if self.chat_history_store is None:
+            return
+        try:
+            persona = self._persona_for(contact)
+            self.chat_history_store.append_exchange(
+                device_ip=self.device_ip,
+                app_name=self.app_name,
+                contact_name=contact,
+                persona=persona,
+                incoming_text=message.get("content", ""),
+                outgoing_text=action.text,
+                message_fingerprint=action.message_fingerprint,
+                conversation_id=str(outbox_entry.get("conversation_id", "") or ""),
+                source=str(message.get("source", "") or ""),
+                reason=action.reason,
+                metadata={
+                    "message_time": message.get("message_time", ""),
+                    "unread_count": message.get("unread_count", ""),
+                },
+            )
+        except Exception as exc:
+            self._log("warning", "chat history update failed", {"contact": contact, "error": str(exc)})

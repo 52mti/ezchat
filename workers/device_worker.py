@@ -100,12 +100,13 @@ class DeviceWorker(threading.Thread):
             logger=self._emit,
         )
         app_cls = app_registry[app_name]
-        self.app = app_cls(
-            self.robot,
-            self.app_config,
-            reply_provider=self.message_processor.prepare_reply,
-            sent_callback=self.message_processor.mark_sent,
-        )
+        app_kwargs: dict[str, Any] = {
+            "reply_provider": self.message_processor.prepare_reply,
+            "sent_callback": self.message_processor.mark_sent,
+        }
+        if app_name == "xinyu":
+            app_kwargs["continuity_required_provider"] = self.message_processor.needs_continuity_context
+        self.app = app_cls(self.robot, self.app_config, **app_kwargs)
         if hasattr(self.app, "set_status_callback"):
             self.app.set_status_callback(self._emit_app_status)
         if hasattr(self.app, "set_log_callback"):

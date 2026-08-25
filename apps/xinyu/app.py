@@ -34,12 +34,14 @@ class XinyuApp(BaseApp):
         config: dict[str, Any] | None = None,
         reply_provider: Callable[[dict[str, str]], str | ReplyAction] | None = None,
         sent_callback: Callable[[ReplyAction, dict[str, str]], None] | None = None,
+        continuity_required_provider: Callable[[dict[str, Any]], bool] | None = None,
     ) -> None:
         merged_config = _deep_merge(DEFAULT_CONFIG, config or {})
         steps._disable_dialogue_region_filter(merged_config)
         super().__init__(robot, merged_config)
         self.reply_provider = reply_provider or (lambda message: "")
         self.sent_callback = sent_callback
+        self.continuity_required_provider = continuity_required_provider
         self.last_activity_at = time.monotonic()
         self.idle_points_checked = False
         self.idle_online_photo_attempted = False
@@ -274,6 +276,16 @@ class XinyuApp(BaseApp):
                 )
             else:
                 message = steps.read_message(self.robot, self.config, target, image=chat_image, reporter=reporter)
+
+            if use_list_content and self.continuity_required_provider:
+                try:
+                    needs_continuity = self.continuity_required_provider(message)
+                except Exception as exc:
+                    self.emit_runtime_log("warning", "检查聊天记忆失败，跳过连续性匹配", {"error": str(exc)})
+                    needs_continuity = False
+                if needs_continuity:
+                    reporter("dialogue_continuity_read", "昵称未命中，读取近期消息确认会话")
+                    message["continuity"] = steps.read_dialogue_continuity(chat_image, self.config)
 
             self.emit_runtime_log(
                 "info",
