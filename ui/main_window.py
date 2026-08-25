@@ -12,13 +12,15 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
+from collections import deque
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import requests
 from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, QUrl
-from PyQt6.QtGui import QColor, QDesktopServices, QFont, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtGui import QColor, QDesktopServices, QFont, QImage, QPainter, QPen, QPixmap, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QAbstractItemView,
@@ -41,6 +43,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressDialog,
+    QPlainTextEdit,
     QRubberBand,
     QScrollArea,
     QSpinBox,
@@ -75,11 +78,15 @@ from apps.visual_assets import (
     import_target_path,
     is_back_button_template_name,
     is_popup_template_name,
+    match_template_with_region,
     popup_template_region_key,
     template_variant_paths,
+    template_path,
 )
+from vision import match
 from lgb.lgb import RobotInterface, scan_devices
 from services import (
+    ChatHistoryStore,
     ConfigManager,
     LicenseClient,
     ReleaseDecision,
@@ -89,6 +96,8 @@ from services import (
     resolve_lanzou_update_package,
     resolve_release_decision,
 )
+from services.persona import resolve_persona
+from ui.chat_history_window import ChatHistoryDialog
 from vision.screen import ensure_portrait_image
 from workers import DeviceWorker, WorkerEvent
 
@@ -346,7 +355,7 @@ QHeaderView::section {
   padding: 8px;
   font-weight: 600;
 }
-QTextEdit {
+QTextEdit, QPlainTextEdit {
   background: #0f172a;
   color: #e2e8f0;
   border: 1px solid #1e293b;
@@ -407,6 +416,13 @@ BALANCE_COLUMN_WIDTH = 86
 
 STATUS_COORDINATE_RE = re.compile(r"\s*[：:,-]?\s*\(?\s*-?\d+(?:\.\d+)?\s*[,，]\s*-?\d+(?:\.\d+)?\s*\)?\s*$")
 UPDATE_DOWNLOAD_CHUNK_SIZE = 1024 * 256
+LOG_EVENT_LIMIT = 5000
+LOG_RENDER_LIMIT = 1000
+RENDERED_LOG_BLOCK_LIMIT = 1200
+UI_EVENT_DRAIN_LIMIT = 120
+UI_EVENT_DRAIN_SECONDS = 0.02
+UPDATE_EVENT_DRAIN_LIMIT = 50
+UNATTENDED_REFRESH_SECONDS = 1.0
 
 
 def mask_secret(value: str) -> str:
@@ -482,8 +498,8 @@ class MainWindow(QMainWindow):
         self.events: "queue.Queue[WorkerEvent]" = queue.Queue()
         self.update_events: "queue.Queue[tuple[str, dict[str, Any]]]" = queue.Queue()
         self.workers: dict[str, DeviceWorker] = {}
-        self.log_events: list[WorkerEvent] = []
-        self.log_event_times: dict[int, str] = {}
+        self.log_events: "deque[tuple[str, str]]" = deque(maxlen=LOG_EVENT_LIMIT)
+        self._last_unattended_refresh_at = 0.0
         self.unattended_started_at: dict[str, float] = {}
         self.unattended_elapsed_seconds: dict[str, float] = {}
         self._update_check_in_progress = False
@@ -605,20 +621,15 @@ class MainWindow(QMainWindow):
         self.batch_start_button = self._button("启动选中", "primary")
         self.batch_start_button.clicked.connect(lambda: self._run_for_checked_rows(self._start_worker))
         action_bar.addWidget(self.batch_start_button)
-        self.batch_pause_button = self._button("暂停选中")
-        self.batch_pause_button.clicked.connect(lambda: self._run_for_checked_rows(self._pause_worker))
-        action_bar.addWidget(self.batch_pause_button)
-        self.batch_resume_button = self._button("恢复选中")
-        self.batch_resume_button.clicked.connect(lambda: self._run_for_checked_rows(self._resume_worker))
-        action_bar.addWidget(self.batch_resume_button)
         self.batch_stop_button = self._button("停止选中", "danger")
         self.batch_stop_button.clicked.connect(lambda: self._run_for_checked_rows(self._stop_worker))
         action_bar.addWidget(self.batch_stop_button)
         action_bar.addStretch(1)
         layout.addWidget(action_panel)
 
-        self.logs = QTextEdit()
+        self.logs = QPlainTextEdit()
         self.logs.setReadOnly(True)
+        self.logs.setMaximumBlockCount(RENDERED_LOG_BLOCK_LIMIT)
         self.logs.setMaximumHeight(180)
         self.logs.setVisible(False)
         layout.addWidget(self.logs)
@@ -803,6 +814,8 @@ class MainWindow(QMainWindow):
                                     {"downloaded": downloaded, "total": total},
                                 )
                             )
+                if not zipfile.is_zipfile(target_path):
+                    raise UpdateSourceError("下载到的更新包不是有效的 zip 文件。")
             self.update_events.put(
                 (
                     "download_complete",
@@ -837,16 +850,7 @@ class MainWindow(QMainWindow):
         if not updater.is_file():
             QMessageBox.critical(self, "更新失败", f"缺少更新脚本：{updater}")
             return
-        command = [
-            sys.executable,
-            str(updater),
-            "--package-root",
-            str(root),
-            "--archive",
-            str(archive_path),
-            "--pid",
-            str(os.getpid()),
-        ]
+        command = self._update_apply_command(root=root, updater=updater, archive_path=archive_path)
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         try:
             subprocess.Popen(command, cwd=root, creationflags=creationflags)
@@ -854,6 +858,211 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "更新失败", f"无法启动更新程序：{exc}")
             return
         QApplication.instance().quit()
+
+    def _update_apply_command(self, *, root: Path, updater: Path, archive_path: str) -> list[str]:
+        if os.name != "nt":
+            return [
+                sys.executable,
+                str(updater),
+                "--package-root",
+                str(root),
+                "--archive",
+                str(archive_path),
+                "--pid",
+                str(os.getpid()),
+            ]
+
+        script_path = self._write_windows_update_script()
+        return [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script_path),
+            "-PackageRoot",
+            str(root),
+            "-ArchivePath",
+            str(archive_path),
+            "-PidToWait",
+            str(os.getpid()),
+        ]
+
+    def _write_windows_update_script(self) -> Path:
+        script_dir = Path(tempfile.gettempdir()) / "jxb_update_apply"
+        script_dir.mkdir(parents=True, exist_ok=True)
+        script_path = script_dir / "apply_update.ps1"
+        script_path.write_text(
+            """
+param(
+    [Parameter(Mandatory = $true)][string]$PackageRoot,
+    [Parameter(Mandatory = $true)][string]$ArchivePath,
+    [Parameter(Mandatory = $true)][int]$PidToWait,
+    [int]$WaitTimeoutSeconds = 120
+)
+
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+
+$PreservePrefixes = @(
+    'config.json',
+    'outbox.json',
+    'runtime/install_state.json',
+    'runtime/logs/',
+    'runtime/errors/',
+    'runtime/memory/',
+    'runtime/reports/',
+    'runtime/tmp/',
+    'runtime/.paddlex/',
+    'photo/',
+    'jiekou/',
+    'lgb/'
+)
+
+function Show-UpdateMessage([string]$title, [string]$message, [string]$iconName) {
+    $buttons = [System.Windows.Forms.MessageBoxButtons]::OK
+    $icon = [System.Windows.Forms.MessageBoxIcon]::$iconName
+    [void][System.Windows.Forms.MessageBox]::Show($message, $title, $buttons, $icon)
+}
+
+function Write-ErrorLog([string]$targetRoot, [string]$message) {
+    try {
+        $errorDir = Join-Path $targetRoot 'runtime\\errors'
+        New-Item -ItemType Directory -Path $errorDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $errorDir 'update_apply_error.txt') -Value $message -Encoding UTF8
+    } catch {
+    }
+}
+
+function Normalize-Relative([string]$relative) {
+    return ($relative.Replace('\\', '/')).TrimStart('/')
+}
+
+function Is-Preserved([string]$relative) {
+    $normalized = Normalize-Relative $relative
+    foreach ($prefix in $PreservePrefixes) {
+        $trimmed = $prefix.TrimEnd('/')
+        if ($normalized -eq $trimmed -or $normalized.StartsWith($prefix)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Wait-ForProcessExit([int]$processId, [int]$timeoutSeconds) {
+    $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+        if ($null -eq $process) {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw 'Timed out waiting for the running program to exit.'
+}
+
+function Read-ManifestPaths([string]$rootPath) {
+    $manifestPath = Join-Path $rootPath 'package_manifest.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        return @()
+    }
+    try {
+        $payload = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        return @()
+    }
+    $paths = @()
+    foreach ($item in @($payload.files)) {
+        if ($null -eq $item) {
+            continue
+        }
+        $relative = [string]$item.path
+        if ($relative) {
+            $paths += (Normalize-Relative $relative)
+        }
+    }
+    return $paths
+}
+
+function Remove-ObsoleteFiles([string]$targetRoot, [string[]]$oldPaths, [string[]]$newPaths) {
+    $newSet = @{}
+    foreach ($path in $newPaths) {
+        $newSet[(Normalize-Relative $path)] = $true
+    }
+    foreach ($path in ($oldPaths | Sort-Object -Unique)) {
+        $normalized = Normalize-Relative $path
+        if ($newSet.ContainsKey($normalized) -or (Is-Preserved $normalized)) {
+            continue
+        }
+        $targetPath = Join-Path $targetRoot ($normalized -replace '/', '\\')
+        if (-not (Test-Path -LiteralPath $targetPath)) {
+            continue
+        }
+        $item = Get-Item -LiteralPath $targetPath -Force
+        if (-not $item.PSIsContainer) {
+            Remove-Item -LiteralPath $targetPath -Force
+        }
+    }
+}
+
+function Copy-UpdateTree([string]$sourceRoot, [string]$targetRoot) {
+    $normalizedSourceRoot = [System.IO.Path]::GetFullPath($sourceRoot)
+    if (-not $normalizedSourceRoot.EndsWith('\\')) {
+        $normalizedSourceRoot += '\\'
+    }
+    $items = Get-ChildItem -LiteralPath $sourceRoot -Recurse -Force | Sort-Object FullName
+    foreach ($item in $items) {
+        $relative = $item.FullName.Substring($normalizedSourceRoot.Length).Replace('\\', '/')
+        if (Is-Preserved $relative) {
+            continue
+        }
+        $targetPath = Join-Path $targetRoot ($relative -replace '/', '\\')
+        if ($item.PSIsContainer) {
+            New-Item -ItemType Directory -Path $targetPath -Force | Out-Null
+            continue
+        }
+        $parent = Split-Path -Parent $targetPath
+        if ($parent) {
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        }
+        Copy-Item -LiteralPath $item.FullName -Destination $targetPath -Force
+    }
+}
+
+try {
+    Wait-ForProcessExit -processId $PidToWait -timeoutSeconds $WaitTimeoutSeconds
+
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('jxb_update_' + [Guid]::NewGuid().ToString('N'))
+    Expand-Archive -LiteralPath $ArchivePath -DestinationPath $tempRoot -Force
+
+    $extractedRoot = Join-Path $tempRoot 'jixiebijiaoben'
+    if (-not (Test-Path -LiteralPath $extractedRoot -PathType Container)) {
+        $children = @(Get-ChildItem -LiteralPath $tempRoot -Directory)
+        if ($children.Count -eq 1) {
+            $extractedRoot = $children[0].FullName
+        } else {
+            throw 'Could not locate the extracted update package root.'
+        }
+    }
+
+    $existingPaths = Read-ManifestPaths -rootPath $PackageRoot
+    $newPaths = Read-ManifestPaths -rootPath $extractedRoot
+    Remove-ObsoleteFiles -targetRoot $PackageRoot -oldPaths $existingPaths -newPaths $newPaths
+    Copy-UpdateTree -sourceRoot $extractedRoot -targetRoot $PackageRoot
+
+    Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Show-UpdateMessage 'Update Complete' 'Update finished. Please reopen the main program.' 'Information'
+} catch {
+    $message = $_.Exception.Message
+    Write-ErrorLog -targetRoot $PackageRoot -message $message
+    Show-UpdateMessage 'Update Failed' ('Application update failed: ' + $message) 'Error'
+    exit 1
+}
+""".strip(),
+            encoding="utf-8-sig",
+        )
+        return script_path
 
     def _load_devices(self) -> None:
         devices = self.config_manager.devices()
@@ -888,13 +1097,13 @@ class MainWindow(QMainWindow):
         self.table.selectRow(row)
         menu = QMenu(self)
         menu.addAction("启动", lambda: self._start_worker(row))
-        menu.addAction("暂停", lambda: self._pause_worker(row))
-        menu.addAction("恢复", lambda: self._resume_worker(row))
         menu.addAction("停止", lambda: self._stop_worker(row))
         menu.addSeparator()
         menu.addAction("卡密绑定", lambda: self._bind_license(row))
         menu.addAction("app设置", lambda: self._edit_app_config(row))
         menu.addAction("设备设置", lambda: self._edit_device_settings(row))
+        menu.addAction("查看聊天记录", lambda: self._show_chat_history(row))
+        menu.addAction("打开设备后台", lambda: self._open_device_backend(row))
         menu.addSeparator()
         menu.addAction("删除当前设备", lambda: self._delete_device(row))
         menu.exec(self.table.viewport().mapToGlobal(position))
@@ -909,9 +1118,49 @@ class MainWindow(QMainWindow):
         item = self.table.item(row, COL_DEVICE_IP)
         return item.text() if item else ""
 
+    def _open_device_backend(self, row: int) -> None:
+        device_ip = self._device_ip_for_row(row).strip()
+        if not device_ip:
+            return
+        QDesktopServices.openUrl(QUrl(f"http://{device_ip}:8888/"))
+
+    def _show_chat_history(self, row: int) -> None:
+        device = self._device_for_row(row)
+        if not device:
+            return
+        device_ip = str(device.get("ip", "") or "").strip()
+        app_name = self._selected_app_for_row(row)
+        if not device_ip or not app_name:
+            return
+        app_cls = get_registered_apps().get(app_name)
+        app_label = getattr(app_cls, "name", app_name) if app_cls is not None else app_name
+        persona = resolve_persona(
+            self.config_manager,
+            device_ip,
+            app_name,
+            device=device,
+        )
+        try:
+            dialog = ChatHistoryDialog(
+                store=ChatHistoryStore(),
+                device_ip=device_ip,
+                app_name=app_name,
+                app_label=str(app_label),
+                persona=persona,
+                parent=self,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "聊天记录", f"聊天记录读取失败：{exc}")
+            return
+        dialog.exec()
+
     def _set_row_status(self, device_ip: str, status: str, detail: str = "") -> None:
         for row in range(self.table.rowCount()):
             if self._device_ip_for_row(row) == device_ip:
+                detail_text = strip_status_coordinates(detail)
+                current = self.table.item(row, COL_STATUS)
+                if current and current.data(256) == status and current.data(257) == detail_text:
+                    return
                 self.table.setItem(row, COL_STATUS, self._status_item(status, detail))
                 self._refresh_summary()
                 return
@@ -919,6 +1168,10 @@ class MainWindow(QMainWindow):
     def _set_row_balance(self, device_ip: str, balance: str) -> None:
         for row in range(self.table.rowCount()):
             if self._device_ip_for_row(row) == device_ip:
+                text = str(balance or "--")
+                current = self.table.item(row, COL_BALANCE)
+                if current and current.text() == text:
+                    return
                 item = QTableWidgetItem(str(balance or "--"))
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row, COL_BALANCE, item)
@@ -980,6 +1233,10 @@ class MainWindow(QMainWindow):
     def _set_row_unattended_time(self, device_ip: str, seconds: float | None) -> None:
         for row in range(self.table.rowCount()):
             if self._device_ip_for_row(row) == device_ip:
+                text = format_duration(seconds)
+                current = self.table.item(row, COL_UNATTENDED_SECONDS)
+                if current and current.text() == text:
+                    return
                 self.table.setItem(row, COL_UNATTENDED_SECONDS, self._unattended_item(seconds))
                 return
 
@@ -1013,6 +1270,11 @@ class MainWindow(QMainWindow):
     ) -> None:
         for row in range(self.table.rowCount()):
             if self._device_ip_for_row(row) == device_ip:
+                count = max(0, int(reply_round_count))
+                value = max(0.0, float(average_seconds or 0.0))
+                current = self.table.item(row, COL_AVG_REPLY_SECONDS)
+                if current and current.data(256) == count and float(current.data(257) or 0.0) == value:
+                    return
                 self.table.setItem(row, COL_AVG_REPLY_SECONDS, self._avg_reply_item(average_seconds, reply_round_count))
                 return
 
@@ -1129,7 +1391,7 @@ class MainWindow(QMainWindow):
         self.unattended_elapsed_seconds.pop(device_ip, None)
         if self.config_manager.remove_device(device_ip):
             self._load_devices()
-            self.logs.append(f"[{time.strftime('%H:%M:%S')}] [info] {device_ip}: device removed")
+            self._append_log_line(device_ip, f"[{time.strftime('%H:%M:%S')}] [info] {device_ip}: device removed")
 
     def _save_apikey(self) -> None:
         value = self.apikey_input.text().strip()
@@ -1259,6 +1521,7 @@ class MainWindow(QMainWindow):
                 "popup_match_threshold",
                 "template_match_regions",
                 "template_match_thresholds",
+                "photo_sent_cooldown_seconds",
             )
             if key in values
         }
@@ -1298,6 +1561,8 @@ class MainWindow(QMainWindow):
         self.logs.setVisible(self.log_toggle.isChecked())
         if self.log_toggle.isChecked():
             self._render_logs()
+        else:
+            self.logs.clear()
 
     def _refresh_log_device_filter(self, devices: list[dict[str, Any]]) -> None:
         if not hasattr(self, "log_device_filter"):
@@ -1315,35 +1580,50 @@ class MainWindow(QMainWindow):
         index = self.log_device_filter.findData(current)
         self.log_device_filter.setCurrentIndex(index if index >= 0 else 0)
         self.log_device_filter.blockSignals(False)
-        self._render_logs()
+        if self._logs_visible():
+            self._render_logs()
 
     def _render_logs(self, *_args: Any) -> None:
         if not hasattr(self, "logs"):
             return
-        selected_ip = ""
-        if hasattr(self, "log_device_filter"):
-            selected_ip = str(self.log_device_filter.currentData() or "")
-        self.logs.clear()
-        for event in self.log_events:
-            event_ip = str(getattr(event, "device_ip", "") or "")
-            if selected_ip and event_ip != selected_ip:
-                continue
-            self._append_log_event(event)
+        selected_ip = self._selected_log_device_ip()
+        lines = [line for event_ip, line in self.log_events if not selected_ip or event_ip == selected_ip]
+        if len(lines) > LOG_RENDER_LIMIT:
+            lines = lines[-LOG_RENDER_LIMIT:]
+        self.logs.setPlainText("\n".join(lines))
+        self.logs.moveCursor(QTextCursor.MoveOperation.End)
 
     def _append_log_event(self, event: WorkerEvent) -> None:
         try:
-            self.logs.append(f"{self._log_event_time(event)} {self._format_log_event(event)}")
+            self._append_log_line(str(event.device_ip or ""), f"{self._log_event_time()} {self._format_log_event(event)}")
         except Exception as exc:
             device_ip = str(getattr(event, "device_ip", "unknown") or "unknown")
-            self.logs.append(f"[{time.strftime('%H:%M:%S')}] [error] {device_ip}: UI事件日志格式化失败：{exc}")
+            self._append_log_line(device_ip, f"[{time.strftime('%H:%M:%S')}] [error] {device_ip}: UI事件日志格式化失败：{exc}")
 
-    def _log_event_time(self, event: WorkerEvent) -> str:
-        event_id = id(event)
-        timestamp = self.log_event_times.get(event_id)
-        if not timestamp:
-            timestamp = time.strftime("%H:%M:%S")
-            self.log_event_times[event_id] = timestamp
-        return f"[{timestamp}]"
+    def _log_event_time(self) -> str:
+        return f"[{time.strftime('%H:%M:%S')}]"
+
+    def _logs_visible(self) -> bool:
+        return bool(hasattr(self, "logs") and hasattr(self, "log_toggle") and self.log_toggle.isChecked())
+
+    def _selected_log_device_ip(self) -> str:
+        if hasattr(self, "log_device_filter"):
+            return str(self.log_device_filter.currentData() or "")
+        return ""
+
+    def _append_log_line(self, device_ip: str, line: str) -> None:
+        self.log_events.append((device_ip, line))
+        if not self._logs_visible():
+            return
+        selected_ip = self._selected_log_device_ip()
+        if selected_ip and device_ip != selected_ip:
+            return
+        self.logs.appendPlainText(line)
+
+    def _should_store_log_event(self, event: WorkerEvent) -> bool:
+        if str(event.level or "") == "status":
+            return False
+        return True
 
     def _format_log_event(self, event: WorkerEvent) -> str:
         payload = event.payload if isinstance(event.payload, dict) else {}
@@ -1401,9 +1681,15 @@ class MainWindow(QMainWindow):
                 f"原因={payload.get('return_reason', '') or '-'}"
             )
         if event.message == "xinyu_round_metrics":
+            reuse_text = ""
+            if payload.get("ocr_cache_hit_count", 0) or payload.get("detection_cache_hit_count", 0):
+                reuse_text = (
+                    f"复用 OCR {payload.get('ocr_cache_hit_count', 0)} 次，"
+                    f"复用检测 {payload.get('detection_cache_hit_count', 0)} 次，"
+                )
             return (
                 f"[{event.level}] {event.device_ip}: 心遇本轮统计 "
-                f"OCR {payload.get('ocr_count', '')} 次，截图 {payload.get('capture_count', '')} 次，"
+                f"OCR {payload.get('ocr_count', '')} 次，{reuse_text}截图 {payload.get('capture_count', '')} 次，"
                 f"详情回退 {payload.get('dialogue_compact_fallback_count', 0)} 次，"
                 f"耗时 {payload.get('seconds', '')} 秒"
             )
@@ -1451,9 +1737,15 @@ class MainWindow(QMainWindow):
                 return f"[{event.level}] {event.device_ip}: 欢友跳过 [{contact}] {reason}"
             return f"[{event.level}] {event.device_ip}: 欢友回复 [{contact}] {reply_text}"
         if event.message == "huanyou_round_metrics":
+            reuse_text = ""
+            if payload.get("ocr_cache_hit_count", 0) or payload.get("detection_cache_hit_count", 0):
+                reuse_text = (
+                    f"复用 OCR {payload.get('ocr_cache_hit_count', 0)} 次，"
+                    f"复用检测 {payload.get('detection_cache_hit_count', 0)} 次，"
+                )
             return (
                 f"[{event.level}] {event.device_ip}: 欢友本轮统计 "
-                f"OCR {payload.get('ocr_count', '')} 次，截图 {payload.get('capture_count', '')} 次，"
+                f"OCR {payload.get('ocr_count', '')} 次，{reuse_text}截图 {payload.get('capture_count', '')} 次，"
                 f"耗时 {payload.get('seconds', '')} 秒"
             )
         if event.message == "huanyou_new_greetings":
@@ -1548,35 +1840,43 @@ class MainWindow(QMainWindow):
         return f"[{event.level}] {event.device_ip}: {event.message}"
 
     def _drain_events(self) -> None:
-        while True:
+        started_at = time.monotonic()
+        processed = 0
+        while processed < UI_EVENT_DRAIN_LIMIT:
             try:
                 event = self.events.get_nowait()
             except queue.Empty:
                 break
-            self.log_event_times.setdefault(id(event), time.strftime("%H:%M:%S"))
-            self.log_events.append(event)
+            processed += 1
             try:
                 self._handle_worker_event(event)
             except Exception as exc:
                 device_ip = str(getattr(event, "device_ip", "unknown") or "unknown")
-                self.logs.append(f"[{time.strftime('%H:%M:%S')}] [error] {device_ip}: UI事件处理失败：{exc}")
-        try:
-            self._refresh_unattended_durations()
-        except Exception as exc:
-            self.logs.append(f"[{time.strftime('%H:%M:%S')}] [error] UI: 无干预时长刷新失败：{exc}")
+                self._append_log_line(device_ip, f"[{time.strftime('%H:%M:%S')}] [error] {device_ip}: UI事件处理失败：{exc}")
+            if time.monotonic() - started_at >= UI_EVENT_DRAIN_SECONDS:
+                break
+        now = time.monotonic()
+        if now - self._last_unattended_refresh_at >= UNATTENDED_REFRESH_SECONDS:
+            self._last_unattended_refresh_at = now
+            try:
+                self._refresh_unattended_durations()
+            except Exception as exc:
+                self._append_log_line("", f"[{time.strftime('%H:%M:%S')}] [error] UI: 无干预时长刷新失败：{exc}")
 
         self._drain_update_events()
 
     def _drain_update_events(self) -> None:
-        while True:
+        processed = 0
+        while processed < UPDATE_EVENT_DRAIN_LIMIT:
             try:
                 event_type, payload = self.update_events.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
             try:
                 self._handle_update_event(event_type, payload)
             except Exception as exc:
-                self.logs.append(f"[{time.strftime('%H:%M:%S')}] [error] UI: 更新事件处理失败：{exc}")
+                self._append_log_line("", f"[{time.strftime('%H:%M:%S')}] [error] UI: 更新事件处理失败：{exc}")
 
     def _handle_update_event(self, event_type: str, payload: dict[str, Any]) -> None:
         if event_type in {"check_complete", "check_error"}:
@@ -1588,7 +1888,7 @@ class MainWindow(QMainWindow):
             if manual:
                 QMessageBox.warning(self, "检查更新", message)
             else:
-                self.logs.append(f"[{time.strftime('%H:%M:%S')}] [warning] UI: {message}")
+                self._append_log_line("", f"[{time.strftime('%H:%M:%S')}] [warning] UI: {message}")
             return
 
         if event_type == "check_complete":
@@ -1669,10 +1969,7 @@ class MainWindow(QMainWindow):
         event_ip = str(event.device_ip or "")
         message = str(event.message or "")
         level = str(event.level or "")
-        selected_ip = ""
-        if hasattr(self, "log_device_filter"):
-            selected_ip = str(self.log_device_filter.currentData() or "")
-        if not selected_ip or event_ip == selected_ip:
+        if self._should_store_log_event(event):
             self._append_log_event(event)
         if level == "status":
             if self._row_status_for_device(event_ip) in {"stopping", "stopped"}:
@@ -1769,6 +2066,11 @@ class _LegacyAppConfigDialog(QDialog):
         self.step_timeout.setRange(1, 300)
         self.step_timeout.setValue(int(overrides.get("step_timeout", 10)))
         layout.addRow("单步超时（秒）", self.step_timeout)
+
+        self.photo_sent_cooldown_seconds = QSpinBox()
+        self.photo_sent_cooldown_seconds.setRange(0, 2592000)
+        self.photo_sent_cooldown_seconds.setValue(int(overrides.get("photo_sent_cooldown_seconds", 86400)))
+        layout.addRow("心遇同一用户发图冷却（秒，0不限制）", self.photo_sent_cooldown_seconds)
 
         self.match_threshold = QDoubleSpinBox()
         self.match_threshold.setRange(0.1, 1.0)
@@ -1939,6 +2241,7 @@ class _LegacyAppConfigDialog(QDialog):
         values.update({
             "poll_interval": self.poll_interval.value(),
             "step_timeout": self.step_timeout.value(),
+            "photo_sent_cooldown_seconds": self.photo_sent_cooldown_seconds.value(),
             "match_threshold": self.match_threshold.value(),
             "popup_match_threshold": self.popup_match_threshold.value(),
             "ocr": ocr,
@@ -2551,9 +2854,17 @@ class TemplateManagerWidget(QWidget):
             self.table.setItem(row, 0, QTableWidgetItem(kind))
             self.table.setItem(row, 1, QTableWidgetItem(path.name))
             self.table.setItem(row, 2, QTableWidgetItem(self._template_region_text(path)))
+            actions = QWidget()
+            actions_layout = QHBoxLayout(actions)
+            actions_layout.setContentsMargins(0, 0, 0, 0)
+            actions_layout.setSpacing(6)
+            test_button = QPushButton("测试")
+            test_button.clicked.connect(lambda checked=False, p=path: self._test_saved_template(p))
+            actions_layout.addWidget(test_button)
             delete_button = QPushButton("删除")
             delete_button.clicked.connect(lambda checked=False, p=path: self._delete_template(p))
-            self.table.setCellWidget(row, 3, delete_button)
+            actions_layout.addWidget(delete_button)
+            self.table.setCellWidget(row, 3, actions)
 
     def _capture_popup_template(self) -> None:
         self._capture_template(CUSTOM_POPUP, "弹窗模板")
@@ -2612,6 +2923,63 @@ class TemplateManagerWidget(QWidget):
         regions = self.overrides.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY, {})
         if not isinstance(regions, dict):
             return "未设置"
+
+    def _template_region_key(self, path: Path) -> str:
+        if is_popup_template_name(path.name):
+            return popup_template_region_key(path)
+        if is_back_button_template_name(path.name):
+            return BACK_BUTTON
+        for rule in fixed_template_rules():
+            if path.name == rule.filename or path.name.startswith(f"{path.stem}_"):
+                return rule.key
+        return ""
+
+    def _test_saved_template(self, path: Path) -> None:
+        try:
+            robot = RobotInterface(self.device_ip)
+            image = ensure_portrait_image(capture_transform_image(robot, pre_move=True, label="template_test"))
+        except Exception as exc:
+            QMessageBox.critical(self, "模板测试失败", f"无法获取截图：{exc}")
+            return
+        key = self._template_region_key(path)
+        if not key:
+            QMessageBox.warning(self, "模板测试", f"无法确定模板类别范围：{path.name}")
+            return
+        config = self.overrides if isinstance(self.overrides, dict) else {}
+        try:
+            result = match_template_with_region(
+                image, path, config, key,
+                threshold=float(config.get("match_threshold", 0.7)),
+                match_func=match,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "模板测试失败", f"匹配 {path.name} 时出错：{exc}")
+            return
+        self._show_template_test_result(image, path.name, key, result)
+
+    def _show_template_test_result(self, image: Image.Image, name: str, key: str, result: dict[str, Any] | None) -> None:
+        pixmap = _pixmap_from_pil_image(image)
+        painter = QPainter(pixmap)
+        regions = self.overrides.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY, {}) if isinstance(self.overrides, dict) else {}
+        region = regions.get(key) if isinstance(regions, dict) else None
+        if isinstance(region, (list, tuple)) and len(region) == 4:
+            x, y, w, h = (float(value) for value in region)
+            painter.setPen(QPen(QColor(249, 115, 22), 4))
+            painter.drawRect(QRect(int(x * pixmap.width()), int(y * pixmap.height()), int(w * pixmap.width()), int(h * pixmap.height())))
+        if result:
+            painter.setPen(QPen(QColor(34, 197, 94), 4))
+            painter.drawRect(QRect(int(result["x"] * pixmap.width()), int(result["y"] * pixmap.height()), int(result["w"] * pixmap.width()), int(result["h"] * pixmap.height())))
+        painter.end()
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"模板测试：{name}")
+        dialog.resize(600, 820)
+        layout = QVBoxLayout(dialog)
+        status = "匹配成功，绿色框为命中位置；橙色框为配置匹配范围。" if result else "未匹配到模板；橙色框为配置匹配范围。"
+        layout.addWidget(QLabel(status))
+        label = QLabel()
+        label.setPixmap(pixmap.scaled(560, 720, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        layout.addWidget(label, 1)
+        dialog.exec()
         region = regions.get(popup_template_region_key(path))
         if not isinstance(region, (list, tuple)) or len(region) != 4:
             return "未设置"
@@ -3447,6 +3815,19 @@ class DeviceSettingsDialogInteractive(QDialog):
         screenshot_button_row.addStretch(1)
         screenshot_layout.addLayout(screenshot_button_row)
 
+        self.template_match_summary = QLabel("当前截图模板匹配：请先刷新截图。")
+        self.template_match_summary.setObjectName("HelperLabel")
+        self.template_match_summary.setWordWrap(True)
+        screenshot_layout.addWidget(self.template_match_summary)
+        self.template_match_table = QTableWidget(0, 4)
+        self.template_match_table.setHorizontalHeaderLabels(["类别", "状态", "命中模板", "相似度"])
+        self.template_match_table.verticalHeader().setVisible(False)
+        self.template_match_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        header = self.template_match_table.horizontalHeader()
+        for column in range(4):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents if column != 2 else QHeaderView.ResizeMode.Stretch)
+        screenshot_layout.addWidget(self.template_match_table)
+
         placeholder = QPixmap(720, 1280)
         placeholder.fill(QColor("#f8fafc"))
         self.crop_label = PopupCropLabel(placeholder)
@@ -3580,6 +3961,7 @@ class DeviceSettingsDialogInteractive(QDialog):
             )
             image = ensure_portrait_image(image_bytes)
             self._set_screenshot(image)
+            self._detect_saved_templates(image)
         except Exception as exc:
             QMessageBox.critical(self, "截图失败", f"无法从当前设备获取截图：{exc}")
             return
@@ -3594,6 +3976,39 @@ class DeviceSettingsDialogInteractive(QDialog):
         self.point_x_label.setText("--")
         self.point_y_label.setText("--")
         self._update_click_labels()
+
+    def _detect_saved_templates(self, image: Image.Image) -> None:
+        """Probe saved templates only; this view never performs a click."""
+        rows: list[tuple[str, str, str, str]] = []
+        config = self.overrides
+        threshold = float(config.get("match_threshold", 0.7) or 0.7)
+        for rule in fixed_template_rules():
+            path = template_path(config, rule.key)
+            if path is None:
+                continue
+            try:
+                result = match_template_with_region(image, path, config, rule.key, threshold=threshold, match_func=match)
+            except Exception:
+                result = None
+            score = float(result.get("score", 0.0)) if result else 0.0
+            rows.append((rule.label, "命中" if result else "未命中", path.name if result else "-", f"{score:.3f} / {threshold:.2f}"))
+        for path in back_button_template_paths(config):
+            try:
+                result = match_template_with_region(image, path, config, BACK_BUTTON, threshold=threshold, match_func=match)
+            except Exception:
+                result = None
+            score = float(result.get("score", 0.0)) if result else 0.0
+            rows.append(("返回按钮", "命中" if result else "未命中", path.name if result else "-", f"{score:.3f} / {threshold:.2f}"))
+        self.template_match_table.setRowCount(len(rows))
+        hit_count = 0
+        for row, values in enumerate(rows):
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 1:
+                    item.setForeground(QColor("#16a34a") if value == "命中" else QColor("#ea580c"))
+                self.template_match_table.setItem(row, column, item)
+            hit_count += values[1] == "命中"
+        self.template_match_summary.setText(f"模板检测完成：{hit_count}/{len(rows)} 类已命中。这里只显示结果，不会执行点击。")
 
     def _save_current_screenshot_to_error_path(self) -> None:
         if self.current_screenshot is None:

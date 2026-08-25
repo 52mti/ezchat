@@ -42,6 +42,7 @@ class XinyuApp(BaseApp):
         self.sent_callback = sent_callback
         self.last_activity_at = time.monotonic()
         self.idle_points_checked = False
+        self.idle_online_photo_attempted = False
         self._last_selected_signature: tuple[str, str, int] | None = None
 
     def _reset_round_metrics(self) -> None:
@@ -59,6 +60,8 @@ class XinyuApp(BaseApp):
             "xinyu_round_metrics",
             {
                 "ocr_count": int(metrics.get("ocr_count", 0) or 0),
+                "ocr_cache_hit_count": int(metrics.get("ocr_cache_hit_count", 0) or 0),
+                "detection_cache_hit_count": int(metrics.get("detection_cache_hit_count", 0) or 0),
                 "capture_count": int(metrics.get("capture_count", 0) or 0),
                 "dialogue_compact_fallback_count": int(metrics.get("dialogue_compact_fallback_count", 0) or 0),
                 "seconds": round(time.monotonic() - started_at, 3),
@@ -166,6 +169,17 @@ class XinyuApp(BaseApp):
             )
             if not target:
                 reporter("empty_list_target", "暂无消息，进入防熄屏等待")
+                if not self.idle_online_photo_attempted:
+                    self.idle_online_photo_attempted = True
+                    reporter("online_photo_due", "无消息，尝试在线用户发照片")
+                    try:
+                        sent_photo = steps.send_photo_to_online_target(self.robot, self.config, reporter=reporter)
+                    except Exception as online_photo_exc:
+                        sent_photo = False
+                        self.emit_runtime_log("warning", "在线用户发照片失败", {"error": str(online_photo_exc)})
+                    if sent_photo:
+                        self._mark_activity()
+                        self.emit_runtime_log("info", "在线用户照片已发送", {})
                 self._run_idle_maintenance(reporter)
                 self._emit_round_metrics(round_started_at)
                 return
@@ -209,6 +223,7 @@ class XinyuApp(BaseApp):
             if self.idle_points_checked:
                 self.emit_runtime_log("info", "心遇检测到真实消息，重置空闲余额读取标记", {})
             self.idle_points_checked = False
+            self.idle_online_photo_attempted = False
 
             list_content = self._clean_content(target.get("content", ""))
             use_list_content = self._can_reply_from_list(list_content)
