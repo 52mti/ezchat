@@ -422,6 +422,42 @@ def build_dialogue_result(
         method = str(sender_detection["method"])
         sender2_min_x_ratio = float(sender_detection["sender2_min_x_ratio"])
         center_position_sender = "sender2" if item["center_x"] > image_width * sender2_min_x_ratio else "sender1"
+
+        def matches_sender1_color_override(hue_value: float, saturation: float, value: float) -> bool:
+            overrides = sender_detection.get("bubble_color_sender1_overrides", [])
+            if not isinstance(overrides, list):
+                return False
+            blue_green_delta = float(item.get("background_blue_green_delta") or 0.0)
+            blue_red_ratio = float(item.get("background_blue_red_ratio") or 0.0)
+            center_x_ratio = float(item["center_x"]) / max(1.0, float(image_width))
+            for override in overrides:
+                if not isinstance(override, dict):
+                    continue
+                if not (float(override.get("hue_min", -1)) <= hue_value <= float(override.get("hue_max", 181))):
+                    continue
+                if saturation < float(override.get("saturation_min", 0.0)):
+                    continue
+                if saturation > float(override.get("saturation_max", 1.0)):
+                    continue
+                if value < float(override.get("value_min", 0.0)):
+                    continue
+                if value > float(override.get("value_max", 1.0)):
+                    continue
+                if blue_green_delta < float(override.get("blue_green_min", -9999.0)):
+                    continue
+                if blue_green_delta > float(override.get("blue_green_max", 9999.0)):
+                    continue
+                if blue_red_ratio < float(override.get("blue_red_ratio_min", 0.0)):
+                    continue
+                if blue_red_ratio > float(override.get("blue_red_ratio_max", 9999.0)):
+                    continue
+                if center_x_ratio < float(override.get("center_x_min_ratio", 0.0)):
+                    continue
+                if center_x_ratio > float(override.get("center_x_max_ratio", 1.0)):
+                    continue
+                return True
+            return False
+
         if method == "position":
             sender_stats["position_fallback"] += 1
             return "sender2" if item["min_x"] > image_width * sender2_min_x_ratio else "sender1"
@@ -444,6 +480,8 @@ def build_dialogue_result(
             blue_min_saturation = float(sender_detection.get("bubble_color_sender2_blue_min_saturation", 0.30))
             if hue is not None and saturation >= min_saturation and value >= min_value:
                 hue_value = float(hue)
+                if matches_sender1_color_override(hue_value, saturation, value):
+                    return "sender1"
                 is_sender2_hue = hue_min <= hue_value <= hue_max
                 if hue_min_2 is not None and hue_max_2 is not None:
                     is_sender2_hue = is_sender2_hue or float(hue_min_2) <= hue_value <= float(hue_max_2)
@@ -1202,7 +1240,9 @@ def _is_list_header_line(line: dict[str, Any], image_width: int, rules: dict[str
     if not text or looks_like_time_text(text) or not line["main_items"]:
         return False
     first_x = min(item["min_x"] for item in line["main_items"])
-    if first_x < image_width * float(rules["text_left_min_ratio"]):
+    name_max_x = image_width * float(rules.get("name_max_x_ratio", rules["text_right_max_ratio"]))
+    name_right_x = max(item["max_x"] for item in line["main_items"])
+    if first_x < image_width * float(rules["text_left_min_ratio"]) or name_right_x > name_max_x:
         return False
     name = _strip_list_name_suffixes(_extract_list_name(text), rules)
     if not name or not _looks_like_list_name(name):
@@ -1253,6 +1293,15 @@ def build_list_result(
     left_badge_read_red_badge_number = bool(rules.get("left_badge_read_red_badge_number", True))
     bottom_nav = _build_bottom_nav_result(rule_items, image_size, rules)
     bottom_nav_names = [item["name"] for item in bottom_nav]
+    if bool(rules.get("main_top_from_top_nav", False)):
+        top_nav_items = [
+            item
+            for item in rule_items
+            if top_nav_top <= item["center_y"] <= top_nav_bottom
+            and item["text"] in _keywords(rules["top_nav_keywords"])
+        ]
+        if top_nav_items:
+            top = max(top, max(item["max_y"] for item in top_nav_items))
     image_array = np.array(load_image(source_image).convert("RGB")) if source_image is not None else None
     excluded_entries: list[dict[str, Any]] = []
 

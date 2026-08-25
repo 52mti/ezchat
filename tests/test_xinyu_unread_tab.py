@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from apps.xinyu import steps
 from apps.xinyu.config import DEFAULT_CONFIG
+from apps.xinyu.ocr_config import LIST_OCR_MODE
+from vision.ocr_rules import build_list_result
 
 
 def test_unread_tab_falls_back_to_raw_ocr_when_banner_pushes_filter_down(monkeypatch):
@@ -25,3 +27,26 @@ def test_unread_tab_falls_back_to_raw_ocr_when_banner_pushes_filter_down(monkeyp
 
     assert image == "screen"
     assert checked["_xinyu_unread_tab_has_red"] is True
+
+
+def test_xinyu_list_starts_after_detected_top_filter_strip():
+    rules = LIST_OCR_MODE["rules"]
+    def item(text: str, left: int, right: int, top: int, bottom: int) -> dict:
+        return {
+            "text": text, "raw_text": text, "confidence": 0.99,
+            "min_x": left, "max_x": right, "min_y": top, "max_y": bottom,
+            "center_x": (left + right) / 2, "center_y": (top + bottom) / 2,
+            "width": right - left, "height": bottom - top,
+        }
+
+    items = [
+        item("全部消息", 30, 120, 240, 265), item("未回复", 175, 255, 240, 265),
+        item("在线", 295, 350, 240, 265), item("距离", 390, 445, 240, 265),
+        item("亲密度", 485, 560, 240, 265), item("薄荷", 120, 180, 310, 335),
+        item("看看你的诚意", 120, 300, 340, 365),
+    ]
+
+    result = build_list_result(items, (600, 1000), rules)
+
+    assert {item["name"] for item in result["bottom_nav"]} >= {"全部消息", "未回复", "在线", "距离", "亲密度"}
+    assert [item["name"] for item in result["message_list"]] == ["薄荷"]
