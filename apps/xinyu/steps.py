@@ -1796,16 +1796,42 @@ def send_photo_to_online_target(
 
     excluded_contacts = _photo_sent_contacts(cfg)
     if excluded_contacts:
+        _report(reporter, "online_filter", "过滤冷却中的已发照片用户", log_label=f"过滤冷却中的已发照片用户：{len(excluded_contacts)} 位")
+
+    max_swipes = max(0, int(cfg.get("online_list_max_swipes", 8) or 0))
+    seen_pages: set[str] = set()
+    target: dict[str, Any] | None = None
+    for swipe_index in range(max_swipes + 1):
+        rows = online_ocr.get("result", {}).get("message_list", []) if isinstance(online_ocr, dict) else []
+        page_signature = _json_cache_fragment(rows)
+        target = _select_online_target_from_ocr_result(online_ocr, excluded_contacts=excluded_contacts)
+        if target is not None:
+            break
+        if swipe_index >= max_swipes:
+            break
+        if page_signature in seen_pages:
+            _report(reporter, "online_skip", "在线列表上滑后页面未变化，停止查找")
+            break
+        seen_pages.add(page_signature)
+        if not hasattr(robot, "swipe"):
+            _report(reporter, "online_skip", "机械臂不支持上滑，无法继续查找未发照片用户")
+            break
+        start = cfg.get("online_list_swipe_start", [0.5, 0.72])
+        end = cfg.get("online_list_swipe_end", [0.5, 0.32])
+        if not isinstance(start, (list, tuple)) or not isinstance(end, (list, tuple)) or len(start) != 2 or len(end) != 2:
+            raise StepUnavailable("在线列表上滑坐标配置无效，应为两个 [x, y] 坐标")
+        start_x, start_y = float(start[0]), float(start[1])
+        end_x, end_y = float(end[0]), float(end[1])
         _report(
             reporter,
-            "online_filter",
-            "过滤冷却中的已发照片用户",
-            log_label=f"过滤冷却中的已发照片用户：{len(excluded_contacts)} 位",
+            "online_scroll",
+            "当前在线用户均已发过照片，上滑继续查找",
+            log_label=f"当前在线用户均已发过照片，上滑继续查找 {swipe_index + 1}/{max_swipes}：{format_point(start_x, start_y)} -> {format_point(end_x, end_y)}",
         )
-    target = _select_online_target_from_ocr_result(
-        online_ocr,
-        excluded_contacts=excluded_contacts,
-    )
+        robot.swipe(start_x, start_y, end_x, end_y)
+        time.sleep(float(cfg.get("online_list_swipe_settle_seconds", 0.8) or 0.8))
+        online_image = capture_after_popups(robot, cfg, label=f"online_list_scroll_{swipe_index + 1}", reporter=reporter)
+        online_ocr = _run_list_ocr(online_image, cfg, reporter=reporter)
     if target is None:
         _report(
             reporter,

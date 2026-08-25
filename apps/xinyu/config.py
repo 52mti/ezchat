@@ -75,4 +75,8 @@ DEFAULT_CONFIG = {
     "online_photo_send_count": 3,
     "photo_select_max_attempts": 3,
     "points_open_max_attempts": 3,
+    "online_list_max_swipes": 8,
+    "online_list_swipe_start": [0.5, 0.72],
+    "online_list_swipe_end": [0.5, 0.32],
+    "online_list_swipe_settle_seconds": 0.8,
 }
