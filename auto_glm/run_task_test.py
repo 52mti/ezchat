@@ -35,18 +35,32 @@ from auto_glm.planner import ExecutionPlan, PlanNode  # noqa: E402
 from lgb.lgb import RobotInterface  # noqa: E402
 
 
-AUTOGLM_EXECUTOR_PROMPT = """你是手机界面视觉执行器。你会连续收到当前截图和一个短目标。
-只依据当前截图完成短目标，不使用任何外部 UI 结构、模板、OCR 或猜测的坐标。
-每次只能输出一个动作；动作后系统会给你新截图。
+AUTOGLM_EXECUTOR_PROMPT = """你是手机界面视觉执行智能体，可以根据连续操作历史和当前状态截图完成任务。
 
-坐标为截图左上角 (0,0) 到右下角 (999,999)。可输出：
-- do(action=\"Tap\", element=[x,y])
-- do(action=\"Swipe\", start=[x1,y1], end=[x2,y2])
-- do(action=\"Type\", text=\"...\")
-- do(action=\"Wait\", duration=\"x\")
-- finish(message=\"...\")
+你必须严格且仅按以下格式输出，不能在标签外输出任何文字：
+<think>对当前截图和下一步选择的简短判断</think>
+<answer>一条动作指令</answer>
 
-必须先确认上一步是否已生效。目标已经完成时输出 finish。不要输出 Back、Home、Take_over、Long Press 或 Double Tap；如需要返回，直接在截图中定位可见的返回或关闭控件并用 Tap 点击。"""
+其中 {think} 只写本次选择理由，{action} 必须是且只能是一条下列格式：
+- do(action="Tap", element=[x,y])
+  点击截图中的一个具体点。坐标原点为左上角 (0,0)，右下角为 (999,999)。
+- do(action="Swipe", start=[x1,y1], end=[x2,y2])
+  从起点滑动至终点；坐标同样为 0 到 999。
+- do(action="Type", text="xxx")
+  仅在输入框已经被上一动作聚焦后输入文本。
+- do(action="Wait", duration="x")
+  等待界面加载，x 为秒数。
+- finish(message="xxx")
+  仅在当前节点目标已从截图中确认完成时使用。
+
+严格规则：
+1. 每次只能输出一条动作。执行后你会收到新的当前截图。
+2. 只能依据当前截图、当前短目标和历史动作判断；不要假设模板、OCR、控件树或固定坐标存在。
+3. 点击前先确认目标在截图中可见；点击后先观察新截图是否生效。页面未变化时，可 Wait 一次，再根据新截图调整一次点击位置。
+4. 当前短目标已满足时必须输出 finish，不能继续重复点击。
+5. 目标不在可见区域时，使用 Swipe 探索；不要在同一位置重复无效点击。
+6. 不要输出 Back、Home、Take_over、Long Press、Double Tap、Note、Call_API 或解释性文本。需要返回时，在截图中定位可见返回或关闭控件，并使用 Tap。
+7. <answer> 内必须包含 do(action=...) 或 finish(message=...)。"""
 
 
 class RollingLog:
@@ -188,7 +202,7 @@ def _request_action_with_retry(
     for attempt in range(1, 3):
         retry_instruction = instruction
         if attempt > 1:
-            retry_instruction += "\n上一次返回不是有效动作协议。本次只能输出一个 do(action=...) 或 finish(message=...)，不得输出解释性文本。"
+            retry_instruction += "\n上一次返回不是有效动作协议。本次必须严格输出 <think>...</think><answer>do(action=...) 或 finish(message=...)</answer>，标签外不得有任何文字。"
         try:
             return model.decide(retry_instruction, image, history=history, system_prompt=AUTOGLM_EXECUTOR_PROMPT)
         except AutoGLMProtocolError as error:
