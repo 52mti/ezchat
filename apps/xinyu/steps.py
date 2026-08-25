@@ -72,6 +72,7 @@ BACK_BUTTON_2 = "button.back.secondary"
 UNREAD_TAB_KEYWORDS = ("\u672a\u56de\u590d",)
 TTS_POST_DELAY_SECONDS = 3.0
 POPUP_MAX_X = 0.9
+BOTTOM_NAV_CACHE_Y_OFFSET = -0.02
 EMPTY_LIST_TARGET_NAMES = {
     "\u6682\u65e0\u6d88\u606f",
     "\u6682\u65e0\u4fe1\u606f",
@@ -907,8 +908,10 @@ def _cache_bottom_nav_from_ocr_result(config: dict[str, Any], ocr_result: dict[s
         item = _bottom_nav_item(bottom_nav, keywords, min_center_y=0.5)
         if item is None:
             continue
-        detected[cache_key] = item[1]
-        _cache_point_once(config, "screen_anchors", cache_key, item[1])
+        center_x, center_y = item[1]
+        corrected_center = (center_x, max(0.02, min(0.98, center_y + BOTTOM_NAV_CACHE_Y_OFFSET)))
+        detected[cache_key] = corrected_center
+        _cache_point_once(config, "screen_anchors", cache_key, corrected_center)
 
     message = detected.get("bottom_message")
     if message is not None:

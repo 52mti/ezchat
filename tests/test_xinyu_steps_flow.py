@@ -1804,11 +1804,11 @@ def test_xinyu_caches_all_five_bottom_navigation_positions(tmp_path):
     steps._cache_bottom_nav_from_ocr_result(config, ocr_result)
 
     anchors = config["_runtime_cache"]["screen_anchors"]
-    assert anchors["bottom_fate"] == pytest.approx((0.08, 0.9))
-    assert anchors["bottom_feed"] == pytest.approx((0.28, 0.9))
-    assert anchors["bottom_entertainment"] == pytest.approx((0.5, 0.9))
-    assert anchors["bottom_message"] == pytest.approx((0.68, 0.9))
-    assert anchors["bottom_my"] == pytest.approx((0.88, 0.9))
+    assert anchors["bottom_fate"] == pytest.approx((0.08, 0.88))
+    assert anchors["bottom_feed"] == pytest.approx((0.28, 0.88))
+    assert anchors["bottom_entertainment"] == pytest.approx((0.5, 0.88))
+    assert anchors["bottom_message"] == pytest.approx((0.68, 0.88))
+    assert anchors["bottom_my"] == pytest.approx((0.88, 0.88))
 
 
 def test_xinyu_caches_my_from_message_when_my_bottom_nav_missing(monkeypatch, tmp_path):
