@@ -70,3 +70,15 @@ def test_xinyu_list_confirmation_wins_over_false_chat_template(monkeypatch):
     assert image == "list"
     assert "已确认聊天列表（第 1 轮）" in reports
     assert "启动时在聊天界面，匹配返回按钮回到列表" not in reports
+
+
+def test_xinyu_list_confirmation_never_falls_back_to_template(monkeypatch):
+    config = dict(DEFAULT_CONFIG)
+    monkeypatch.setattr(steps, "_run_ocr_mode", lambda *_args, **_kwargs: {"ocr_items": []})
+    monkeypatch.setattr(
+        steps,
+        "_matches_screen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("不应匹配聊天列表模板")),
+    )
+
+    assert steps._matches_chat_list_screen("list", config) is False

@@ -1169,11 +1169,15 @@ def _matches_chat_list_screen(
         if _chat_list_title_ocr_matches(ocr_result):
             _report(reporter, "chat_list_title_ocr", "识别到消息通话，判定聊天列表")
             return True
-    return _matches_screen(image, config, CHAT_LIST_SCREEN)
+    return False
 
 
 def current_screen(image: Any, config: dict[str, Any]) -> str:
+    if _matches_chat_list_screen(image, config):
+        return CHAT_LIST_SCREEN
     for state in all_screen_states(config):
+        if state.name == CHAT_LIST_SCREEN:
+            continue
         if match_template_with_region(
             image,
             state.path,
@@ -1183,8 +1187,6 @@ def current_screen(image: Any, config: dict[str, Any]) -> str:
             match_func=match,
         ):
             return state.name
-    if _matches_chat_list_screen(image, config):
-        return CHAT_LIST_SCREEN
     if _matches_screen(image, config, CHAT_WINDOW_SCREEN):
         return CHAT_WINDOW_SCREEN
     return "unknown"
@@ -1718,10 +1720,9 @@ def read_my_points(
     try:
         image = capture_after_popups(robot, cfg, label="after_points_message", reporter=reporter)
         _raise_if_black_screen(image, cfg)
-        if not _matches_screen(image, cfg, CHAT_LIST_SCREEN):
+        if not _matches_chat_list_screen(image, cfg, reporter=reporter):
             raise StepUnavailable(
-                f"读取积分后未能返回聊天列表，未匹配到模板："
-                f"{_template_failure_detail(cfg, CHAT_LIST_SCREEN, group='screens')}"
+                "读取积分后未能返回聊天列表，顶部 OCR 未识别到“消息”和“通话”"
             )
     except Exception as exc:
         # 积分已经识别成功，回到列表失败不能吞掉积分结果，主 UI 仍需显示余额。
@@ -2353,5 +2354,5 @@ def go_back(
 
     _set_metric(cfg, "return_clicks", back_clicks)
     _set_metric(cfg, "return_reason", "recheck_not_in_list")
-    raise StepUnavailable(f"返回后仍未进入聊天列表，未匹配到模板：{_template_failure_detail(cfg, CHAT_LIST_SCREEN, group='screens')}")
+    raise StepUnavailable("返回后仍未进入聊天列表，顶部 OCR 未识别到“消息”和“通话”")
 
