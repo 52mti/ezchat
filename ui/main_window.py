@@ -3855,6 +3855,18 @@ class DeviceSettingsDialogInteractive(QDialog):
         control_help.setWordWrap(True)
         control_layout.addWidget(control_help)
 
+        self.photo_sent_cooldown_seconds: QSpinBox | None = None
+        if self.app_name == "xinyu":
+            photo_form = QFormLayout()
+            photo_form.setContentsMargins(0, 0, 0, 0)
+            photo_form.setSpacing(8)
+            self.photo_sent_cooldown_seconds = QSpinBox()
+            self.photo_sent_cooldown_seconds.setRange(0, 2592000)
+            self.photo_sent_cooldown_seconds.setValue(int(self.overrides.get("photo_sent_cooldown_seconds", 86400) or 0))
+            self.photo_sent_cooldown_seconds.setToolTip("发送成功后，同一用户在此时间内不会再次收到主动照片。0 表示不限制。")
+            photo_form.addRow("同一用户发图冷却（秒，0不限制）", self.photo_sent_cooldown_seconds)
+            control_layout.addLayout(photo_form)
+
         field_specs = self._field_specs()
         if field_specs:
             target_form = QFormLayout()
@@ -4104,6 +4116,8 @@ class DeviceSettingsDialogInteractive(QDialog):
         for field_key, (x_spin, y_spin) in self.offset_spin_boxes.items():
             values[f"{field_key}_click_x_offset"] = x_spin.value()
             values[f"{field_key}_click_y_offset"] = y_spin.value()
+        if self.photo_sent_cooldown_seconds is not None:
+            values["photo_sent_cooldown_seconds"] = self.photo_sent_cooldown_seconds.value()
         return values
 
 
