@@ -79,6 +79,10 @@ from apps.visual_assets import (
     is_back_button_template_name,
     is_popup_template_name,
     match_template_with_region,
+    match_template_candidates_with_region,
+    TemplateMatchRegionMissingError,
+    popup_template_paths,
+    template_match_region,
     popup_template_region_key,
     template_variant_paths,
     template_path,
@@ -2372,6 +2376,7 @@ class PopupCropLabel(QWidget):
         super().__init__(parent)
         self.origin = QPoint()
         self.selection = QRect()
+        self.match_points: list[tuple[float, float]] = []
         self.on_point_selected: Any | None = None
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setMouseTracking(True)
@@ -2387,7 +2392,15 @@ class PopupCropLabel(QWidget):
         )
         self.origin = QPoint()
         self.selection = QRect()
+        self.match_points = []
         self.setFixedSize(self.display_pixmap.size())
+        self.update()
+
+    def set_match_points(self, points: list[tuple[float, float]]) -> None:
+        self.match_points = [
+            (max(0.0, min(1.0, float(x))), max(0.0, min(1.0, float(y))))
+            for x, y in points
+        ]
         self.update()
 
     def _display_point_to_source_ratio(self, point: QPoint) -> tuple[float, float]:
@@ -2422,6 +2435,13 @@ class PopupCropLabel(QWidget):
     def paintEvent(self, event: Any) -> None:
         painter = QPainter(self)
         painter.drawPixmap(0, 0, self.display_pixmap)
+        painter.setPen(QPen(QColor("#dc2626"), 3))
+        for x_ratio, y_ratio in self.match_points:
+            x = int(round(x_ratio * self.display_pixmap.width()))
+            y = int(round(y_ratio * self.display_pixmap.height()))
+            painter.drawLine(x - 12, y, x + 12, y)
+            painter.drawLine(x, y - 12, x, y + 12)
+            painter.drawEllipse(QPoint(x, y), 4, 4)
         if self.selection.isValid() and not self.selection.isNull():
             painter.setPen(QPen(QColor(249, 115, 22), 2))
             painter.setBrush(QColor(249, 115, 22, 40))
@@ -3305,6 +3325,12 @@ class AppConfigDialog(QDialog):
         self.keep_awake_interval_seconds.setValue(int(overrides.get("keep_awake_interval_seconds", DEFAULT_RUNTIME_CONFIG["keep_awake_interval_seconds"])))
         form.addRow("防熄屏跳转间隔（秒，0关闭）", self.keep_awake_interval_seconds)
 
+        self.photo_sent_cooldown_seconds = QSpinBox()
+        self.photo_sent_cooldown_seconds.setRange(0, 2592000)
+        self.photo_sent_cooldown_seconds.setValue(int(overrides.get("photo_sent_cooldown_seconds", 86400) or 0))
+        self.photo_sent_cooldown_seconds.setToolTip("主动照片发送成功后，同一用户在此时间内不会再次收到主动照片。")
+        form.addRow("同一用户发图冷却（秒，0不限制）", self.photo_sent_cooldown_seconds)
+
         self.ocr_toggle_button = QPushButton("显示OCR设置")
         self.ocr_toggle_button.clicked.connect(self._toggle_ocr_tab)
         panel_root.addWidget(self.ocr_toggle_button, 0, Qt.AlignmentFlag.AlignLeft)
@@ -3613,6 +3639,7 @@ class AppConfigDialog(QDialog):
             "poll_interval": self.poll_interval.value(),
             "step_timeout": self.step_timeout.value(),
             "keep_awake_interval_seconds": self.keep_awake_interval_seconds.value(),
+            "photo_sent_cooldown_seconds": self.photo_sent_cooldown_seconds.value(),
             "exclude_ocr_wait_from_step_timeout": self.exclude_ocr_wait_from_step_timeout.isChecked(),
             "match_threshold": self.match_threshold.value(),
             "popup_match_threshold": self.popup_match_threshold.value(),
@@ -3815,19 +3842,6 @@ class DeviceSettingsDialogInteractive(QDialog):
         screenshot_button_row.addStretch(1)
         screenshot_layout.addLayout(screenshot_button_row)
 
-        self.template_match_summary = QLabel("当前截图模板匹配：请先刷新截图。")
-        self.template_match_summary.setObjectName("HelperLabel")
-        self.template_match_summary.setWordWrap(True)
-        screenshot_layout.addWidget(self.template_match_summary)
-        self.template_match_table = QTableWidget(0, 4)
-        self.template_match_table.setHorizontalHeaderLabels(["类别", "状态", "命中模板", "相似度"])
-        self.template_match_table.verticalHeader().setVisible(False)
-        self.template_match_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        header = self.template_match_table.horizontalHeader()
-        for column in range(4):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents if column != 2 else QHeaderView.ResizeMode.Stretch)
-        screenshot_layout.addWidget(self.template_match_table)
-
         placeholder = QPixmap(720, 1280)
         placeholder.fill(QColor("#f8fafc"))
         self.crop_label = PopupCropLabel(placeholder)
@@ -3854,6 +3868,21 @@ class DeviceSettingsDialogInteractive(QDialog):
         control_help.setObjectName("HelperLabel")
         control_help.setWordWrap(True)
         control_layout.addWidget(control_help)
+
+        self.template_match_summary = QLabel("当前截图模板匹配：请先刷新截图。")
+        self.template_match_summary.setObjectName("HelperLabel")
+        self.template_match_summary.setWordWrap(True)
+        control_layout.addWidget(self.template_match_summary)
+        self.template_match_table = QTableWidget(0, 4)
+        self.template_match_table.setHorizontalHeaderLabels(["类别", "状态", "命中模板", "相似度"])
+        self.template_match_table.setMinimumHeight(170)
+        self.template_match_table.setMaximumHeight(280)
+        self.template_match_table.verticalHeader().setVisible(False)
+        self.template_match_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        header = self.template_match_table.horizontalHeader()
+        for column in range(4):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents if column != 2 else QHeaderView.ResizeMode.Stretch)
+        control_layout.addWidget(self.template_match_table)
 
         self.photo_sent_cooldown_seconds: QSpinBox | None = None
         if self.app_name == "xinyu":
