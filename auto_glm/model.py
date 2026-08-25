@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -12,6 +13,7 @@ import requests
 from PIL import Image
 
 from auto_glm.protocol import AutoGLMAction, parse_action
+from auto_glm.secrets import read_local_secret
 
 
 SYSTEM_PROMPT = """你是手机界面操作执行器。每次只输出一个动作，不要输出多个步骤。
@@ -28,6 +30,12 @@ class AutoGLMConfig:
     endpoint: str = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
     timeout_seconds: float = 60.0
     max_tokens: int = 512
+
+    @classmethod
+    def from_workspace(cls, workspace_root: Path, **overrides: Any) -> "AutoGLMConfig":
+        """Load the local AutoGLM key without exposing it in app configuration."""
+        api_key = read_local_secret(workspace_root, "autoglm.txt", "zhipu.txt")
+        return cls(api_key=api_key, **overrides)
 
 
 @dataclass(frozen=True)

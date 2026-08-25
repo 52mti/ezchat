@@ -5,6 +5,7 @@ import pytest
 
 from auto_glm.adapter import RobotActionAdapter
 from auto_glm.gpt_planner import GPTPlannerClient, GPTPlannerConfig
+from auto_glm.model import AutoGLMConfig
 from auto_glm.planner import ExecutionPlan
 from auto_glm.protocol import parse_action
 from auto_glm.verification import compare_images, image_signature, verify_transition
@@ -91,6 +92,19 @@ def test_gpt_planner_returns_strict_execution_plan():
 
     assert plan.summary == "测试"
     assert plan.nodes[0].verification == "页面变化"
+
+
+def test_model_configs_load_keys_from_workspace_env(tmp_path):
+    env_dir = tmp_path / ".env"
+    env_dir.mkdir()
+    (env_dir / "gpt_planner.txt").write_text("OPENAI_API_KEY=gpt-test\n", encoding="utf-8")
+    (env_dir / "autoglm.txt").write_text("AUTOGLM_API_KEY=glm-test\n", encoding="utf-8")
+
+    planner = GPTPlannerConfig.from_workspace(tmp_path, model="gpt", endpoint="https://example.test")
+    executor = AutoGLMConfig.from_workspace(tmp_path)
+
+    assert planner.api_key == "gpt-test"
+    assert executor.api_key == "glm-test"
 
 
 def test_visual_transition_requires_meaningful_change():

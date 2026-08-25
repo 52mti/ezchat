@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import requests
 
 from auto_glm.planner import ExecutionPlan
+from auto_glm.secrets import read_local_secret
 
 
 _PLANNER_PROMPT = """你是自动化流程规划器。将用户目标拆成小而可验证的原子节点。
@@ -25,6 +27,12 @@ class GPTPlannerConfig:
     endpoint: str
     timeout_seconds: float = 75.0
     max_tokens: int = 3000
+
+    @classmethod
+    def from_workspace(cls, workspace_root: Path, *, model: str, endpoint: str, **overrides: Any) -> "GPTPlannerConfig":
+        """Load GPT planner credentials from ``.env/gpt_planner.txt``."""
+        api_key = read_local_secret(workspace_root, "gpt_planner.txt")
+        return cls(api_key=api_key, model=model, endpoint=endpoint, **overrides)
 
 
 class GPTPlannerClient:
