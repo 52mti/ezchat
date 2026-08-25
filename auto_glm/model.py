@@ -144,6 +144,12 @@ def _split_thinking(content: str) -> tuple[str, str]:
     thinking = ""
     if "<think>" in text:
         thinking = text.split("<think>", 1)[1].split("</think>", 1)[0].strip()
+    else:
+        # Some AutoGLM replies omit the requested XML tags but still explain the
+        # choice before the executable action. Keep that explanation visible.
+        starts = [index for index in (text.find("do("), text.find("finish(")) if index >= 0]
+        if starts:
+            thinking = text[: min(starts)].strip()
     return thinking, text
 
 

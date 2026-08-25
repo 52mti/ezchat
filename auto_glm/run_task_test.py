@@ -65,8 +65,9 @@ AUTOGLM_EXECUTOR_PROMPT = """你是手机界面视觉执行智能体，可以根
 3. 点击前先确认目标在截图中可见；点击后先观察新截图是否生效。页面未变化时，可 Wait 一次，再根据新截图调整一次点击位置。
 4. 当前短目标已满足时必须输出 finish，不能继续重复点击。每轮当前截图会自动进入动作历史；根据完整任务上下文判断任务是否已经完成。
 5. 目标不在可见区域时，使用 Swipe 探索；不要在同一位置重复无效点击。
-6. 不要输出 Home、Take_over、Long Press、Double Tap、Note、Call_API 或解释性文本。需要返回时优先输出 Back。
-7. <answer> 内必须包含 do(action=...) 或 finish(message=...)。"""
+6. 当任务要求“选择照片”时，只能点击实际照片缩略图；相机图标、拍摄入口、空白占位、标签和返回按钮都不是照片，不能点击。
+7. 不要输出 Home、Take_over、Long Press、Double Tap、Note、Call_API 或解释性文本。需要返回时优先输出 Back。
+8. <answer> 内必须包含 do(action=...) 或 finish(message=...)。"""
 
 
 class RollingLog:
@@ -132,7 +133,10 @@ def _plan(task: str, output_dir: Path, log: RollingLog) -> ExecutionPlan:
             "执行器职责": "AutoGLM 根据连续截图独立判断页面、定位并输出 Tap/Swipe/Type/Wait/finish。",
             "限制": "不得使用模板匹配、OCR、颜色规则、无障碍节点或 App 专项流程。",
         },
-        project_skills="每个节点必须可由连续截图完成，避免生成仅观察、不产生状态推进的节点。",
+        project_skills=(
+            "每个节点必须可由连续截图完成，避免生成仅观察、不产生状态推进的节点。"
+            "只规划目标状态，不假设中间 UI；例如“进入相册”不可拆成“打开附件面板”。"
+        ),
     )
     (output_dir / "GPT规划.json").write_text(
         json.dumps({"summary": plan.summary, "nodes": [node.__dict__ for node in plan.nodes]}, ensure_ascii=False, indent=2),
@@ -160,11 +164,12 @@ def _run_node(
     for action_index in range(1, max(1, args.max_actions_per_node) + 1):
         image = _capture(robot, output_dir, f"{node_index:02d}_{action_index:02d}_动作前", log)
         instruction = (
-            f"总体用户任务：{history[0]}\n"
             f"当前节点目标：{node.goal}\n"
             f"本次执行指令：{node.executor_task}\n"
             f"当前节点成功条件：{node.verification}\n"
-            "若当前节点已满足成功条件，输出 finish；否则只执行推进当前节点的一个动作。"
+            "硬性边界：只处理当前节点，禁止执行任何后续节点的操作。"
+            "当前截图一旦满足当前节点成功条件，必须立刻输出 finish，不能再点击、不能预先选择照片或发送。"
+            "只有当前截图尚未满足成功条件时，才输出一个推进当前节点的动作。"
         )
         references = _node_visual_references(node)
         if references:
@@ -188,6 +193,8 @@ def _run_node(
             ),
             encoding="utf-8",
         )
+        thinking = " ".join(decision.thinking.split()) or "（模型未返回 think 内容）"
+        log.write("思考", f"节点 {node.id} 第 {action_index} 步：{thinking}")
         log.write("信息", f"节点 {node.id} 第 {action_index} 步：AutoGLM={action.name}，参数={action.arguments}")
         if action.finished:
             history.append(f"节点 {node.id} 已完成：{action.message or node.goal}")

@@ -15,8 +15,11 @@ from auto_glm.secrets import read_local_secret
 _PLANNER_PROMPT = """你是自动化流程规划器。将用户目标拆成小而可验证的原子节点。
 每个节点必须包含 id、goal、executor_task、verification、on_failure、executor、retry、timeout_seconds。
 executor.type 只能是 template、ocr、color、program、autoglm、hybrid。
-本地模板/OCR/颜色规则优先；只有本地规则不能可靠定位时才使用 autoglm。
+必须严格遵守调用方声明的可用能力，不能凭空添加模板、OCR、颜色检测或 App 专项知识。
 AutoGLM 每次只能执行一个短动作，动作后必须重新截图验证。所有文本必须是简体中文。
+节点描述只表达可观察的目标状态，不能臆测界面一定存在某个中间面板、按钮或入口。
+例如目标是进入相册时，节点应为“进入照片选择界面”，不能擅自拆成“打开附件面板再进入相册”；具体从哪个可见入口进入由视觉执行器根据截图决定。
+每个节点只能完成一个状态迁移，不得把后续节点的操作合并到当前节点。
 只输出 JSON：{"summary":"...","nodes":[...]}。"""
 
 
