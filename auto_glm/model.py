@@ -68,7 +68,7 @@ class AutoGLMClient:
         history: list[str] | None = None,
         system_prompt: str | None = None,
         reference_images: list[tuple[str, Any]] | None = None,
-        previous_screenshot: Any | None = None,
+        conversation: list[dict[str, Any]] | None = None,
     ) -> ModelDecision:
         instruction = f"当前原子任务：{task.strip()}"
         if history:
@@ -77,13 +77,6 @@ class AutoGLMClient:
             {"type": "text", "text": "当前完整截图（动作坐标必须基于此图输出）："},
             {"type": "image_url", "image_url": {"url": _as_data_url(screenshot)}},
         ]
-        if previous_screenshot is not None:
-            content.extend(
-                [
-                    {"type": "text", "text": "上一轮动作前截图（只用于比较页面变化，不得以此图坐标输出动作）："},
-                    {"type": "image_url", "image_url": {"url": _as_data_url(previous_screenshot)}},
-                ]
-            )
         for label, reference_image in reference_images or []:
             content.extend(
                 [
@@ -92,17 +85,16 @@ class AutoGLMClient:
                 ]
             )
         content.append({"type": "text", "text": instruction})
+        user_message = {"role": "user", "content": content}
+        messages = conversation if conversation is not None else [
+            {"role": "system", "content": system_prompt or SYSTEM_PROMPT}
+        ]
+        messages.append(user_message)
         payload = {
             "model": self.config.model,
             "max_tokens": self.config.max_tokens,
             "temperature": 0,
-            "messages": [
-                {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": content,
-                },
-            ],
+            "messages": messages,
         }
         response = self.session.post(
             self.config.endpoint,
@@ -120,8 +112,21 @@ class AutoGLMClient:
         try:
             action = parse_action(action_text)
         except ValueError as error:
+            if conversation is not None:
+                messages.pop()
             raise AutoGLMProtocolError(str(error), content) from error
-        return ModelDecision(action=action, thinking=thinking, raw_content=content)
+        decision = ModelDecision(action=action, thinking=thinking, raw_content=content)
+        if conversation is not None:
+            # Mirror Open-AutoGLM: keep the action trace as text, but discard
+            # old screenshot bytes after each turn to control context size.
+            messages[-1] = {
+                "role": "user",
+                "content": [item for item in user_message["content"] if item.get("type") == "text"],
+            }
+            messages.append(
+                {"role": "assistant", "content": f"<think>{thinking}</think><answer>{_action_text(content)}</answer>"}
+            )
+        return decision
 
 
 def _as_data_url(image: Any) -> str:
@@ -140,6 +145,14 @@ def _split_thinking(content: str) -> tuple[str, str]:
     if "<think>" in text:
         thinking = text.split("<think>", 1)[1].split("</think>", 1)[0].strip()
     return thinking, text
+
+
+def _action_text(content: str) -> str:
+    text = str(content).strip()
+    if "<answer>" in text:
+        return text.split("<answer>", 1)[1].split("</answer>", 1)[0].strip()
+    starts = [index for index in (text.find("do("), text.find("finish(")) if index >= 0]
+    return text[min(starts) :].strip() if starts else text
 
 
 def _content_to_text(content: Any) -> str:

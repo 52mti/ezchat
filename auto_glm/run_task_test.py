@@ -63,7 +63,7 @@ AUTOGLM_EXECUTOR_PROMPT = """你是手机界面视觉执行智能体，可以根
 1. 每次只能输出一条动作。执行后你会收到新的当前截图。
 2. 只能依据当前截图、当前短目标和历史动作判断；不要假设模板、OCR、控件树或固定坐标存在。
 3. 点击前先确认目标在截图中可见；点击后先观察新截图是否生效。页面未变化时，可 Wait 一次，再根据新截图调整一次点击位置。
-4. 当前短目标已满足时必须输出 finish，不能继续重复点击。若对比上一轮截图后发现总体用户任务已经完成，必须输出 finish(message="ALL_DONE: 原因")，不能继续后续节点。
+4. 当前短目标已满足时必须输出 finish，不能继续重复点击。每轮当前截图会自动进入动作历史；根据完整任务上下文判断任务是否已经完成。
 5. 目标不在可见区域时，使用 Swipe 探索；不要在同一位置重复无效点击。
 6. 不要输出 Home、Take_over、Long Press、Double Tap、Note、Call_API 或解释性文本。需要返回时优先输出 Back。
 7. <answer> 内必须包含 do(action=...) 或 finish(message=...)。"""
@@ -110,11 +110,9 @@ def main() -> int:
             args.device, "xinyu", XINYU_DEFAULT_CONFIG
         )
         history = [f"总体用户任务：{task}"]
+        conversation: list[dict[str, Any]] = [{"role": "system", "content": AUTOGLM_EXECUTOR_PROMPT}]
         for index, node in enumerate(plan.nodes, start=1):
-            result = _run_node(robot, model, node, index, output_dir, log, history, args, back_config)
-            if result == "all_done":
-                log.write("信息", "AutoGLM 已确认总体任务完成，跳过剩余 GPT 节点。")
-                return 0
+            result = _run_node(robot, model, node, index, output_dir, log, history, conversation, args, back_config)
             if result != "node_done":
                 log.write("错误", f"节点 {node.id} 未完成，停止整个任务。失败策略：{node.on_failure}")
                 return 3
@@ -154,11 +152,11 @@ def _run_node(
     output_dir: Path,
     log: RollingLog,
     history: list[str],
+    conversation: list[dict[str, Any]],
     args: argparse.Namespace,
     back_config: dict[str, Any],
 ) -> str:
     log.write("信息", f"开始节点 {node.id}：{node.goal}")
-    previous_image: Image.Image | None = None
     for action_index in range(1, max(1, args.max_actions_per_node) + 1):
         image = _capture(robot, output_dir, f"{node_index:02d}_{action_index:02d}_动作前", log)
         instruction = (
@@ -166,14 +164,13 @@ def _run_node(
             f"当前节点目标：{node.goal}\n"
             f"本次执行指令：{node.executor_task}\n"
             f"当前节点成功条件：{node.verification}\n"
-            "若当前截图已显示总体用户任务完成，输出 finish(message=\"ALL_DONE: 原因\")；"
-            "否则若当前节点已满足成功条件，输出 finish；否则只执行推进当前节点的一个动作。"
+            "若当前节点已满足成功条件，输出 finish；否则只执行推进当前节点的一个动作。"
         )
         references = _node_visual_references(node)
         if references:
             log.write("信息", "本节点已向 AutoGLM 提供视觉参考图：" + "、".join(label for label, _ in references))
         decision = _request_action_with_retry(
-            model, instruction, image, history, output_dir, node_index, action_index, log, references, previous_image
+            model, instruction, image, output_dir, node_index, action_index, log, references, conversation
         )
         if decision is None:
             return "failed"
@@ -195,7 +192,7 @@ def _run_node(
         if action.finished:
             history.append(f"节点 {node.id} 已完成：{action.message or node.goal}")
             log.write("信息", f"节点 {node.id} 完成：{action.message or node.goal}")
-            return "all_done" if action.message.strip().upper().startswith("ALL_DONE") else "node_done"
+            return "node_done"
         if args.dry_run:
             log.write("信息", "诊断模式未执行模型动作，当前节点到此结束")
             return "failed"
@@ -204,7 +201,6 @@ def _run_node(
         if not success:
             return "failed"
         history.append(f"节点 {node.id} 第 {action_index} 步执行 {action.name}：{message}")
-        previous_image = image
         time.sleep(0.8)
     log.write("错误", f"节点 {node.id} 超过最大动作数 {args.max_actions_per_node}，模型未声明完成")
     return "failed"
@@ -214,13 +210,12 @@ def _request_action_with_retry(
     model: AutoGLMClient,
     instruction: str,
     image: Image.Image,
-    history: list[str],
     output_dir: Path,
     node_index: int,
     action_index: int,
     log: RollingLog,
     references: list[tuple[str, Image.Image]],
-    previous_image: Image.Image | None,
+    conversation: list[dict[str, Any]],
 ):
     for attempt in range(1, 3):
         retry_instruction = instruction
@@ -230,10 +225,8 @@ def _request_action_with_retry(
             return model.decide(
                 retry_instruction,
                 image,
-                history=history,
-                system_prompt=AUTOGLM_EXECUTOR_PROMPT,
                 reference_images=references,
-                previous_screenshot=previous_image,
+                conversation=conversation,
             )
         except AutoGLMProtocolError as error:
             path = output_dir / f"{node_index:02d}_{action_index:02d}_协议异常_第{attempt}次.txt"
