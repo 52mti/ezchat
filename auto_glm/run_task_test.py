@@ -146,7 +146,7 @@ def _run_node(
     execute: bool,
 ) -> bool:
     before = _capture(robot, output_dir, f"{index:02d}_动作前", log)
-    state = steps.current_screen(before, config)
+    state = _screen_state(before, config)
     log.log("信息", f"节点 {node.id} 当前界面={state}；请求 AutoGLM：{node.executor_task}")
     decision = model.decide(node.executor_task, before, history=history)
     action = decision.action
@@ -245,6 +245,17 @@ def _wait_seconds(value: Any) -> float:
         return max(0.0, float(str(value).split()[0]))
     except (TypeError, ValueError, IndexError):
         return 1.0
+
+
+def _screen_state(image: Image.Image, config: dict[str, Any]) -> str:
+    """Diagnostic runner must not invoke OCR merely to label the page."""
+    if steps._matches_screen(image, config, steps.CHAT_WINDOW_SCREEN):
+        return steps.CHAT_WINDOW_SCREEN
+    if steps._matches_screen(image, config, steps.CHAT_LIST_SCREEN):
+        return steps.CHAT_LIST_SCREEN
+    if steps._matches_screen(image, config, steps.CALL_SCREEN):
+        return steps.CALL_SCREEN
+    return "unknown"
 
 
 if __name__ == "__main__":

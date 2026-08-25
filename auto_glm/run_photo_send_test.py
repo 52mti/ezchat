@@ -39,7 +39,6 @@ from apps.xinyu.config import DEFAULT_CONFIG  # noqa: E402
 from apps.visual_assets import format_template_match_diagnostic  # noqa: E402
 from auto_glm.gpt_planner import GPTPlannerClient, GPTPlannerConfig  # noqa: E402
 from auto_glm.model import AutoGLMClient, AutoGLMConfig  # noqa: E402
-from auto_glm.verification import compare_images  # noqa: E402
 from lgb.lgb import RobotInterface  # noqa: E402
 
 
@@ -88,7 +87,7 @@ def main() -> int:
     try:
         _write_plan(logger, output_dir, args)
         before = _capture(robot, output_dir, "01_开始截图", logger)
-        screen = steps.current_screen(before, config)
+        screen = _screen_state(before, config)
         logger.info(f"当前界面判定={screen}")
 
         if screen == steps.CHAT_WINDOW_SCREEN:
@@ -190,6 +189,7 @@ def _open_album(
     point = steps._template_center(image, config, steps.PHOTO_BUTTON, group="buttons")
     if point is None:
         logger.error(f"未找到照片按钮模板：{format_template_match_diagnostic(config, steps.PHOTO_BUTTON)}")
+        _save_candidate_template(image, candidate, steps.PHOTO_BUTTON, output_dir, logger)
         return False
     logger.info(f"本地照片模板命中：{_point(point)}，将使用该点而非模型候选")
     if args.dry_run:
@@ -209,7 +209,7 @@ def _select_random_photo(
     logger: TestLogger,
     args: argparse.Namespace,
 ) -> bool:
-    if steps.current_screen(image, config) == steps.CHAT_WINDOW_SCREEN:
+    if _screen_state(image, config) == steps.CHAT_WINDOW_SCREEN:
         logger.error("点击照片按钮后仍在聊天界面，未进入选图页")
         return False
     left, top, right, bottom = map(float, config["photo_select_random_bounds"])
@@ -235,9 +235,13 @@ def _complete_send(
     candidate = _model_candidate(image, "当前已选择一张照片。点击用于确认发送该照片的完成按钮。只执行本步骤。", output_dir, logger, args)
     if candidate:
         logger.info(f"AutoGLM 完成按钮候选：{_point(candidate)}")
+        region = config["template_match_regions"][steps.COMPLETE_BUTTON]
+        if not _in_region(candidate, region):
+            logger.warning(f"完成按钮候选超出当前配置范围：范围={region}；不会使用该坐标点击")
     point = steps._template_center(image, config, steps.COMPLETE_BUTTON, group="buttons")
     if point is None:
         logger.error(f"未找到完成按钮模板：{format_template_match_diagnostic(config, steps.COMPLETE_BUTTON)}")
+        _save_candidate_template(image, candidate, steps.COMPLETE_BUTTON, output_dir, logger)
         logger.error("本次已停止发送；请检查 05_发送前预览.jpg 后补充当前界面模板或范围")
         return False
     logger.info(f"本地完成按钮模板命中：{_point(point)}")
@@ -284,7 +288,7 @@ def _model_candidate(
 
 
 def _verify_after_send(image: Image.Image, config: dict[str, Any], logger: TestLogger) -> None:
-    screen = steps.current_screen(image, config)
+    screen = _screen_state(image, config)
     complete = steps._template_center(image, config, steps.COMPLETE_BUTTON, group="buttons")
     logger.info(f"发送后界面判定={screen}，完成按钮={'仍存在' if complete else '未检测到'}")
     if screen != steps.CHAT_WINDOW_SCREEN:
@@ -298,6 +302,43 @@ def _in_region(point: tuple[float, float], region: list[float]) -> bool:
 
 def _point(point: tuple[float, float]) -> str:
     return f"({point[0]:.3f}, {point[1]:.3f})"
+
+
+def _screen_state(image: Image.Image, config: dict[str, Any]) -> str:
+    """Use templates only; diagnostic runs must not initialize the OCR runtime."""
+    if steps._matches_screen(image, config, steps.CHAT_WINDOW_SCREEN):
+        return steps.CHAT_WINDOW_SCREEN
+    if steps._matches_screen(image, config, steps.CHAT_LIST_SCREEN):
+        return steps.CHAT_LIST_SCREEN
+    if steps._matches_screen(image, config, steps.CALL_SCREEN):
+        return steps.CALL_SCREEN
+    return "unknown"
+
+
+def _save_candidate_template(
+    image: Image.Image,
+    candidate: tuple[float, float] | None,
+    key: str,
+    output_dir: Path,
+    logger: TestLogger,
+) -> None:
+    if candidate is None:
+        logger.warning("模型未给出候选点，无法生成候选模板截图")
+        return
+    width, height = image.size
+    center_x, center_y = int(candidate[0] * width), int(candidate[1] * height)
+    half_width, half_height = max(32, width // 16), max(24, height // 22)
+    crop = image.crop(
+        (
+            max(0, center_x - half_width),
+            max(0, center_y - half_height),
+            min(width, center_x + half_width),
+            min(height, center_y + half_height),
+        )
+    )
+    path = output_dir / f"候选模板_{key.replace('.', '_')}.jpg"
+    crop.save(path, quality=95)
+    logger.info(f"已保存 AutoGLM 候选模板截图：{path.name}，候选={_point(candidate)}")
 
 
 if __name__ == "__main__":
