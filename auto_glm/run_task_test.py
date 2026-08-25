@@ -29,6 +29,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from apps.coordinates import click_image_point  # noqa: E402
+from apps.photo_capture import capture_transform_image  # noqa: E402
 from auto_glm.gpt_planner import GPTPlannerClient, GPTPlannerConfig  # noqa: E402
 from auto_glm.model import AutoGLMClient, AutoGLMConfig, AutoGLMProtocolError  # noqa: E402
 from auto_glm.planner import ExecutionPlan, PlanNode  # noqa: E402
@@ -218,8 +219,12 @@ def _request_action_with_retry(
 
 def _capture(robot: RobotInterface, output_dir: Path, name: str, log: RollingLog) -> Image.Image:
     log.write("信息", f"截图：{name}")
-    image = Image.open(BytesIO(robot.get_transform_image(pre_move=True))).convert("RGB")
+    # Reuse the project's calibrated perspective + portrait normalization so
+    # model coordinates and mechanical-arm coordinates share one orientation.
+    image_data = capture_transform_image(robot, {}, pre_move=True, label=f"autoglm_{name}")
+    image = Image.open(BytesIO(bytes(image_data))).convert("RGB")
     image.save(output_dir / f"{name}.jpg", quality=95)
+    log.write("信息", f"截图坐标系：竖屏 {image.width}x{image.height}")
     return image
 
 
