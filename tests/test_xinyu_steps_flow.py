@@ -833,8 +833,46 @@ def test_xinyu_list_keeps_initial_content_when_unread_switch_is_empty(monkeypatc
 
     assert target is None
     assert robot.clicks == [pytest.approx(((0.329 + 0.47) / 2, (0.125 + 0.153) / 2))]
-    assert "切换后未找到未回复入口，不读取列表目标" in reports
+    assert "切换后未找到未回复入口，且无未读消息，不读取列表目标" in reports
     assert "未回复入口不是红色，不读取列表目标" in reports
+
+
+def test_xinyu_list_uses_unread_rows_when_switched_tab_text_is_missed(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["list"])
+
+    monkeypatch.setattr(steps, "ensure_list_screen", lambda robot, config, reporter=None, image=None: "list")
+    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, config, label="screen", reporter=None: "after_unread")
+    monkeypatch.setattr(
+        steps,
+        "_red_pixel_stats",
+        lambda image, match_result: {"has_red": False, "red_pixels": 0, "total_pixels": 100, "threshold": 1, "region": [1, 2, 3, 4]},
+    )
+    monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
+
+    def fake_ocr(image, cfg, mode, region=None):
+        if image == "after_unread":
+            return {
+                "result": {
+                    "bottom_nav": [],
+                    "message_list": [
+                        {"name": "心想事成", "favorability": 63, "unread_count": 1, "content": "你好", "bounds": [0.184, 0.177, 0.977, 0.247]},
+                        {"name": "风回路转", "favorability": 87, "unread_count": 1, "content": "在吗", "bounds": [0.184, 0.374, 0.977, 0.445]},
+                    ],
+                },
+                "ocr_items": [],
+            }
+        return {
+            "result": {"bottom_nav": [{"name": "未回复", "bounds": [0.329, 0.125, 0.47, 0.153]}], "message_list": []},
+            "ocr_items": [],
+        }
+
+    monkeypatch.setattr(steps, "run_ocr_mode", fake_ocr)
+
+    target = steps.find_unread_target(robot, config)
+
+    assert target is not None
+    assert target["name"] == "风回路转"
 
 
 def test_xinyu_list_ignores_empty_placeholder_when_falling_back_to_content(monkeypatch, tmp_path):

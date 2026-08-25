@@ -610,7 +610,7 @@ def _list_candidate_score(index: int, row: dict[str, Any]) -> tuple[int, int, di
     return favorability_value, -index, row
 
 
-def _select_list_target_from_rows(rows: Any) -> dict[str, Any] | None:
+def _select_list_target_from_rows(rows: Any, *, require_unread: bool = False) -> dict[str, Any] | None:
     if not isinstance(rows, list):
         return None
     unread_candidates: list[tuple[int, int, dict[str, Any]]] = []
@@ -631,7 +631,7 @@ def _select_list_target_from_rows(rows: Any) -> dict[str, Any] | None:
             continue
         if _clean_list_text(row.get("content")):
             content_candidates.append(candidate)
-    candidates = unread_candidates or content_candidates
+    candidates = unread_candidates if require_unread else (unread_candidates or content_candidates)
     if not candidates:
         return None
     _favorability, _position, selected_row = max(candidates, key=lambda item: (item[0], item[1]))
@@ -648,10 +648,14 @@ def _select_list_target_from_rows(rows: Any) -> dict[str, Any] | None:
     }
 
 
-def _select_list_target_from_ocr_result(ocr_result: dict[str, Any]) -> dict[str, Any] | None:
+def _select_list_target_from_ocr_result(
+    ocr_result: dict[str, Any],
+    *,
+    require_unread: bool = False,
+) -> dict[str, Any] | None:
     result = ocr_result.get("result", {}) if isinstance(ocr_result, dict) else {}
     rows = result.get("message_list", []) if isinstance(result, dict) else []
-    return _select_list_target_from_rows(rows)
+    return _select_list_target_from_rows(rows, require_unread=require_unread)
 
 
 def _photo_contact_key(value: Any) -> str:
@@ -1430,11 +1434,20 @@ def check_unread_button(
     time.sleep(0.4)
     current_image = capture_after_popups(robot, cfg, label="after_unread_button", reporter=reporter)
     ocr_result = _run_list_ocr(current_image, cfg, reporter=reporter, prefer_compact=True)
+    unread_target = _select_list_target_from_ocr_result(ocr_result, require_unread=True)
     bottom_nav = ocr_result["result"].get("bottom_nav", [])
     unread_item = _bottom_nav_item(bottom_nav, UNREAD_TAB_KEYWORDS)
     if unread_item is None:
+        if unread_target is not None:
+            _mark_unread_tab_red_state(ocr_result, True)
+            _report(
+                reporter,
+                "unread_button_check",
+                "切换后未识别到未回复入口文字，但发现未读消息，继续读取列表目标",
+            )
+            return current_image, ocr_result
         _mark_unread_tab_red_state(ocr_result, False)
-        _report(reporter, "unread_button_check", "切换后未找到未回复入口，不读取列表目标")
+        _report(reporter, "unread_button_check", "切换后未找到未回复入口，且无未读消息，不读取列表目标")
         return current_image, ocr_result
     nav_item, unread_center = unread_item
     bounds = nav_item.get("bounds")
@@ -1445,7 +1458,8 @@ def check_unread_button(
     _cache_unread_tab_band(cfg, bounds)
     red_stats = _red_pixel_stats(current_image, _match_result_from_bounds(bounds))
     has_red = bool(red_stats.get("has_red"))
-    _mark_unread_tab_red_state(ocr_result, has_red)
+    confirmed_unread_page = has_red or unread_target is not None
+    _mark_unread_tab_red_state(ocr_result, confirmed_unread_page)
     red_detail = (
         f"红色像素={red_stats.get('red_pixels', 0)}/{red_stats.get('total_pixels', 0)}"
         f"，阈值={red_stats.get('threshold', 0)}，区域={red_stats.get('region')}"
@@ -1453,11 +1467,19 @@ def check_unread_button(
     _report(
         reporter,
         "unread_button_check",
-        "切换后未回复入口已有红色" if has_red else "切换后未回复入口仍无红色，不读取列表目标",
+        "切换后未回复入口已有红色" if has_red else (
+            "切换后入口无红色，但发现未读消息，继续读取列表目标"
+            if unread_target is not None
+            else "切换后未回复入口仍无红色，且无未读消息，不读取列表目标"
+        ),
         log_label=(
             f"切换后未回复入口已有红色：{format_point(*unread_center)}，{red_detail}"
             if has_red
-            else f"切换后未回复入口仍无红色，不读取列表目标：{format_point(*unread_center)}，{red_detail}"
+            else (
+                f"切换后入口无红色，但发现未读消息，继续读取列表目标：{format_point(*unread_center)}，{red_detail}"
+                if unread_target is not None
+                else f"切换后未回复入口仍无红色，且无未读消息，不读取列表目标：{format_point(*unread_center)}，{red_detail}"
+            )
         ),
     )
     return current_image, ocr_result
