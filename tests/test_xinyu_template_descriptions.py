@@ -13,6 +13,9 @@ def test_xinyu_template_descriptions_keep_photo_fallback_constrained():
 
     assert photo["reference_template"] == "btn_照片按钮.jpg"
     assert photo["fallback"]["enabled"] is True
-    assert payload["model_observation_policy"]["must_stay_within_configured_match_region"] is True
+    policy = payload["model_observation_policy"]
+    assert policy["output_coordinate_space"] == "crop_normalized_1000"
+    assert policy["coordinate_scale"] == 1000
+    assert policy["must_stay_within_configured_match_region"] is True
     assert payload["model_observation_policy"]["local_pixel_recheck_required"] is True
     assert payload["model_observation_policy"]["auto_click_from_model_output"] is False

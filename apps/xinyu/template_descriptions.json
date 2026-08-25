@@ -3,11 +3,13 @@
   "model_observation_policy": {
     "reference_image_required": true,
     "observation_only": true,
-    "output_coordinate_space": "crop_3x3_grid",
+    "output_coordinate_space": "crop_normalized_1000",
+    "coordinate_scale": 1000,
     "must_stay_within_configured_match_region": true,
     "local_pixel_recheck_required": true,
     "auto_click_from_model_output": false
   },
+  "model_prompt_template": "你是视觉复核器，只观察，不执行操作，不规划下一步。参考图是目标模板，待检测图是该模板已配置匹配范围的裁图。待检测图的左上角为 (0,0)，右下角为 (1000,1000)，无论其实际像素宽高是多少。仅判断裁图内是否存在与参考图相同或因反光、阴影、失焦而外观略有变化的控件。只返回 JSON：{\"found\":true,\"confidence\":0.0,\"bbox\":[left,top,right,bottom],\"reason\":\"不超过20个中文字符\"}。bbox 中每个值必须是 0 到 1000 的整数；不存在时 bbox 为 null。",
   "templates": {
     "button.photo": {
       "reference_template": "btn_照片按钮.jpg",
@@ -15,7 +17,7 @@
       "description": "浅蓝灰色圆角方形相册图标，内部有深灰色山峰和圆形太阳。点击后打开系统或应用内照片选择界面。",
       "visual_features": ["圆角方形", "相册", "山峰", "圆形太阳", "浅蓝灰底色"],
       "exclude": ["输入框", "麦克风", "底部导航", "普通图片缩略图", "发送按钮"],
-      "fallback": {"enabled": true, "weak_match_threshold": 0.52, "max_calls_per_image": 1}
+      "fallback": {"enabled": true, "weak_match_threshold": 0.52, "max_calls_per_image": 1, "model_search_area": "configured_match_region"}
     },
     "button.complete": {
       "reference_template": "btn_完成按钮.jpg",
