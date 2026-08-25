@@ -1622,10 +1622,19 @@ def read_my_points(
         _report(reporter, "message_button_click", "读取积分后未找到消息位置，不触发复位")
         return points or None
     time.sleep(0.6)
-    image = capture_after_popups(robot, cfg, label="after_points_message", reporter=reporter)
-    _raise_if_black_screen(image, cfg)
-    if not _matches_screen(image, cfg, CHAT_LIST_SCREEN):
-        raise StepUnavailable(f"读取积分后未能返回聊天列表，未匹配到模板：{_template_failure_detail(cfg, CHAT_LIST_SCREEN, group='screens')}")
+    try:
+        image = capture_after_popups(robot, cfg, label="after_points_message", reporter=reporter)
+        _raise_if_black_screen(image, cfg)
+        if not _matches_screen(image, cfg, CHAT_LIST_SCREEN):
+            raise StepUnavailable(
+                f"读取积分后未能返回聊天列表，未匹配到模板："
+                f"{_template_failure_detail(cfg, CHAT_LIST_SCREEN, group='screens')}"
+            )
+    except Exception as exc:
+        # 积分已经识别成功，回到列表失败不能吞掉积分结果，主 UI 仍需显示余额。
+        _report(reporter, "points_return_list_failed", "积分已读取，返回聊天列表失败", log_label=str(exc))
+        if not points:
+            raise
     return points or None
 
 
@@ -1754,6 +1763,13 @@ def send_photo_to_online_target(
             )
 
     excluded_contacts = _photo_sent_contacts(cfg)
+    if excluded_contacts:
+        _report(
+            reporter,
+            "online_filter",
+            "过滤冷却中的已发照片用户",
+            log_label=f"过滤冷却中的已发照片用户：{len(excluded_contacts)} 位",
+        )
     target = _select_online_target_from_ocr_result(
         online_ocr,
         excluded_contacts=excluded_contacts,
@@ -1800,9 +1816,7 @@ def send_photo_to_online_target(
         raise StepUnavailable(f"选择照片后未找到完成按钮模板：{_template_failure_detail(cfg, COMPLETE_BUTTON, group='buttons')}")
     _report(reporter, "photo_complete", "点击完成发送照片", log_label=f"点击完成发送照片：{format_point(*complete_pos)}")
     click_image_point(robot, *complete_pos)
-    time.sleep(0.6)
-    # 主动发图后只需退出一次聊天；go_back 会截图确认是否已回到列表。
-    go_back(robot, cfg, double_click_on_first_attempt=False, reporter=reporter)
+    # “完成”即代表照片已提交；返回失败也必须保留冷却记录，避免重复发送。
     _record_photo_sent_contact(cfg, target.get("name"))
     _report(
         reporter,
@@ -1810,6 +1824,9 @@ def send_photo_to_online_target(
         "记录已发照片用户",
         log_label=f"记录已发照片用户：{str(target.get('name', '') or '').strip()}",
     )
+    time.sleep(0.6)
+    # 主动发图后只需退出一次聊天；go_back 会截图确认是否已回到列表。
+    go_back(robot, cfg, double_click_on_first_attempt=False, reporter=reporter)
     return True
 
 
