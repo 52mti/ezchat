@@ -77,12 +77,6 @@ def main() -> int:
     if not task:
         print("未输入任务，已退出。", flush=True)
         return 2
-    if not args.dry_run:
-        approved = input("将由 AutoGLM 直接控制机械臂，不使用模板/OCR。输入 YES 开始：").strip()
-        if approved.upper() != "YES":
-            print("未确认实际执行，已退出。", flush=True)
-            return 2
-
     output_dir = ROOT / "runtime" / "autoglm_task_tests" / datetime.now().strftime("%Y%m%d_%H%M%S")
     log = RollingLog(output_dir)
     log.write("信息", f"用户任务：{task}")
