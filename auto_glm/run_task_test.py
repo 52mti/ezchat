@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 import time
 import tomllib
@@ -47,6 +48,25 @@ class RollingLog:
         print(line, flush=True)
         with self.path.open("a", encoding="utf-8") as stream:
             stream.write(line + "\n")
+
+
+def _is_photo_send_task(task: str) -> bool:
+    normalized = "".join(str(task).split())
+    return ("相册" in normalized or "照片" in normalized or "图片" in normalized) and any(
+        word in normalized for word in ("发", "发送", "给对面", "给他", "给她")
+    )
+
+
+def _photo_send_plan() -> ExecutionPlan:
+    return ExecutionPlan(
+        summary="心遇已知发图流程：打开相册、随机选图、完成发送、回到聊天界面验证。",
+        nodes=(
+            PlanNode("photo_open", "打开相册", "点击聊天编辑区左下角的照片按钮，打开系统相册。", "截图不再是聊天界面。", "保存模板与截图诊断并停止。", "template"),
+            PlanNode("photo_random_select", "随机选择一张照片", "在图片列表的已配置随机范围中随机点击一张照片。", "截图进入照片预览或出现完成按钮。", "保存截图并停止。", "program"),
+            PlanNode("photo_complete", "完成并发送照片", "点击照片预览页的完成按钮，发送照片。", "完成按钮消失且返回聊天界面。", "保存模板候选和截图并停止。", "template"),
+            PlanNode("photo_verify", "验证发送结果", "确认已回到聊天界面。", "聊天界面模板命中。", "保存发送后截图并停止。", "program"),
+        ),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,6 +121,10 @@ def main() -> int:
 
 
 def _build_plan(task: str, output_dir: Path, log: RollingLog) -> ExecutionPlan:
+    if _is_photo_send_task(task):
+        plan = _photo_send_plan()
+        log.log("信息", "识别到“相册随机发图”任务，使用已知的直接执行节点，不生成观察节点")
+        return _save_plan(plan, output_dir, log)
     try:
         plan = GPTPlannerClient(_planner_config()).plan(
             task,
@@ -126,6 +150,10 @@ def _build_plan(task: str, output_dir: Path, log: RollingLog) -> ExecutionPlan:
                 ),
             ),
         )
+    return _save_plan(plan, output_dir, log)
+
+
+def _save_plan(plan: ExecutionPlan, output_dir: Path, log: RollingLog) -> ExecutionPlan:
     payload = {"summary": plan.summary, "nodes": [node.__dict__ for node in plan.nodes]}
     (output_dir / "GPT规划.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     log.log("信息", f"GPT 规划：{plan.summary}")
@@ -147,6 +175,8 @@ def _run_node(
 ) -> bool:
     before = _capture(robot, output_dir, f"{index:02d}_动作前", log)
     state = _screen_state(before, config)
+    if node.id.startswith("photo_"):
+        return _run_known_photo_node(robot, model, node, index, before, state, config, output_dir, log, execute)
     log.log("信息", f"节点 {node.id} 当前界面={state}；请求 AutoGLM：{node.executor_task}")
     decision = model.decide(node.executor_task, before, history=history)
     action = decision.action
@@ -201,6 +231,96 @@ def _run_node(
     return transition.changed
 
 
+def _run_known_photo_node(
+    robot: RobotInterface,
+    model: AutoGLMClient,
+    node: PlanNode,
+    index: int,
+    before: Image.Image,
+    state: str,
+    config: dict[str, Any],
+    output_dir: Path,
+    log: RollingLog,
+    execute: bool,
+) -> bool:
+    """Run the known Xinyu photo flow directly; no observation is delegated to the model."""
+    if node.id == "photo_verify":
+        log.log("信息", f"发送后验证：当前界面={state}")
+        return state == steps.CHAT_WINDOW_SCREEN
+    if node.id == "photo_open":
+        if state != steps.CHAT_WINDOW_SCREEN:
+            log.log("错误", f"当前不是聊天界面，不能打开相册：{state}")
+            return False
+        point = steps._template_center(before, config, steps.PHOTO_BUTTON, group="buttons")
+        if point is None:
+            return _photo_model_fallback(robot, model, node, index, before, config, steps.PHOTO_BUTTON, output_dir, log, execute)
+        log.log("信息", f"本地照片模板命中：{point}，直接点击")
+    elif node.id == "photo_random_select":
+        if state == steps.CHAT_WINDOW_SCREEN:
+            log.log("错误", "仍在聊天界面，不能随机选图")
+            return False
+        left, top, right, bottom = map(float, config["photo_select_random_bounds"])
+        point = (random.uniform(left, right), random.uniform(top, bottom))
+        log.log("信息", f"随机选图：范围={config['photo_select_random_bounds']}，点击={point}")
+    elif node.id == "photo_complete":
+        point = steps._template_center(before, config, steps.COMPLETE_BUTTON, group="buttons")
+        if point is None:
+            return _photo_model_fallback(robot, model, node, index, before, config, steps.COMPLETE_BUTTON, output_dir, log, execute)
+        log.log("信息", f"本地完成按钮模板命中：{point}，直接点击发送")
+    else:
+        log.log("错误", f"未知内置发图节点：{node.id}")
+        return False
+    if not execute:
+        log.log("信息", "诊断模式未执行机械臂点击")
+        return False
+    click_image_point(robot, *point)
+    time.sleep(0.8)
+    after = _capture(robot, output_dir, f"{index:02d}_动作后", log)
+    transition = compare_images(before, after)
+    log.log("信息", f"节点 {node.id} 画面验证：{transition.message}，差异={transition.difference_ratio:.4f}")
+    return transition.changed
+
+
+def _photo_model_fallback(
+    robot: RobotInterface,
+    model: AutoGLMClient,
+    node: PlanNode,
+    index: int,
+    image: Image.Image,
+    config: dict[str, Any],
+    template_key: str,
+    output_dir: Path,
+    log: RollingLog,
+    execute: bool,
+) -> bool:
+    """Use model position only after it stays in the configured template range."""
+    log.log("警告", f"本地模板未命中：{template_key}；请求 AutoGLM 候选定位")
+    decision = model.decide(node.executor_task, image)
+    (output_dir / f"{index:02d}_AutoGLM模板候选.json").write_text(
+        json.dumps({"raw_content": decision.raw_content, "action": decision.action.arguments}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    point = _model_point(decision.action.arguments.get("element")) if decision.action.name == "Tap" else None
+    if point is None:
+        log.log("错误", f"AutoGLM 未给出有效点击候选：{decision.action.name}")
+        return False
+    region = config["template_match_regions"].get(template_key)
+    if not isinstance(region, list) or not _in_region(point, region):
+        log.log("错误", f"AutoGLM 候选超出 {template_key} 配置范围：候选={point}，范围={region}")
+        _save_candidate_crop(image, point, template_key, output_dir)
+        return False
+    _save_candidate_crop(image, point, template_key, output_dir)
+    log.log("信息", f"AutoGLM 候选已落在范围内：{point}；候选模板截图已保存")
+    if not execute:
+        return False
+    click_image_point(robot, *point)
+    time.sleep(0.8)
+    after = _capture(robot, output_dir, f"{index:02d}_模型候选动作后", log)
+    transition = compare_images(image, after)
+    log.log("信息", f"模型候选动作验证：{transition.message}，差异={transition.difference_ratio:.4f}")
+    return transition.changed
+
+
 def _capture(robot: RobotInterface, output_dir: Path, name: str, log: RollingLog) -> Image.Image:
     log.log("信息", f"截图：{name}")
     image = Image.open(BytesIO(robot.get_transform_image(pre_move=True))).convert("RGB")
@@ -238,6 +358,26 @@ def _model_point(value: Any) -> tuple[float, float] | None:
     if not 0 <= x <= 999 or not 0 <= y <= 999:
         return None
     return x / 1000, y / 1000
+
+
+def _in_region(point: tuple[float, float], region: list[float]) -> bool:
+    left, top, width, height = map(float, region)
+    return left <= point[0] <= left + width and top <= point[1] <= top + height
+
+
+def _save_candidate_crop(image: Image.Image, point: tuple[float, float], key: str, output_dir: Path) -> None:
+    width, height = image.size
+    center_x, center_y = int(point[0] * width), int(point[1] * height)
+    half_width, half_height = max(32, width // 16), max(24, height // 22)
+    crop = image.crop(
+        (
+            max(0, center_x - half_width),
+            max(0, center_y - half_height),
+            min(width, center_x + half_width),
+            min(height, center_y + half_height),
+        )
+    )
+    crop.save(output_dir / f"候选模板_{key.replace('.', '_')}.jpg", quality=95)
 
 
 def _wait_seconds(value: Any) -> float:
