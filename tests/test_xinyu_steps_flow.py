@@ -1784,6 +1784,7 @@ def test_xinyu_bottom_nav_coordinates_are_cached_once(monkeypatch, tmp_path):
     anchors = config["_runtime_cache"]["screen_anchors"]
     assert anchors["bottom_message"] == (0.72, 0.91)
     assert anchors["bottom_my"] == (0.88, 0.91)
+    assert robot.clicks == [pytest.approx((0.72, 0.91))]
 
 
 def test_xinyu_caches_all_five_bottom_navigation_positions(tmp_path):
@@ -1808,7 +1809,6 @@ def test_xinyu_caches_all_five_bottom_navigation_positions(tmp_path):
     assert anchors["bottom_entertainment"] == pytest.approx((0.5, 0.9))
     assert anchors["bottom_message"] == pytest.approx((0.68, 0.9))
     assert anchors["bottom_my"] == pytest.approx((0.88, 0.9))
-    assert robot.clicks == [pytest.approx((0.72, 0.91))]
 
 
 def test_xinyu_caches_my_from_message_when_my_bottom_nav_missing(monkeypatch, tmp_path):
