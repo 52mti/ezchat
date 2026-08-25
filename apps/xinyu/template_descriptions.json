@@ -2,14 +2,16 @@
   "schema_version": 1,
   "model_observation_policy": {
     "reference_image_required": true,
-    "observation_only": true,
-    "output_coordinate_space": "crop_normalized_1000_point",
-    "coordinate_scale": 1000,
+    "observation_only": false,
+    "output_coordinate_space": "full_image_normalized_999_point",
+    "coordinate_scale": 999,
     "must_stay_within_configured_match_region": true,
+    "model_point_is_candidate": true,
     "local_pixel_recheck_required": true,
-    "auto_click_from_model_output": false
+    "auto_click_from_model_output": false,
+    "response_protocol": "autoglm_phone_action"
   },
-  "model_prompt_template": "你是视觉复核器，只观察，不执行操作，不规划下一步。参考图是目标模板，待检测图是该模板已配置匹配范围的裁图。待检测图的左上角为 (0,0)，右下角为 (1000,1000)，无论其实际像素宽高是多少。仅判断裁图内是否存在与参考图相同或因反光、阴影、失焦而外观略有变化的控件。只返回 JSON：{\"found\":true,\"confidence\":0.0,\"point\":[x,y],\"reason\":\"不超过20个中文字符\"}。point 是目标可点击中心点；x 和 y 必须是 0 到 1000 的整数。不存在时 point 为 null。",
+  "model_prompt_template": "你是手机操作智能体。根据当前完整手机截图执行一次操作。参考模板和模板描述定义了唯一目标，但不要输出边界框。坐标系统左上角为 (0,0)，右下角为 (999,999)。若目标存在，严格输出 <think>简短判断</think><answer>do(action=\"Tap\", element=[x,y])</answer>；x,y 是目标可点击中心点。若目标不存在，严格输出 <think>简短判断</think><answer>finish(message=\"未找到目标\")</answer>。返回的点击点必须位于该模板既有匹配范围内，否则结果无效。该点只用于缩小本地模板复核范围，不能直接点击。",
   "templates": {
     "button.photo": {
       "reference_template": "btn_照片按钮.jpg",
