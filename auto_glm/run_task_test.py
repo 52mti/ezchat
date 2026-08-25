@@ -30,7 +30,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from apps.coordinates import click_image_point  # noqa: E402
 from auto_glm.gpt_planner import GPTPlannerClient, GPTPlannerConfig  # noqa: E402
-from auto_glm.model import AutoGLMClient, AutoGLMConfig  # noqa: E402
+from auto_glm.model import AutoGLMClient, AutoGLMConfig, AutoGLMProtocolError  # noqa: E402
 from auto_glm.planner import ExecutionPlan, PlanNode  # noqa: E402
 from lgb.lgb import RobotInterface  # noqa: E402
 
@@ -138,7 +138,11 @@ def _run_node(
             f"当前节点成功条件：{node.verification}\n"
             "若已满足成功条件，立即 finish；否则只执行推进当前节点的一个动作。"
         )
-        decision = model.decide(instruction, image, history=history, system_prompt=AUTOGLM_EXECUTOR_PROMPT)
+        decision = _request_action_with_retry(
+            model, instruction, image, history, output_dir, node_index, action_index, log
+        )
+        if decision is None:
+            return False
         action = decision.action
         action_path = output_dir / f"{node_index:02d}_{action_index:02d}_AutoGLM动作.json"
         action_path.write_text(
@@ -169,6 +173,33 @@ def _run_node(
         time.sleep(0.8)
     log.write("错误", f"节点 {node.id} 超过最大动作数 {args.max_actions_per_node}，模型未声明完成")
     return False
+
+
+def _request_action_with_retry(
+    model: AutoGLMClient,
+    instruction: str,
+    image: Image.Image,
+    history: list[str],
+    output_dir: Path,
+    node_index: int,
+    action_index: int,
+    log: RollingLog,
+):
+    for attempt in range(1, 3):
+        retry_instruction = instruction
+        if attempt > 1:
+            retry_instruction += "\n上一次返回不是有效动作协议。本次只能输出一个 do(action=...) 或 finish(message=...)，不得输出解释性文本。"
+        try:
+            return model.decide(retry_instruction, image, history=history, system_prompt=AUTOGLM_EXECUTOR_PROMPT)
+        except AutoGLMProtocolError as error:
+            path = output_dir / f"{node_index:02d}_{action_index:02d}_协议异常_第{attempt}次.txt"
+            path.write_text(error.raw_content, encoding="utf-8")
+            preview = error.raw_content.replace("\n", " ").strip()[:200] or "（空返回）"
+            log.write("警告", f"AutoGLM 第 {attempt}/2 次未返回动作协议：{error}；原始返回已保存到 {path.name}；内容={preview}")
+        except Exception as error:
+            log.write("警告", f"AutoGLM 第 {attempt}/2 次请求失败：{error}")
+    log.write("错误", "AutoGLM 连续两次未返回可执行动作，已停止本节点")
+    return None
 
 
 def _capture(robot: RobotInterface, output_dir: Path, name: str, log: RollingLog) -> Image.Image:

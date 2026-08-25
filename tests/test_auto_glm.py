@@ -5,7 +5,7 @@ import pytest
 
 from auto_glm.adapter import RobotActionAdapter
 from auto_glm.gpt_planner import GPTPlannerClient, GPTPlannerConfig
-from auto_glm.model import AutoGLMConfig
+from auto_glm.model import AutoGLMConfig, AutoGLMProtocolError
 from auto_glm.planner import ExecutionPlan
 from auto_glm.protocol import parse_action
 from auto_glm.verification import compare_images, image_signature, verify_transition
@@ -105,6 +105,13 @@ def test_model_configs_load_keys_from_workspace_env(tmp_path):
 
     assert planner.api_key == "gpt-test"
     assert executor.api_key == "glm-test"
+
+
+def test_protocol_error_preserves_raw_model_reply():
+    error = AutoGLMProtocolError("未找到动作", "模型只返回了说明文字")
+
+    assert str(error) == "未找到动作"
+    assert error.raw_content == "模型只返回了说明文字"
 
 
 def test_visual_transition_requires_meaningful_change():

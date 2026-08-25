@@ -45,6 +45,14 @@ class ModelDecision:
     raw_content: str
 
 
+class AutoGLMProtocolError(ValueError):
+    """A model reply was received but did not contain an executable action."""
+
+    def __init__(self, message: str, raw_content: str) -> None:
+        super().__init__(message)
+        self.raw_content = raw_content
+
+
 class AutoGLMClient:
     def __init__(self, config: AutoGLMConfig, *, session: requests.Session | None = None) -> None:
         if not config.api_key.strip():
@@ -87,11 +95,15 @@ class AutoGLMClient:
         response.raise_for_status()
         body = response.json()
         try:
-            content = str(body["choices"][0]["message"]["content"])
+            content = _content_to_text(body["choices"][0]["message"]["content"])
         except (KeyError, IndexError, TypeError) as error:
             raise ValueError("AutoGLM 返回中没有可解析的动作内容") from error
         thinking, action_text = _split_thinking(content)
-        return ModelDecision(action=parse_action(action_text), thinking=thinking, raw_content=content)
+        try:
+            action = parse_action(action_text)
+        except ValueError as error:
+            raise AutoGLMProtocolError(str(error), content) from error
+        return ModelDecision(action=action, thinking=thinking, raw_content=content)
 
 
 def _as_data_url(image: Any) -> str:
@@ -110,3 +122,17 @@ def _split_thinking(content: str) -> tuple[str, str]:
     if "<think>" in text:
         thinking = text.split("<think>", 1)[1].split("</think>", 1)[0].strip()
     return thinking, text
+
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+        return "".join(parts).strip()
+    return str(content)
