@@ -67,10 +67,23 @@ class AutoGLMClient:
         *,
         history: list[str] | None = None,
         system_prompt: str | None = None,
+        reference_images: list[tuple[str, Any]] | None = None,
     ) -> ModelDecision:
         instruction = f"当前原子任务：{task.strip()}"
         if history:
             instruction += "\n最近动作结果：\n" + "\n".join(history[-5:])
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": "当前完整截图（动作坐标必须基于此图输出）："},
+            {"type": "image_url", "image_url": {"url": _as_data_url(screenshot)}},
+        ]
+        for label, reference_image in reference_images or []:
+            content.extend(
+                [
+                    {"type": "text", "text": f"视觉参考图：{label}。只用于识别控件外观，不得以此图坐标输出动作。"},
+                    {"type": "image_url", "image_url": {"url": _as_data_url(reference_image)}},
+                ]
+            )
+        content.append({"type": "text", "text": instruction})
         payload = {
             "model": self.config.model,
             "max_tokens": self.config.max_tokens,
@@ -79,10 +92,7 @@ class AutoGLMClient:
                 {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": _as_data_url(screenshot)}},
-                        {"type": "text", "text": instruction},
-                    ],
+                    "content": content,
                 },
             ],
         }

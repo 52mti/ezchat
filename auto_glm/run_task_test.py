@@ -162,8 +162,11 @@ def _run_node(
             f"当前节点成功条件：{node.verification}\n"
             "若已满足成功条件，立即 finish；否则只执行推进当前节点的一个动作。"
         )
+        references = _node_visual_references(node)
+        if references:
+            log.write("信息", "本节点已向 AutoGLM 提供视觉参考图：" + "、".join(label for label, _ in references))
         decision = _request_action_with_retry(
-            model, instruction, image, history, output_dir, node_index, action_index, log
+            model, instruction, image, history, output_dir, node_index, action_index, log, references
         )
         if decision is None:
             return False
@@ -208,13 +211,20 @@ def _request_action_with_retry(
     node_index: int,
     action_index: int,
     log: RollingLog,
+    references: list[tuple[str, Image.Image]],
 ):
     for attempt in range(1, 3):
         retry_instruction = instruction
         if attempt > 1:
             retry_instruction += "\n上一次返回不是有效动作协议。本次必须严格输出 <think>...</think><answer>do(action=...) 或 finish(message=...)</answer>，标签外不得有任何文字。"
         try:
-            return model.decide(retry_instruction, image, history=history, system_prompt=AUTOGLM_EXECUTOR_PROMPT)
+            return model.decide(
+                retry_instruction,
+                image,
+                history=history,
+                system_prompt=AUTOGLM_EXECUTOR_PROMPT,
+                reference_images=references,
+            )
         except AutoGLMProtocolError as error:
             path = output_dir / f"{node_index:02d}_{action_index:02d}_协议异常_第{attempt}次.txt"
             path.write_text(error.raw_content, encoding="utf-8")
@@ -224,6 +234,25 @@ def _request_action_with_retry(
             log.write("警告", f"AutoGLM 第 {attempt}/2 次请求失败：{error}")
     log.write("错误", "AutoGLM 连续两次未返回可执行动作，已停止本节点")
     return None
+
+
+def _node_visual_references(node: PlanNode) -> list[tuple[str, Image.Image]]:
+    """Give the model visual semantics without using a local matcher to click."""
+    text = f"{node.goal} {node.executor_task}".replace(" ", "")
+    button_dir = ROOT / "apps" / "xinyu" / "templates" / "buttons"
+    references: list[tuple[str, Image.Image]] = []
+    if (
+        ("相册" in text or "照片" in text or "图片" in text or "更多功能" in text)
+        and any(keyword in text for keyword in ("打开", "入口", "选择界面", "更多功能"))
+    ):
+        path = button_dir / "btn_照片按钮.jpg"
+        if path.is_file():
+            references.append(("心遇照片/相册按钮", Image.open(path).convert("RGB")))
+    if any(keyword in text for keyword in ("确认", "完成", "发送已选", "发送照片")):
+        path = button_dir / "btn_完成按钮.jpg"
+        if path.is_file():
+            references.append(("心遇完成发送按钮", Image.open(path).convert("RGB")))
+    return references
 
 
 def _capture(robot: RobotInterface, output_dir: Path, name: str, log: RollingLog) -> Image.Image:
