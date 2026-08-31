@@ -101,6 +101,70 @@ def test_xinyu_chat_window_screen_uses_lower_match_threshold(monkeypatch, tmp_pa
     assert thresholds[steps.CHAT_LIST_SCREEN] == 0.85
 
 
+def test_xinyu_complete_button_ocr_fallback_uses_configured_range(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    config["template_match_regions"] = {"button.complete": [0.0, 0.0, 1.0, 0.35]}
+    seen: dict[str, object] = {}
+
+    def fake_run_ocr_mode(image, cfg, mode, region=None):
+        seen["image"] = image
+        seen["mode"] = mode
+        seen["region"] = region
+        return {
+            "ocr_items": [
+                {"text": "完成", "x": 0.76, "y": 0.08, "w": 0.12, "h": 0.06},
+            ]
+        }
+
+    monkeypatch.setattr(steps, "_run_ocr_mode", fake_run_ocr_mode)
+
+    assert steps._complete_button_ocr_center("album", config) == pytest.approx((0.82, 0.11))
+    assert seen == {"image": "album", "mode": "list", "region": [0.0, 0.0, 1.0, 0.35]}
+
+
+def test_xinyu_online_photo_uses_complete_button_ocr_after_template_retries(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    config.update(
+        {
+            "template_match_regions": {"button.complete": [0.0, 0.0, 1.0, 0.35]},
+            "photo_select_max_attempts": 2,
+            "photo_select_random_bounds": [0.3, 0.2, 0.9, 0.5],
+        }
+    )
+    robot = FakeRobot([])
+    reports: list[str] = []
+    list_ocr_results = iter(
+        [
+            {"result": {"bottom_nav": [{"name": "在线", "bounds": [0.5, 0.1, 0.6, 0.2]}], "message_list": []}},
+            {"result": {"bottom_nav": [{"name": "在线", "bounds": [0.5, 0.1, 0.6, 0.2]}], "message_list": [{"name": "测试用户", "bounds": [0.2, 0.3, 0.8, 0.4]}]}},
+        ]
+    )
+
+    monkeypatch.setattr(steps, "ensure_list_screen", lambda robot, config, reporter=None: "list")
+    monkeypatch.setattr(steps, "_run_list_ocr", lambda image, config, reporter=None: next(list_ocr_results))
+    monkeypatch.setattr(steps, "_red_pixel_stats", lambda image, result: {"has_red": True})
+    monkeypatch.setattr(steps, "confirm_chat_window", lambda robot, config, reporter=None: "chat")
+    monkeypatch.setattr(
+        steps,
+        "_template_center",
+        lambda image, config, key, group: (0.1, 0.9) if key == steps.PHOTO_BUTTON else None,
+    )
+    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, config, label="screen", reporter=None: "album")
+    monkeypatch.setattr(
+        steps,
+        "_run_ocr_mode",
+        lambda image, config, mode, region=None: {
+            "ocr_items": [{"text": "发送", "x": 0.75, "y": 0.08, "w": 0.1, "h": 0.05}]
+        },
+    )
+    monkeypatch.setattr(steps, "go_back", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
+
+    assert steps.send_photo_to_online_target(robot, config, reporter=lambda _step, _label, log_label=None: reports.append(log_label or ""))
+    assert robot.clicks[-1] == pytest.approx((0.8, 0.105))
+    assert any("OCR 识别到发送或完成" in report for report in reports)
+
+
 def test_xinyu_list_ocr_treats_left_badge_as_default_unread(monkeypatch, tmp_path):
     config = _config(tmp_path)
     robot = FakeRobot(["list"])

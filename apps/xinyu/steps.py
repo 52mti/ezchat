@@ -596,6 +596,28 @@ def _template_center(image: Any, config: dict[str, Any], key: str, *, group: str
     return result["x"] + result["w"] / 2, result["y"] + result["h"] / 2
 
 
+def _complete_button_ocr_center(image: Any, config: dict[str, Any]) -> tuple[float, float] | None:
+    """Find the album completion action from OCR within its configured range."""
+    region = _valid_region(_configured_template_region(config, COMPLETE_BUTTON))
+    if region is None:
+        return None
+    ocr_result = _run_ocr_mode(image, config, "list", region=region)
+    for item in ocr_result.get("ocr_items", []):
+        if not isinstance(item, dict):
+            continue
+        text = _clean_list_text(item.get("text"))
+        if "完成" not in text and "发送" not in text:
+            continue
+        try:
+            return (
+                float(item["x"]) + float(item["w"]) / 2,
+                float(item["y"]) + float(item["h"]) / 2,
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
 def _warm_back_button_cache(
     image: Any,
     config: dict[str, Any],
@@ -2247,8 +2269,17 @@ def send_photo_to_online_target(
         if complete_pos is not None:
             break
     if complete_pos is None:
+        complete_pos = _complete_button_ocr_center(complete_image, cfg)
+        if complete_pos is not None:
+            _report(
+                reporter,
+                "photo_complete_ocr",
+                "完成按钮模板未命中，OCR 识别到发送或完成",
+                log_label=f"完成按钮模板未命中，OCR 识别到发送或完成：{format_point(*complete_pos)}",
+            )
+    if complete_pos is None:
         raise StepUnavailable(
-            f"随机选择照片 {max_photo_attempts} 次后仍未找到完成按钮模板："
+            f"随机选择照片 {max_photo_attempts} 次后，完成按钮模板和范围 OCR 均未命中："
             f"{_template_failure_detail(cfg, COMPLETE_BUTTON, group='buttons')}"
         )
     _report(reporter, "photo_complete", "点击完成发送照片", log_label=f"点击完成发送照片：{format_point(*complete_pos)}")
