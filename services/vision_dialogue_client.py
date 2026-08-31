@@ -210,8 +210,7 @@ class VisionDialogueClient:
 
     def _openrouter_key(self) -> str:
         return (
-            "REMOVED-OPENROUTER-KEY"
-            or _read_local_json_secret(self.workspace_root, "openrouter_key")
+            _read_local_json_secret(self.workspace_root, "openrouter_key")
             or self._secret(
             "OPENROUTER_API_KEY",
             "openrouter_key.txt",
