@@ -57,6 +57,29 @@ def _config(tmp_path: Path) -> dict[str, object]:
     }
 
 
+def test_xinyu_learned_system_rules_skip_covered_text_and_shorten_new_text():
+    rules = {"line_excluded_keywords": ["金币", "亲密度"]}
+    config = {"ocr_modes": {"dialogue": {"rules": rules}}}
+    payload = {
+        "excluded_messages": [
+            {
+                "content": "为表诚意，对方发消息需消耗金币。你回复越快获得积分越多。",
+                "reason": "平台提示",
+            },
+            {
+                "content": "平台温馨提示请完善资料后继续使用。",
+                "reason": "平台提示",
+            },
+            {"content": "亲密度37", "reason": "等级"},
+        ]
+    }
+
+    learned = steps._learn_llm_system_messages(config, payload)
+
+    assert learned == 1
+    assert rules["line_excluded_keywords"] == ["金币", "亲密度", "平台温馨提示"]
+
+
 def test_xinyu_chat_window_screen_uses_lower_match_threshold(monkeypatch, tmp_path):
     config = _config(tmp_path)
     config["match_threshold"] = 0.85
@@ -1904,13 +1927,14 @@ def test_xinyu_play_voice_reply_reclicks_microphone_when_tts_fails(monkeypatch, 
             return {"x": 0.4, "y": 0.5, "w": 0.2, "h": 0.2, "score": 0.99}
         return None
 
-    def fake_tts(robot, text):
-        played.append(text)
+    def fake_play(robot, chunks):
+        played.append("".join(chunks))
         if len(played) == 1:
             raise RuntimeError("speaker timeout")
 
     monkeypatch.setattr(steps, "match", fake_match)
-    monkeypatch.setattr(steps, "tts_input", fake_tts)
+    monkeypatch.setattr(steps, "prepare_tts_input", lambda robot, text: [text])
+    monkeypatch.setattr(steps, "play_prepared_tts_input", fake_play)
     monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
 
     steps.play_voice_reply(robot, "你好", config)
