@@ -251,8 +251,7 @@ class ChatHistoryDialog(QDialog):
         is_outgoing = str(message.get("direction", "")) == "outgoing"
         bubble = self._bubble(message, is_outgoing)
         row = QWidget()
-        # 让每一行占满气泡计算出的实际高度，避免下一条消息覆盖当前气泡。
-        row.setMinimumHeight(max(1, bubble.sizeHint().height()))
+        row.setFixedHeight(bubble.height())
         row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -267,9 +266,8 @@ class ChatHistoryDialog(QDialog):
     def _bubble(self, message: dict[str, Any], is_outgoing: bool) -> QFrame:
         bubble = QFrame()
         bubble.setObjectName("OutgoingBubble" if is_outgoing else "IncomingBubble")
-        # QLabel 只有 maximumWidth 时，Qt 可能按未换行的 sizeHint 计算高度，
-        # 长消息会因此覆盖下一条气泡。固定内容列宽，确保高度按换行后的尺寸计算。
         bubble_width = 464
+        content_width = 440
         bubble.setFixedWidth(bubble_width)
         bubble.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
         layout = QVBoxLayout(bubble)
@@ -279,14 +277,17 @@ class ChatHistoryDialog(QDialog):
         text = QLabel(str(message.get("content", "") or ""))
         text.setObjectName("OutgoingText" if is_outgoing else "IncomingText")
         text.setWordWrap(True)
-        text.setFixedWidth(440)
+        text.setFixedWidth(content_width)
+        text.setFixedHeight(max(text.minimumSizeHint().height(), text.heightForWidth(content_width)))
         text.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         time_label = QLabel(str(message.get("created_at", "") or ""))
         time_label.setObjectName("MessageTime")
         time_label.setAlignment(Qt.AlignmentFlag.AlignRight if is_outgoing else Qt.AlignmentFlag.AlignLeft)
-        time_label.setFixedWidth(440)
+        time_label.setFixedWidth(content_width)
         time_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         layout.addWidget(text)
         layout.addWidget(time_label)
+        layout.activate()
+        bubble.setFixedHeight(layout.sizeHint().height())
         return bubble
