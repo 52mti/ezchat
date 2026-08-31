@@ -176,7 +176,13 @@ class ChatHistoryDialog(QDialog):
         for index, contact in enumerate(self.contacts):
             contact_name = str(contact.get("contact_name", "") or "")
             item = QListWidgetItem(self._contact_text(contact))
-            item.setData(Qt.ItemDataRole.UserRole, contact_name)
+            item.setData(
+                Qt.ItemDataRole.UserRole,
+                {
+                    "contact_name": contact_name,
+                    "conversation_id": str(contact.get("conversation_id", "") or ""),
+                },
+            )
             self.contact_list.addItem(item)
             if current_contact and contact_name == current_contact:
                 selected_row = index
@@ -189,7 +195,10 @@ class ChatHistoryDialog(QDialog):
 
     def _current_contact_name(self) -> str:
         item = self.contact_list.currentItem()
-        return str(item.data(Qt.ItemDataRole.UserRole) or "") if item else ""
+        value = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        if isinstance(value, dict):
+            return str(value.get("contact_name", "") or "")
+        return str(value or "")
 
     @staticmethod
     def _contact_text(contact: dict[str, Any]) -> str:
@@ -222,11 +231,13 @@ class ChatHistoryDialog(QDialog):
                 self._show_empty("当前设备、App、人设下暂无聊天记录")
             return
         contact_name = str(self.contacts[row].get("contact_name", "") or "")
+        conversation_id = str(self.contacts[row].get("conversation_id", "") or "")
         messages = self.store.get_messages(
             device_ip=self.device_ip,
             app_name=self.app_name,
             contact_name=contact_name,
             persona=self.persona,
+            conversation_id=conversation_id,
         )
         self._clear_messages()
         if not messages:

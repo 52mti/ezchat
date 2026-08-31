@@ -225,6 +225,18 @@ class MemoryStore:
             data = self._load(path)
             records = data.setdefault("records", {})
             existing = records.get(record_key, {}) if isinstance(records.get(record_key), dict) else {}
+            # OCR 昵称修正后仍应绑定到同一个 AI 会话，而不是拆出新会话。
+            if conversation_id:
+                for candidate_key, candidate in records.items():
+                    if not isinstance(candidate, dict) or candidate_key == record_key:
+                        continue
+                    if (
+                        str(candidate.get("conversation_id") or candidate.get("conversationId") or "")
+                        == conversation_id
+                        and str(candidate.get("persona_signature") or "") == persona_signature
+                    ):
+                        existing = candidate
+                        break
             records[record_key] = {
                 **existing,
                 "record_key": record_key,
