@@ -1,6 +1,6 @@
 from apps.defaults import DEFAULT_PERSONA_CONFIG, DEFAULT_RUNTIME_CONFIG
 
-from .ocr_config import OCR_MODES
+from .ocr_config import LLM_DIALOGUE_CONFIG, OCR_MODES
 
 
 DEFAULT_CONFIG = {
@@ -20,6 +20,10 @@ DEFAULT_CONFIG = {
         },
     },
     "ocr_modes": OCR_MODES,
+    "dialogue_engine": "llm_vision",
+    # 连续多次成功识别但没有发现新系统规则后，当前透视改用本地 OCR。
+    "llm_vision_zero_rule_limit": 3,
+    "dialogue_llm": LLM_DIALOGUE_CONFIG,
     "templates": {
         "buttons": "apps/xinyu/templates/buttons",
         "screens": "apps/xinyu/templates/screens",
@@ -31,6 +35,9 @@ DEFAULT_CONFIG = {
     "template_match_region_expand_ratio": 0.03,
     "template_match_scales": [0.92, 0.96, 1.0, 1.04, 1.08],
     "template_match_channels": ["gray_norm", "gray", "edge"],
+    "template_match_channels_by_key": {
+        "screen.chat_window": ["bgr"],
+    },
     "template_match_regions": {
         "button.back": [0.0, 0.911, 0.993, 0.089],
         "button.input_box": [0.651, 0.737, 0.349, 0.188],
@@ -63,6 +70,9 @@ DEFAULT_CONFIG = {
     "list_compact_bottom_margin": 0.02,
     "list_compact_min_height": 0.2,
     "dialogue_message_input_box_top_margin": 0.04,
+    # 视觉模型确认双方消息后，本地 OCR 坐标向左右扩展的安全边距。
+    "dialogue_sender1_left_margin": 0.05,
+    "dialogue_sender2_right_margin": 0.05,
     "dialogue_compact_min_height": 0.2,
     "unread_tab_band_vertical_scale": 0.6,
     "ocr_reuse_image_mean_threshold": 0.8,

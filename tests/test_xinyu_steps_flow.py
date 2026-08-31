@@ -7,6 +7,7 @@ from PIL import Image
 
 from apps.xinyu import app as xinyu_app
 from apps.xinyu import steps
+from services.rule_learning import RuleLearningStore
 
 
 class FakeRobot:
@@ -57,7 +58,8 @@ def _config(tmp_path: Path) -> dict[str, object]:
     }
 
 
-def test_xinyu_learned_system_rules_skip_covered_text_and_shorten_new_text():
+def test_xinyu_learned_system_rules_skip_covered_text_and_shorten_new_text(monkeypatch, tmp_path):
+    monkeypatch.setattr(steps, "RuleLearningStore", lambda: RuleLearningStore(tmp_path / "rule-learning"))
     rules = {"line_excluded_keywords": ["金币", "亲密度"]}
     config = {"ocr_modes": {"dialogue": {"rules": rules}}}
     payload = {

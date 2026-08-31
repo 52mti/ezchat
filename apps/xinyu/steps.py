@@ -43,7 +43,7 @@ from apps.visual_assets import (
 from services.vision_dialogue_client import VisionDialogueClient, VisionDialogueError
 from services.rule_learning import RuleLearningStore
 from services.coordinate_cache import persist_from_runtime
-from services.vision_usage import acquire as acquire_vision_usage
+from services.vision_usage import acquire as acquire_vision_usage, record_rule_learning, rule_learning_status
 from vision import match, run_ocr_mode
 from vision.ocr_rules import looks_like_debug_text, looks_like_reward_text, looks_like_time_text
 from vision.screen import ensure_portrait_image, load_image
@@ -2278,29 +2278,44 @@ def read_message(
     current_image = image if image is not None else confirm_chat_window(robot, cfg, reporter=reporter)
     llm_payload: dict[str, Any] | None = None
     if _dialogue_engine(cfg) == "llm_vision":
-        allowed, call_count = _acquire_llm_vision_slot(cfg)
-        if not allowed:
-            _report(reporter, "dialogue_llm_limit", "视觉识别额度已用完，继续本地 OCR", log_label=f"视觉识别调用已达到上限：{LLM_VISION_CALL_LIMIT} 次，继续本地 OCR")
-        else:
+        zero_rule_limit = max(1, int(cfg.get("llm_vision_zero_rule_limit", 3) or 3))
+        learning_status = rule_learning_status(cfg)
+        if bool(learning_status.get("disabled")):
             _report(
                 reporter,
-                "dialogue_llm_read",
-                f"聊天详情视觉识别（本透视第 {call_count}/{LLM_VISION_CALL_LIMIT} 次）",
-                log_label=f"聊天详情视觉识别（本透视第 {call_count}/{LLM_VISION_CALL_LIMIT} 次）",
+                "dialogue_llm_disabled",
+                "视觉识别连续无新增规则，继续本地 OCR",
+                log_label=f"视觉识别已停用：连续 {learning_status.get('zero_count', zero_rule_limit)}/{zero_rule_limit} 次无新增规则，继续本地 OCR",
             )
-            try:
-                with exclude_ocr_wait_from_step_timeout(cfg):
-                    llm_reply = _DIALOGUE_LLM_CLIENT.parse_dialogue(current_image, cfg)
-                llm_payload = llm_reply.payload
-                learned_count = _learn_llm_system_messages(cfg, llm_payload)
+        else:
+            allowed, call_count = _acquire_llm_vision_slot(cfg)
+            if not allowed:
+                _report(reporter, "dialogue_llm_limit", "视觉识别额度已用完，继续本地 OCR", log_label=f"视觉识别调用已达到上限：{LLM_VISION_CALL_LIMIT} 次，继续本地 OCR")
+            else:
                 _report(
                     reporter,
-                    "dialogue_llm_provider",
-                    f"视觉识别通道：{llm_reply.provider}",
-                    log_label=f"视觉识别通道：{llm_reply.provider}，模型={llm_reply.model}，本透视已调用={call_count}/{LLM_VISION_CALL_LIMIT}，新增系统规则={learned_count}",
+                    "dialogue_llm_read",
+                    f"聊天详情视觉识别（本透视第 {call_count}/{LLM_VISION_CALL_LIMIT} 次）",
+                    log_label=f"聊天详情视觉识别（本透视第 {call_count}/{LLM_VISION_CALL_LIMIT} 次）",
                 )
-            except (VisionDialogueError, RuntimeError) as exc:
-                _report(reporter, "dialogue_llm_error", "视觉识别失败，继续本地 OCR", log_label=f"视觉识别失败，继续本地 OCR：{exc}，本透视已调用={call_count}/{LLM_VISION_CALL_LIMIT}")
+                try:
+                    with exclude_ocr_wait_from_step_timeout(cfg):
+                        llm_reply = _DIALOGUE_LLM_CLIENT.parse_dialogue(current_image, cfg)
+                    llm_payload = llm_reply.payload
+                    learned_count = _learn_llm_system_messages(cfg, llm_payload)
+                    learning_status = record_rule_learning(
+                        cfg,
+                        added_count=learned_count,
+                        disable_after_zero=zero_rule_limit,
+                    )
+                    _report(
+                        reporter,
+                        "dialogue_llm_provider",
+                        f"视觉识别通道：{llm_reply.provider}",
+                        log_label=f"视觉识别通道：{llm_reply.provider}，模型={llm_reply.model}，本透视已调用={call_count}/{LLM_VISION_CALL_LIMIT}，新增系统规则={learned_count}，连续无新增={learning_status.get('zero_count', 0)}/{zero_rule_limit}",
+                    )
+                except (VisionDialogueError, RuntimeError) as exc:
+                    _report(reporter, "dialogue_llm_error", "视觉识别失败，继续本地 OCR", log_label=f"视觉识别失败，继续本地 OCR：{exc}，本透视已调用={call_count}/{LLM_VISION_CALL_LIMIT}")
     message_region = _dialogue_message_region(current_image, cfg)
     if message_region is not None:
         _report(reporter, "dialogue_ocr_read", "聊天详情 OCR（消息小范围）")
