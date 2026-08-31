@@ -116,7 +116,8 @@ def test_write_customer_update_archive_excludes_full_runtimes_and_models(tmp_pat
         names = set(archive.namelist())
 
     assert f"{build.PACKAGE_NAME}/main.py" in names
-    assert f"{build.PACKAGE_NAME}/{build.LAUNCHER_EXE}" in names
+    assert f"{build.PACKAGE_NAME}/{build.LAUNCHER_EXE}" not in names
+    assert f"{build.PACKAGE_NAME}/{build.LAUNCHER_ALIAS_EXE}" not in names
     assert all(not name.startswith(f"{build.PACKAGE_NAME}/runtime/app/") for name in names)
     assert all(not name.startswith(f"{build.PACKAGE_NAME}/runtime/ocr_cpu/") for name in names)
     assert all(not name.startswith(f"{build.PACKAGE_NAME}/models/ocr/") for name in names)
@@ -273,6 +274,10 @@ def test_write_release_manifest_writes_uploadable_dist_payload(tmp_path):
         "requires_full_package": False,
         "update_share_url": build.DEFAULT_UPDATE_SHARE_URL,
         "update_file_name": "jixiebijiaoben_update_20260607_0904.zip",
+        "update_url": (
+            "https://jixiebi-1311918180.cos.ap-shanghai.myqcloud.com/packages/"
+            "jixiebijiaoben_update_20260607_0904.zip"
+        ),
         "full_package_url": build.DEFAULT_FULL_PACKAGE_PAGE_URL,
         "release_notes": "",
         "release_manifest_url": build.DEFAULT_RELEASE_MANIFEST_URL,

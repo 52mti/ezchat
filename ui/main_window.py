@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import html
 import importlib
+import ipaddress
 import json
 import os
 import queue
@@ -14,9 +16,10 @@ import threading
 import time
 import zipfile
 from collections import deque
+from types import SimpleNamespace
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, QUrl, QThread, pyqtSignal
@@ -93,6 +96,7 @@ from services import (
     ChatHistoryStore,
     ConfigManager,
     LicenseClient,
+    LocalTtsServer,
     ReleaseDecision,
     ReleaseManifestError,
     ResolvedUpdatePackage,
@@ -446,17 +450,28 @@ STATUS_COLORS = {
     "offline": ("离线授权", "#e0f2fe", "#0369a1"),
 }
 
+DEVICE_HEALTH_STYLES = {
+    "unknown": ("待检测", "#f1f5f9", "#475569"),
+    "normal": ("在线 · 画面正常", "#dcfce7", "#166534"),
+    "too_dark": ("在线 · 画面过暗", "#fef3c7", "#92400e"),
+    "overexposed": ("在线 · 画面过曝", "#fef3c7", "#92400e"),
+    "black_screen": ("在线 · 黑屏", "#fee2e2", "#991b1b"),
+    "capture_error": ("截图异常", "#fee2e2", "#991b1b"),
+}
+
 
 COL_SELECT = 0
 COL_LICENSE = 1
 COL_EXPIRES = 2
 COL_DEVICE_IP = 3
 COL_STATUS = 4
-COL_AVG_REPLY_SECONDS = 5
-COL_UNATTENDED_SECONDS = 6
-COL_RUNNING_APP = 7
-COL_BALANCE = 8
+COL_DEVICE_HEALTH = 5
+COL_AVG_REPLY_SECONDS = 6
+COL_UNATTENDED_SECONDS = 7
+COL_RUNNING_APP = 8
+COL_BALANCE = 9
 STATUS_COLUMN_WIDTH = 150
+DEVICE_HEALTH_COLUMN_WIDTH = 124
 UNATTENDED_COLUMN_WIDTH = 112
 BALANCE_COLUMN_WIDTH = 86
 
@@ -553,6 +568,8 @@ class MainWindow(QMainWindow):
         self._download_progress_dialog: QProgressDialog | None = None
         self._pending_update_decision: ReleaseDecision | None = None
         self._pending_update_package: ResolvedUpdatePackage | None = None
+        self.local_tts_server = LocalTtsServer()
+        self._tts_bind_lock = threading.Lock()
         self.setWindowTitle("机械臂视觉控制系统")
         self.resize(1180, 720)
         self.setStyleSheet(APP_STYLESHEET)
@@ -620,8 +637,8 @@ class MainWindow(QMainWindow):
         summary.addStretch(1)
         layout.addWidget(summary_panel)
 
-        self.table = QTableWidget(0, 9)
-        self.table.setHorizontalHeaderLabels(["\u9009\u62e9", "\u5f53\u524d\u5361\u5bc6", "\u5230\u671f\u65f6\u95f4", "\u8bbe\u5907IP", "\u8fd0\u884c\u72b6\u6001", "\u5e73\u5747\u7528\u65f6", "\u65e0\u5e72\u9884\u65f6\u957f", "\u8fd0\u884cApp", "\u4f59\u989d"])
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(["\u9009\u62e9", "\u5f53\u524d\u5361\u5bc6", "\u5230\u671f\u65f6\u95f4", "\u8bbe\u5907IP", "\u8fd0\u884c\u72b6\u6001", "\u8bbe\u5907\u72b6\u6001", "\u5e73\u5747\u7528\u65f6", "\u65e0\u5e72\u9884\u65f6\u957f", "\u8fd0\u884cApp", "\u4f59\u989d"])
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -636,6 +653,8 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(COL_DEVICE_IP, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(COL_STATUS, STATUS_COLUMN_WIDTH)
+        header.setSectionResizeMode(COL_DEVICE_HEALTH, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(COL_DEVICE_HEALTH, DEVICE_HEALTH_COLUMN_WIDTH)
         header.setSectionResizeMode(COL_AVG_REPLY_SECONDS, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(COL_UNATTENDED_SECONDS, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(COL_UNATTENDED_SECONDS, UNATTENDED_COLUMN_WIDTH)
@@ -686,6 +705,7 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._drain_events)
         self.timer.start(100)
+        QTimer.singleShot(500, self._start_and_bind_local_tts)
         QTimer.singleShot(800, lambda: self._start_release_check(manual=False))
 
     def _button(self, text: str, variant: str = "default") -> QPushButton:
@@ -713,6 +733,9 @@ class MainWindow(QMainWindow):
         return Path(getattr(self.config_manager, "config_path", Path("config.json"))).resolve().parent
 
     def _startup_update_check_enabled(self) -> bool:
+        # 开发目录同样会有运行时清单，不能仅靠文件存在与否判断为客户安装包。
+        if os.environ.get("JIXIEBI_PACKAGED_LAUNCH", "").strip() != "1":
+            return False
         root = self._package_root()
         return (root / "runtime_manifest.json").is_file() and (root / "runtime" / "install_state.json").is_file()
 
@@ -814,11 +837,25 @@ class MainWindow(QMainWindow):
         target_path: Path | None = None
         try:
             with requests.Session() as http:
-                resolved = resolve_lanzou_update_package(
-                    share_url=decision.update_share_url,
-                    file_name=decision.update_file_name,
-                    session=http,
-                )
+                resolved = None
+                if decision.update_url:
+                    try:
+                        response = http.head(decision.update_url, timeout=30, allow_redirects=True)
+                        response.raise_for_status()
+                        resolved = SimpleNamespace(
+                            file_name=decision.update_file_name or Path(decision.update_url).name,
+                            size=response.headers.get("Content-Length", ""),
+                            download_url=decision.update_url,
+                            detail_url=decision.update_url,
+                        )
+                    except (requests.RequestException, OSError):
+                        resolved = None
+                if resolved is None:
+                    resolved = resolve_lanzou_update_package(
+                        share_url=decision.update_share_url,
+                        file_name=decision.update_file_name,
+                        session=http,
+                    )
                 self.update_events.put(
                     (
                         "download_resolved",
@@ -892,7 +929,7 @@ class MainWindow(QMainWindow):
 
     def _launch_update_apply(self, archive_path: str) -> None:
         root = self._package_root()
-        updater = root / "update_apply.py"
+        updater = root / ("update_apply.pyc" if os.name == "nt" else "update_apply.py")
         if not updater.is_file():
             QMessageBox.critical(self, "更新失败", f"缺少更新脚本：{updater}")
             return
@@ -909,6 +946,7 @@ class MainWindow(QMainWindow):
         if os.name != "nt":
             return [
                 sys.executable,
+                "-s",
                 str(updater),
                 "--package-root",
                 str(root),
@@ -961,9 +999,9 @@ $PreservePrefixes = @(
     'runtime/tmp/',
     'runtime/.paddlex/',
     'photo/',
-    'jiekou/',
-    'lgb/'
+    'jiekou/'
 )
+$PreservedLaunchers = @('机械臂脚本.exe', 'jixiebijiaoben_launcher.exe')
 
 function Show-UpdateMessage([string]$title, [string]$message, [string]$iconName) {
     $buttons = [System.Windows.Forms.MessageBoxButtons]::OK
@@ -986,6 +1024,9 @@ function Normalize-Relative([string]$relative) {
 
 function Is-Preserved([string]$relative) {
     $normalized = Normalize-Relative $relative
+    if ($PreservedLaunchers -contains $normalized) {
+        return $true
+    }
     foreach ($prefix in $PreservePrefixes) {
         $trimmed = $prefix.TrimEnd('/')
         if ($normalized -eq $trimmed -or $normalized.StartsWith($prefix)) {
@@ -1071,6 +1112,28 @@ function Copy-UpdateTree([string]$sourceRoot, [string]$targetRoot) {
         if ($parent) {
             New-Item -ItemType Directory -Path $parent -Force | Out-Null
         }
+        if ($relative -eq 'app_modules.zip') {
+            # 模块 ZIP 是启动入口依赖的单个文件。先写临时文件，再替换旧文件，
+            # 兼容旧版本留下的同名目录，避免 Copy-Item 触发 WinError 183。
+            $temporary = Join-Path $parent ('.app_modules.zip.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+            try {
+                Copy-Item -LiteralPath $item.FullName -Destination $temporary -Force
+                if (Test-Path -LiteralPath $targetPath) {
+                    $existing = Get-Item -LiteralPath $targetPath -Force
+                    if ($existing.PSIsContainer) {
+                        Remove-Item -LiteralPath $targetPath -Recurse -Force
+                    } else {
+                        Remove-Item -LiteralPath $targetPath -Force
+                    }
+                }
+                Move-Item -LiteralPath $temporary -Destination $targetPath -Force
+            } finally {
+                if (Test-Path -LiteralPath $temporary) {
+                    Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+                }
+            }
+            continue
+        }
         Copy-Item -LiteralPath $item.FullName -Destination $targetPath -Force
     }
 }
@@ -1122,6 +1185,7 @@ try {
             self.table.setItem(row, COL_EXPIRES, QTableWidgetItem(str(device.get("license_expires", "") or "-")))
             self.table.setItem(row, COL_DEVICE_IP, QTableWidgetItem(str(device.get("ip", ""))))
             self.table.setItem(row, COL_STATUS, self._status_item("stopped"))
+            self.table.setItem(row, COL_DEVICE_HEALTH, self._device_health_item("unknown"))
             self.table.setItem(row, COL_AVG_REPLY_SECONDS, self._avg_reply_item())
             self.table.setItem(row, COL_UNATTENDED_SECONDS, self._unattended_item(self._unattended_seconds_for_device(str(device.get("ip", "")))))
             app_select = NoWheelComboBox()
@@ -1168,7 +1232,28 @@ try {
         device_ip = self._device_ip_for_row(row).strip()
         if not device_ip:
             return
-        QDesktopServices.openUrl(QUrl(f"http://{device_ip}:8888/"))
+        try:
+            normalized_ip = str(ipaddress.ip_address(device_ip))
+        except ValueError:
+            QMessageBox.warning(self, "打开设备后台", "当前设备 IP 格式无效。")
+            return
+
+        # 设备后台使用表单会话登录，程序请求登录接口得到的 Cookie 无法交给默认
+        # 浏览器。因此由浏览器打开一次性自动提交页，让 Cookie 在浏览器会话中创建。
+        login_url = f"http://{normalized_ip}:8888/login"
+        login_page = Path(tempfile.gettempdir()) / f"jixiebijiaoben_device_backend_{normalized_ip.replace(':', '_')}.html"
+        page_html = f"""<!doctype html>
+<html><head><meta charset=\"utf-8\"><title>Opening device backend</title></head>
+<body><form id=\"login\" action=\"{html.escape(login_url, quote=True)}\" method=\"post\">
+<input type=\"hidden\" name=\"password\" value=\"admin\">
+</form><script>document.getElementById('login').submit();</script></body></html>
+"""
+        try:
+            login_page.write_text(page_html, encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, "打开设备后台", f"无法创建后台登录页：{exc}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(login_page)))
 
     def _show_chat_history(self, row: int) -> None:
         device = self._device_for_row(row)
@@ -1222,6 +1307,32 @@ try {
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row, COL_BALANCE, item)
                 return
+
+    def _device_health_item(self, health: str, metrics: dict[str, Any] | None = None) -> QTableWidgetItem:
+        label, background, foreground = DEVICE_HEALTH_STYLES.get(health, DEVICE_HEALTH_STYLES["unknown"])
+        item = QTableWidgetItem(label)
+        item.setData(256, health)
+        item.setBackground(QColor(background))
+        item.setForeground(QColor(foreground))
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if isinstance(metrics, dict) and metrics:
+            item.setToolTip(
+                f"平均亮度 {metrics.get('mean_luma', '--')}；"
+                f"暗像素比例 {metrics.get('dark_ratio', '--')}；"
+                f"亮像素比例 {metrics.get('bright_ratio', '--')}；"
+                f"饱和通道 {metrics.get('clipped_channel_count', '--')}"
+            )
+        return item
+
+    def _set_row_device_health(self, device_ip: str, health: str, metrics: dict[str, Any] | None = None) -> None:
+        for row in range(self.table.rowCount()):
+            if self._device_ip_for_row(row) != device_ip:
+                continue
+            current = self.table.item(row, COL_DEVICE_HEALTH)
+            if current and current.data(256) == health:
+                return
+            self.table.setItem(row, COL_DEVICE_HEALTH, self._device_health_item(health, metrics))
+            return
 
     def _row_status_for_device(self, device_ip: str) -> str:
         for row in range(self.table.rowCount()):
@@ -1466,6 +1577,7 @@ try {
             return
         self.device_ip_input.clear()
         self._load_devices()
+        self._start_and_bind_local_tts([device_ip])
 
     def _scan_devices(self) -> None:
         self.scan_device_button.setEnabled(False)
@@ -1492,7 +1604,37 @@ try {
             ):
                 added += 1
         self._load_devices()
+        self._start_and_bind_local_tts(found)
         QMessageBox.information(self, "扫描设备", f"发现 {len(found)} 台，新增 {added} 台")
+
+    def _start_and_bind_local_tts(self, device_ips: list[str] | None = None) -> None:
+        """后台启动本地 TTS，并将其 LAN 地址写入设备后台。"""
+        if not self._tts_bind_lock.acquire(blocking=False):
+            return
+        if device_ips is None:
+            device_ips = [str(device.get("ip", "") or "") for device in self.config_manager.devices() if isinstance(device, dict)]
+        targets = list(dict.fromkeys(ip.strip() for ip in device_ips if str(ip).strip()))
+
+        def bind() -> None:
+            try:
+                results = self.local_tts_server.bind_devices(targets)
+                if not targets:
+                    self.events.put(WorkerEvent("本地TTS", "info", "本地 TTS 服务已启动"))
+                for device_ip, tts_url, error in results:
+                    if error:
+                        self.events.put(WorkerEvent(device_ip, "warning", f"本地 TTS 绑定失败：{error}"))
+                    else:
+                        self.events.put(WorkerEvent(device_ip, "info", f"本地 TTS 已绑定：{tts_url}"))
+            except Exception as exc:
+                self.events.put(WorkerEvent("本地TTS", "warning", f"本地 TTS 服务启动失败：{exc}"))
+            finally:
+                self._tts_bind_lock.release()
+
+        threading.Thread(target=bind, name="local-tts-bind", daemon=True).start()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.local_tts_server.stop()
+        super().closeEvent(event)
 
     def _bind_license(self, row: int) -> None:
         device = self._device_for_row(row)
@@ -2027,6 +2169,11 @@ try {
             reply_round_count = int(payload.get("reply_round_count") or 0)
             average_reply_seconds = payload.get("average_reply_seconds")
             self._set_row_average_reply_time(event_ip, average_reply_seconds, reply_round_count)
+            # 流程进度事件通常不附带截图健康度；不能把已有结果覆盖回“待检测”。
+            if "phone_screen_health" in payload:
+                health = str(payload.get("phone_screen_health", "unknown") or "unknown")
+                metrics = payload.get("phone_screen_health_metrics")
+                self._set_row_device_health(event_ip, health, metrics if isinstance(metrics, dict) else None)
             if is_open:
                 row_status = "circuit_open"
             elif current_step.startswith(("black_screen", "no_phone")):
@@ -2921,7 +3068,7 @@ class TemplateManagerWidget(QWidget):
             actions_layout = QHBoxLayout(actions)
             actions_layout.setContentsMargins(0, 0, 0, 0)
             actions_layout.setSpacing(6)
-            test_button = QPushButton("测试")
+            test_button = QPushButton("测试当前图")
             test_button.clicked.connect(lambda checked=False, p=path: self._test_saved_template(p))
             actions_layout.addWidget(test_button)
             delete_button = QPushButton("删除")
@@ -2955,7 +3102,13 @@ class TemplateManagerWidget(QWidget):
                 return
             match_region = None
 
-        target = import_target_path(target_key, self.buttons_dir, self.screens_dir)
+        # 主 UI 中新增的模板明确标记为客户模板，更新包不会覆盖这些文件。
+        target = import_target_path(
+            target_key,
+            self.buttons_dir,
+            self.screens_dir,
+            owner="customer",
+        )
         try:
             dialog.cropped_image.convert("RGB").save(target, format="JPEG", quality=95)
         except Exception as exc:
@@ -2981,19 +3134,39 @@ class TemplateManagerWidget(QWidget):
         self.overrides[TEMPLATE_MATCH_REGIONS_CONFIG_KEY] = regions
 
     def _template_region_text(self, path: Path) -> str:
-        if not is_popup_template_name(path.name) or not isinstance(self.overrides, dict):
+        if not isinstance(self.overrides, dict):
             return "-"
         regions = self.overrides.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY, {})
         if not isinstance(regions, dict):
+            return "未设置"
+        key = self._template_region_key(path)
+        if not key:
+            return "-"
+        region = regions.get(key)
+        if region is None and key == BACK_BUTTON:
+            region = regions.get(CUSTOM_BACK_BUTTON)
+        if not isinstance(region, (list, tuple)) or len(region) != 4:
+            return "未设置"
+        try:
+            return ", ".join(f"{float(value):.3f}" for value in region)
+        except (TypeError, ValueError):
             return "未设置"
 
     def _template_region_key(self, path: Path) -> str:
         if is_popup_template_name(path.name):
             return popup_template_region_key(path)
-        if is_back_button_template_name(path.name):
+        if is_back_button_template_name(path.name) or path.name == "btn_back.jpg":
             return BACK_BUTTON
         for rule in fixed_template_rules():
-            if path.name == rule.filename or path.name.startswith(f"{path.stem}_"):
+            base_stem = Path(rule.filename).stem
+            suffix = Path(rule.filename).suffix or ".jpg"
+            if path.name == rule.filename or re.fullmatch(
+                rf"{re.escape(base_stem)}_\d+{re.escape(suffix)}",
+                path.name,
+            ) or re.fullmatch(
+                rf"{re.escape(base_stem)}__(?:customer|developer)_\d+{re.escape(suffix)}",
+                path.name,
+            ):
                 return rule.key
         return ""
 
@@ -3009,18 +3182,37 @@ class TemplateManagerWidget(QWidget):
             QMessageBox.warning(self, "模板测试", f"无法确定模板类别范围：{path.name}")
             return
         config = self.overrides if isinstance(self.overrides, dict) else {}
+        thresholds = config.get("template_match_thresholds", {})
+        threshold = float(
+            config.get("popup_match_threshold", 0.8)
+            if is_popup_template_name(path.name)
+            else config.get("match_threshold", 0.7)
+        )
+        if isinstance(thresholds, dict) and key in thresholds:
+            try:
+                threshold = float(thresholds[key])
+            except (TypeError, ValueError):
+                pass
         try:
+            # 用最低阈值取回最高候选，未达到正式阈值时也必须把相似度展示给用户。
             result = match_template_with_region(
                 image, path, config, key,
-                threshold=float(config.get("match_threshold", 0.7)),
+                threshold=-1.0,
                 match_func=match,
             )
         except Exception as exc:
             QMessageBox.critical(self, "模板测试失败", f"匹配 {path.name} 时出错：{exc}")
             return
-        self._show_template_test_result(image, path.name, key, result)
+        self._show_template_test_result(image, path.name, key, result, threshold)
 
-    def _show_template_test_result(self, image: Image.Image, name: str, key: str, result: dict[str, Any] | None) -> None:
+    def _show_template_test_result(
+        self,
+        image: Image.Image,
+        name: str,
+        key: str,
+        result: dict[str, Any] | None,
+        threshold: float,
+    ) -> None:
         pixmap = _pixmap_from_pil_image(image)
         painter = QPainter(pixmap)
         regions = self.overrides.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY, {}) if isinstance(self.overrides, dict) else {}
@@ -3037,19 +3229,19 @@ class TemplateManagerWidget(QWidget):
         dialog.setWindowTitle(f"模板测试：{name}")
         dialog.resize(600, 820)
         layout = QVBoxLayout(dialog)
-        status = "匹配成功，绿色框为命中位置；橙色框为配置匹配范围。" if result else "未匹配到模板；橙色框为配置匹配范围。"
+        score = float(result.get("score", -1.0)) if result else None
+        matched = score is not None and score >= threshold
+        if matched:
+            status = f"匹配成功：相似度 {score:.3f} / 阈值 {threshold:.3f}。绿色框为命中位置；橙色框为配置匹配范围。"
+        elif score is not None:
+            status = f"未达到阈值：相似度 {score:.3f} / 阈值 {threshold:.3f}。绿色框为最高候选；橙色框为配置匹配范围。"
+        else:
+            status = f"未找到有效候选：阈值 {threshold:.3f}。橙色框为配置匹配范围。"
         layout.addWidget(QLabel(status))
         label = QLabel()
         label.setPixmap(pixmap.scaled(560, 720, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         layout.addWidget(label, 1)
         dialog.exec()
-        region = regions.get(popup_template_region_key(path))
-        if not isinstance(region, (list, tuple)) or len(region) != 4:
-            return "未设置"
-        try:
-            return ", ".join(f"{float(value):.3f}" for value in region)
-        except (TypeError, ValueError):
-            return "未设置"
 
     def _delete_template(self, path: Path) -> None:
         if is_popup_template_name(path.name) and isinstance(self.overrides, dict):
@@ -3651,11 +3843,11 @@ class AppConfigDialog(QDialog):
         ocr = dict(values.get("ocr", {}) if isinstance(values.get("ocr", {}), dict) else {})
         ocr["det_db_thresh"] = self.det_db_thresh.value()
         ocr["rec_thresh"] = self.rec_thresh.value()
-        regions = dict(ocr.get("regions", {}) if isinstance(ocr.get("regions", {}), dict) else {})
         chat_left = self.dialogue_region_left.value()
         chat_top = self.dialogue_region_top.value()
         chat_right = max(chat_left, self.dialogue_region_right.value())
         chat_bottom = max(chat_top, self.dialogue_region_bottom.value())
+        regions = dict(ocr.get("regions", {}) if isinstance(ocr.get("regions", {}), dict) else {})
         regions["chat_area"] = [
             round(chat_left, 3),
             round(chat_top, 3),
@@ -4120,7 +4312,11 @@ class DeviceSettingsDialogInteractive(QDialog):
                 points.append((x, y))
                 rows.append((label, "命中", str(result.get("_template_name") or paths[0].name), f"{float(result.get('score', 0.0)):.3f} / {threshold:.2f}"))
             else:
-                rows.append((label, "未命中", "-", f"- / {threshold:.2f}"))
+                diagnostic = config.get("_runtime_cache", {}).get("template_match_diagnostics", {}).get(key)
+                candidate = str(getattr(diagnostic, "template_name", "") or "-")
+                score = getattr(diagnostic, "score", None)
+                score_text = f"{float(score):.3f} / {threshold:.2f}" if score is not None else f"- / {threshold:.2f}"
+                rows.append((label, "未命中", candidate, score_text))
         return rows, points
 
     def _detect_saved_templates(self, image: Image.Image) -> None:
@@ -4261,7 +4457,7 @@ class DeviceSettingsDialogInteractive(QDialog):
 DeviceSettingsDialog = DeviceSettingsDialogInteractive
 
 
-def run_app(argv: list[str] | None = None) -> int:
+def run_app(argv: list[str] | None = None, on_ready: Callable[[], Any] | None = None) -> int:
     app = QApplication(argv or sys.argv)
     previous_handler = signal.getsignal(signal.SIGINT)
 
@@ -4275,6 +4471,9 @@ def run_app(argv: list[str] | None = None) -> int:
 
     window = MainWindow()
     window.show()
+    if on_ready is not None:
+        # 让窗口先完成首帧绘制，再执行可能加载大型 OCR runtime 的初始化。
+        QTimer.singleShot(0, on_ready)
     try:
         return app.exec()
     except KeyboardInterrupt:

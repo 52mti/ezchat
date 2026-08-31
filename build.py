@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import time
 import zipfile
+import py_compile
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator
@@ -26,6 +28,7 @@ LAUNCHER_ALIAS_EXE = "jixiebijiaoben_launcher.exe"
 START_CMD = "start_jixiebijiaoben.cmd"
 DEFAULT_FULL_PACKAGE_NVIDIA_LANE = "cu118"
 DEFAULT_RELEASE_MANIFEST_URL = "https://jixiebi-1311918180.cos.ap-shanghai.myqcloud.com/release.json"
+DEFAULT_UPDATE_PACKAGE_URL_PREFIX = "https://jixiebi-1311918180.cos.ap-shanghai.myqcloud.com/packages"
 DEFAULT_UPDATE_SHARE_URL = "https://liaotianbao.lanzouq.com/b006712hbg"
 DEFAULT_FULL_PACKAGE_PAGE_URL = "https://1822169749.share.123865.com/123pan/0OrBjv-AoL7d"
 RELEASE_FILE_NAME = "release.json"
@@ -49,6 +52,8 @@ INCLUDE_PATHS = [
     "services",
     "ui",
     "workers",
+    "tts",
+    "auto_glm",
     "lgb",
     "main.py",
     "launcher_entry.py",
@@ -82,6 +87,30 @@ RUNTIME_SKELETON_DIRS = [
     "photo/errors",
 ]
 
+# 发布包只保护本工程的业务代码。模板、配置、模型和只读外部依赖保持原样。
+PROTECTED_SOURCE_PATHS = (
+    "apps",
+    "vision",
+    "services",
+    "ui",
+    "workers",
+    "tts",
+    "main.py",
+    "launcher_entry.py",
+    "ocr_subprocess_entry.py",
+    "update_apply.py",
+    "runtime_layout.py",
+    "auto_glm",
+    "lgb",
+)
+
+APPLICATION_ENTRY_PYC = "app_core_entry.pyc"
+APPLICATION_MODULE_ARCHIVE = "app_modules.zip"
+TTS_SERVER_PYC = "tts_server.pyc"
+UPDATE_APPLY_PYC = "update_apply.pyc"
+OCR_BRIDGE_PYC = "ocr_subprocess_entry.pyc"
+OCR_BRIDGE_ARCHIVE = "ocr_bridge_modules.zip"
+
 _IGNORE_NAMES = {
     ".git",
     ".gitignore",
@@ -111,6 +140,7 @@ RUNTIME_CACHE_INPUTS = (
 PACKAGE_CACHE_EXTRA_INPUTS = (
     "build.py",
     "runtime_builder.py",
+    "app_core_entry.py",
 )
 DEPRECATED_PACKAGE_PATHS = (
     "apps/wechat",
@@ -218,8 +248,46 @@ def _model_version(root: Path, *, model_tier: str) -> str:
     return f"{runtime_version}-{tier}" if runtime_version and tier else runtime_version
 
 
-def _app_version(cache_key: str) -> str:
-    return f"app-{cache_key}"
+def _next_release_app_version(
+    root: Path,
+    *,
+    now: datetime | None = None,
+    include_remote: bool = True,
+) -> str:
+    """Return a simple calendar release number such as ``20260830-02``."""
+    date_text = (now or datetime.now()).strftime("%Y%m%d")
+    sequence = 0
+
+    def consider(version: object, update_file_name: object = "") -> None:
+        nonlocal sequence
+        version_text = str(version or "").strip()
+        matched = re.fullmatch(rf"{re.escape(date_text)}-(\d+)", version_text)
+        if matched:
+            sequence = max(sequence, int(matched.group(1)))
+            return
+        # Older hash-based releases still count as the first publication when
+        # their update archive was created today.
+        if str(update_file_name or "").startswith(f"{PACKAGE_NAME}_update_{date_text}_"):
+            sequence = max(sequence, 1)
+
+    for manifest_path in (root / "runtime_manifest.json", root / "dist" / RELEASE_FILE_NAME):
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            consider(payload.get("appVersion") or payload.get("app_version"), payload.get("update_file_name"))
+
+    if include_remote:
+        try:
+            response = requests.get(DEFAULT_RELEASE_MANIFEST_URL, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict):
+                consider(payload.get("app_version"), payload.get("update_file_name"))
+        except (requests.RequestException, ValueError):
+            pass
+    return f"{date_text}-{sequence + 1:02d}"
 
 
 def _write_package_release_metadata(
@@ -242,6 +310,7 @@ def _release_manifest_payload(
     runtime_version: str,
     model_version: str,
     update_file_name: str,
+    update_url: str = "",
     requires_full_package: bool = False,
 ) -> dict[str, object]:
     return {
@@ -251,6 +320,7 @@ def _release_manifest_payload(
         "requires_full_package": requires_full_package,
         "update_share_url": DEFAULT_UPDATE_SHARE_URL,
         "update_file_name": update_file_name,
+        "update_url": update_url or f"{DEFAULT_UPDATE_PACKAGE_URL_PREFIX}/{quote(update_file_name, safe='-_.~')}",
         "full_package_url": DEFAULT_FULL_PACKAGE_PAGE_URL,
         "release_notes": "",
         "release_manifest_url": DEFAULT_RELEASE_MANIFEST_URL,
@@ -264,6 +334,7 @@ def _write_release_manifest(
     runtime_version: str,
     model_version: str,
     update_file_name: str,
+    update_url: str = "",
     requires_full_package: bool = False,
 ) -> Path:
     payload = _release_manifest_payload(
@@ -271,6 +342,7 @@ def _write_release_manifest(
         runtime_version=runtime_version,
         model_version=model_version,
         update_file_name=update_file_name,
+        update_url=update_url,
         requires_full_package=requires_full_package,
     )
     dist_root.mkdir(parents=True, exist_ok=True)
@@ -468,6 +540,40 @@ def _upload_release_manifest(
     verify_response.raise_for_status()
 
 
+def _upload_update_package_to_cos(
+    update_zip: Path,
+    *,
+    timeout_seconds: int = DEFAULT_COS_UPLOAD_TIMEOUT_SECONDS,
+    session: requests.Session | None = None,
+) -> str:
+    """上传更新包到 COS，并返回公开下载地址。"""
+    url = f"{DEFAULT_UPDATE_PACKAGE_URL_PREFIX}/{quote(update_zip.name, safe='-_.~')}"
+    secret_id, secret_key, session_token = _cos_credentials_from_env()
+    parsed = urlparse(url)
+    headers = {
+        "Host": parsed.netloc,
+        "Content-Type": "application/zip",
+        "Content-Length": str(update_zip.stat().st_size),
+        "x-cos-acl": "public-read",
+    }
+    if session_token:
+        headers["x-cos-security-token"] = session_token
+    headers["Authorization"] = _cos_authorization(
+        method="PUT",
+        url=url,
+        headers=headers,
+        secret_id=secret_id,
+        secret_key=secret_key,
+    )
+    http = session or requests.Session()
+    with update_zip.open("rb") as handle:
+        response = http.put(url, data=handle, headers=headers, timeout=timeout_seconds)
+    response.raise_for_status()
+    verify = http.head(url, timeout=timeout_seconds, headers={"User-Agent": "Mozilla/5.0"})
+    verify.raise_for_status()
+    return url
+
+
 def _lanzou_login_session(
     *,
     username: str,
@@ -636,26 +742,34 @@ def _lanzou_upload_file(
     folder_id: int,
     timeout_seconds: int = 3600,
 ) -> None:
-    with file_path.open("rb") as handle:
-        response = session.post(
-            "https://pc.woozooo.com/fileup.php",
-            data={
-                "task": "1",
-                "vie": "2",
-                "ve": "2",
-                "id": "WU_FILE_0",
-                "folder_id_bb_n": str(folder_id),
-                "name": file_path.name,
-            },
-            files={
-                "upload_file": (file_path.name, handle, "application/octet-stream"),
-            },
-            headers={
-                "Referer": "https://pc.woozooo.com/mydisk.php",
-                "User-Agent": "Mozilla/5.0",
-            },
-            timeout=timeout_seconds,
-        )
+    headers = {
+        "Referer": "https://pc.woozooo.com/mydisk.php",
+        "User-Agent": "Mozilla/5.0",
+    }
+    # 蓝奏云新网页使用 html5up.php；旧版接口仍保留回退，兼容旧账户页面。
+    endpoints = ("https://pc.woozooo.com/html5up.php", "https://pc.woozooo.com/fileup.php")
+    response = None
+    for endpoint in endpoints:
+        with file_path.open("rb") as handle:
+            response = session.post(
+                endpoint,
+                data={
+                    "task": "1",
+                    "vie": "2",
+                    "ve": "2",
+                    "folder_id": str(folder_id),
+                    "folder_id_bb_n": str(folder_id),
+                    "name": file_path.name,
+                },
+                files={
+                    "upload_file": (file_path.name, handle, "application/octet-stream"),
+                },
+                headers=headers,
+                timeout=timeout_seconds,
+            )
+        if response.status_code != 404:
+            break
+    assert response is not None
     response.raise_for_status()
     payload = response.json()
     if int(payload.get("zt", 0) or 0) != 1:
@@ -708,6 +822,7 @@ def _publish_release_manifest(
     model_version: str,
     update_file_name: str,
     requires_full_package: bool = False,
+    update_zip: Path | None = None,
 ) -> str:
     try:
         from services.update_sources import UpdateSourceError, resolve_lanzou_update_package
@@ -726,11 +841,13 @@ def _publish_release_manifest(
             f"Resolver error: {exc}"
         ) from exc
 
+    update_url = _upload_update_package_to_cos(update_zip) if update_zip is not None else ""
     payload = _release_manifest_payload(
         app_version=app_version,
         runtime_version=runtime_version,
         model_version=model_version,
         update_file_name=update_file_name,
+        update_url=update_url,
         requires_full_package=requires_full_package,
     )
     secret_id, secret_key, session_token = _cos_credentials_from_env()
@@ -767,6 +884,10 @@ def _archive_excludes(
     exclude_full_runtimes: bool,
     exclude_app_customer_config_assets: bool,
 ) -> bool:
+    # 客户更新由当前启动器拉起，启动器自身仍被 Windows 占用，更新包不能携带
+    # 这两个 EXE，否则更新程序会尝试覆盖正在运行的文件并失败。
+    if exclude_full_runtimes and relative in {LAUNCHER_EXE, LAUNCHER_ALIAS_EXE}:
+        return True
     if exclude_runtime_state and relative == "runtime/install_state.json":
         return True
     if exclude_app_customer_config_assets and _is_app_customer_config_asset(relative):
@@ -784,7 +905,13 @@ def _archive_excludes(
     parts = relative.split("/")
     if "__pycache__" in parts:
         return True
-    return relative.endswith((".pyc", ".pyo"))
+    protected_bytecode = {
+        APPLICATION_ENTRY_PYC,
+        TTS_SERVER_PYC,
+        UPDATE_APPLY_PYC,
+        OCR_BRIDGE_PYC,
+    }
+    return relative.endswith((".pyc", ".pyo")) and relative not in protected_bytecode
 
 
 def _iter_archive_dirs(
@@ -1248,12 +1375,14 @@ def _package_cache_key(
     model_tier: str,
     nvidia_cuda_lane: str,
     include_full_payload: bool,
+    app_version_salt: str = "",
 ) -> str:
     digest = hashlib.sha256()
     payload = {
         "model_tier": model_tier,
         "nvidia_cuda_lane": nvidia_cuda_lane,
         "include_full_payload": include_full_payload,
+        "app_version_salt": str(app_version_salt or "").strip(),
         "python": sys.version,
     }
     digest.update(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8"))
@@ -1449,29 +1578,15 @@ def _write_cmd_launchers(package_root: Path) -> None:
             'cd /d "%~dp0"',
             "",
             f'set "LAUNCHER_EXE=%~dp0{LAUNCHER_ALIAS_EXE}"',
-            'set "RUNTIME_PYTHON=%~dp0runtime\\app\\python.exe"',
-            'set "RUNTIME_PYTHON_ALT=%~dp0runtime\\app\\pythonw.exe"',
             "",
             'if exist "%LAUNCHER_EXE%" goto start_exe',
-            'if exist "%RUNTIME_PYTHON%" goto run_runtime',
-            'if exist "%RUNTIME_PYTHON_ALT%" goto run_runtime_alt',
-            "echo Missing launcher executable and packaged runtime.",
+            "echo Missing protected launcher executable.",
             "pause",
             "exit /b 1",
             "",
             ":start_exe",
             'start "" "%LAUNCHER_EXE%"',
             "exit /b 0",
-            "",
-            ":run_runtime",
-            'set "PYTHONNOUSERSITE=1"',
-            '\"%RUNTIME_PYTHON%\" -s -u \"%~dp0main.py\"',
-            "exit /b %ERRORLEVEL%",
-            "",
-            ":run_runtime_alt",
-            'set "PYTHONNOUSERSITE=1"',
-            '\"%RUNTIME_PYTHON_ALT%\" -s -u \"%~dp0main.py\"',
-            "exit /b %ERRORLEVEL%",
         ],
     )
 
@@ -1516,38 +1631,114 @@ def _exe_cache_fresh(cached_exe: Path, root: Path, deps: list[str]) -> bool:
     return True
 
 
+def _source_signature(root: Path) -> str:
+    """Build-cache key for frozen executables; includes every protected source file."""
+    digest = hashlib.sha256()
+    for relative in [*PROTECTED_SOURCE_PATHS, "launcher_entry.py", "app_core_entry.py"]:
+        source = root / relative
+        if source.is_file():
+            digest.update(relative.encode("utf-8"))
+            digest.update(source.read_bytes())
+        elif source.is_dir():
+            for path in sorted(source.rglob("*.py")):
+                digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+                digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _freeze_executable(root: Path, cache: Path, work: Path, *, name: str, entry: str, args: list[str]) -> Path:
+    target = cache / name
+    command = [
+        sys.executable,
+        "-m",
+        "PyInstaller",
+        "--onefile",
+        "--noconsole",
+        "--name",
+        Path(name).stem,
+        "--distpath",
+        str(cache),
+        "--workpath",
+        str(work / Path(name).stem),
+        "--specpath",
+        str(work),
+        *args,
+        str(root / entry),
+    ]
+    print("[pyinstaller] " + " ".join(command))
+    subprocess.check_call(command, cwd=root)
+    if not target.is_file():
+        raise RuntimeError(f"PyInstaller did not create {target}")
+    return target
+
+
 def _freeze_executables(root: Path, package_root: Path, *, rebuild: bool) -> None:
     cache = root / "build" / "exe_cache"
     cache.mkdir(parents=True, exist_ok=True)
-    work = root / "build" / "_pyinstaller"
-    cached_exe = cache / LAUNCHER_EXE
+    cached_launcher = cache / LAUNCHER_EXE
     deps = ["launcher_entry.py", "runtime_layout.py"]
-    if rebuild and not _exe_cache_fresh(cached_exe, root, deps):
+    if rebuild and not _exe_cache_fresh(cached_launcher, root, deps):
         try:
             import PyInstaller  # noqa: F401
         except ImportError as exc:
             raise RuntimeError("PyInstaller is required. Run `pip install -r requirements-dev.txt`.") from exc
-        command = [
-            sys.executable,
-            "-m",
-            "PyInstaller",
-            "--onefile",
-            "--noconsole",
-            "--name",
-            LAUNCHER_EXE[:-4],
-            "--distpath",
-            str(cache),
-            "--workpath",
-            str(work),
-            "--specpath",
-            str(work),
-            str(root / "launcher_entry.py"),
-        ]
-        print("[pyinstaller] " + " ".join(command))
-        subprocess.check_call(command, cwd=root)
-    if not cached_exe.is_file():
-        raise RuntimeError(f"Missing cached launcher executable: {cached_exe}")
-    shutil.copy2(cached_exe, package_root / LAUNCHER_EXE)
+        _freeze_executable(root, cache, root / "build" / "_pyinstaller", name=LAUNCHER_EXE, entry="launcher_entry.py", args=[])
+    if not cached_launcher.is_file():
+        raise RuntimeError(f"Missing cached launcher executable: {cached_launcher}")
+    shutil.copy2(cached_launcher, package_root / LAUNCHER_EXE)
+
+    # Compile business modules into a zip archive. Python can import pyc-only
+    # modules from it, while customers cannot open the source files directly.
+    temporary = Path(tempfile.mkdtemp(prefix="jxb_modules_"))
+    try:
+        archive = package_root / APPLICATION_MODULE_ARCHIVE
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+            for relative in PROTECTED_SOURCE_PATHS:
+                source = root / relative
+                files = [source] if source.is_file() else sorted(source.rglob("*.py")) if source.is_dir() else []
+                for file_path in files:
+                    target = temporary / file_path.relative_to(root).with_suffix(".pyc")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    py_compile.compile(str(file_path), cfile=str(target), doraise=True)
+                    output.write(target, target.relative_to(temporary).as_posix())
+        for name, source in ((APPLICATION_ENTRY_PYC, "app_core_entry.py"), (TTS_SERVER_PYC, "tts/server.py"), (UPDATE_APPLY_PYC, "update_apply.py")):
+            target = package_root / name
+            py_compile.compile(str(root / source), cfile=str(target), doraise=True)
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _build_ocr_bridge_bytecode(root: Path, package_root: Path) -> None:
+    """Keep OCR on its selected runtime while removing readable bridge sources."""
+    if not (root / "ocr_subprocess_entry.py").is_file() or not (root / "vision").is_dir():
+        return
+    temporary = Path(tempfile.mkdtemp(prefix="jxb_ocr_bridge_"))
+    try:
+        entry_target = package_root / OCR_BRIDGE_PYC
+        py_compile.compile(str(root / "ocr_subprocess_entry.py"), cfile=str(entry_target), doraise=True)
+        archive = package_root / OCR_BRIDGE_ARCHIVE
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+            for relative in ("vision", "runtime_layout.py"):
+                source = root / relative
+                files = [source] if source.is_file() else sorted(source.rglob("*.py"))
+                for file_path in files:
+                    compiled = temporary / file_path.relative_to(root).with_suffix(".pyc")
+                    compiled.parent.mkdir(parents=True, exist_ok=True)
+                    py_compile.compile(str(file_path), cfile=str(compiled), doraise=True)
+                    output.write(compiled, compiled.relative_to(temporary).as_posix())
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _remove_packaged_python_sources(package_root: Path) -> None:
+    """Release directories retain templates/configuration only; code lives in executables."""
+    for relative in PROTECTED_SOURCE_PATHS:
+        target = package_root / relative
+        if target.is_file() and target.suffix == ".py":
+            target.unlink(missing_ok=True)
+        elif target.is_dir():
+            for source_file in target.rglob("*.py"):
+                source_file.unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1559,6 +1750,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-release-upload", action="store_true", help="skip uploading release.json to Tencent COS")
     parser.add_argument("--model-tier", default="lite")
     parser.add_argument("--nvidia-cuda-lane", default=DEFAULT_FULL_PACKAGE_NVIDIA_LANE)
+    parser.add_argument("--app-version-salt", default="", help="force a different app_version without changing runtime/model versions")
     args = parser.parse_args(argv)
 
     root = Path(__file__).resolve().parent
@@ -1569,13 +1761,14 @@ def main(argv: list[str] | None = None) -> int:
     package_timestamp = _current_package_timestamp()
     _remove_dist_archives(dist)
 
+    app_version = _next_release_app_version(root, include_remote=not args.skip_release_upload)
     package_cache_key = _package_cache_key(
         root,
         model_tier=args.model_tier,
         nvidia_cuda_lane=args.nvidia_cuda_lane,
         include_full_payload=include_full_payload,
+        app_version_salt=f"{args.app_version_salt}:{app_version}",
     )
-    app_version = _app_version(package_cache_key)
     runtime_version = _runtime_version(root)
     model_version = _model_version(root, model_tier=args.model_tier)
     cache_dir = _package_cache_dir(root, package_cache_key)
@@ -1614,6 +1807,7 @@ def main(argv: list[str] | None = None) -> int:
                 runtime_version=runtime_version,
                 model_version=model_version,
                 update_file_name=update_zip.name,
+                update_zip=update_zip,
             )
             print(f"[done] release(uploaded)={release_manifest_url}")
         _write_package_release_metadata(
@@ -1646,6 +1840,8 @@ def main(argv: list[str] | None = None) -> int:
         _cleanup_python_caches(package_root)
         _write_full_package_runtime_state(package_root, model_tier=args.model_tier, nvidia_cuda_lane=args.nvidia_cuda_lane)
     _freeze_executables(root, package_root, rebuild=not args.skip_freeze)
+    _build_ocr_bridge_bytecode(root, package_root)
+    _remove_packaged_python_sources(package_root)
     _copy_executable_aliases(package_root)
     _write_cmd_launchers(package_root)
     _write_package_manifest(package_root)
@@ -1681,6 +1877,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime_version=runtime_version,
             model_version=model_version,
             update_file_name=update_zip.name,
+            update_zip=update_zip,
         )
         print(f"[done] release(uploaded)={release_manifest_url}")
     _write_package_release_metadata(

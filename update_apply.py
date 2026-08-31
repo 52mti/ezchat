@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import contextlib
 import json
 import os
 import shutil
@@ -26,8 +27,21 @@ PRESERVE_PREFIXES = (
     "runtime/.paddlex/",
     "photo/",
     "jiekou/",
-    "lgb/",
 )
+PRESERVED_LAUNCHERS = {"机械臂脚本.exe", "jixiebijiaoben_launcher.exe"}
+
+
+def _is_app_config_relative(relative: str) -> bool:
+    parts = relative.replace("\\", "/").lstrip("/").split("/")
+    return len(parts) == 3 and parts[0] == "apps" and parts[2] == "config.json" and bool(parts[1])
+
+
+def _is_customer_template_relative(relative: str) -> bool:
+    """客户新增模板跨版本保留，更新包不能覆盖或清理。"""
+    parts = relative.replace("\\", "/").lstrip("/").split("/")
+    if len(parts) < 4 or parts[0] != "apps" or parts[2] != "templates":
+        return False
+    return any("__customer_" in part for part in parts[3:])
 
 
 def _is_windows() -> bool:
@@ -71,8 +85,11 @@ def _wait_for_process_exit(pid: int, timeout_seconds: int) -> None:
 
 def _extract_archive(archive_path: Path) -> Path:
     temp_root = Path(tempfile.mkdtemp(prefix="jxb_update_"))
-    with zipfile.ZipFile(archive_path, "r") as archive:
-        archive.extractall(temp_root)
+    try:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            archive.extractall(temp_root)
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError("Downloaded update package is not a valid zip archive.") from exc
     package_root = temp_root / PACKAGE_NAME
     if package_root.is_dir():
         return package_root
@@ -104,10 +121,60 @@ def _read_manifest_paths(package_root: Path) -> set[str]:
 
 def _is_preserved(relative: str) -> bool:
     normalized = relative.replace("\\", "/").lstrip("/")
+    if normalized in PRESERVED_LAUNCHERS:
+        return True
+    if _is_app_config_relative(normalized) or _is_customer_template_relative(normalized):
+        return True
     return any(
         normalized == prefix.rstrip("/") or normalized.startswith(prefix)
         for prefix in PRESERVE_PREFIXES
     )
+
+
+def _read_json_object(path: Path) -> dict | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _copy_or_merge_update_file(source: Path, target: Path, relative: str) -> None:
+    if _is_app_config_relative(relative) and target.is_file():
+        update_config = _read_json_object(source)
+        local_config = _read_json_object(target)
+        if update_config is not None and local_config is not None:
+            merged = _deep_merge(update_config, local_config)
+            target.write_text(
+                json.dumps(merged, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            return
+    # 程序模块 ZIP 可能仍被旧启动器占用。先在同目录写临时文件，再用
+    # Windows 原子替换；避免直接创建已存在目标时触发 WinError 183。
+    if relative.replace("\\", "/") == "app_modules.zip":
+        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        try:
+            shutil.copy2(source, temporary)
+            # 某些旧安装可能把同名路径留下为目录；清理这个精确目标后再替换。
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            os.replace(temporary, target)
+        finally:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+        return
+    shutil.copy2(source, target)
 
 
 def _remove_obsolete_files(target_root: Path, old_paths: set[str], new_paths: set[str]) -> None:
@@ -123,14 +190,15 @@ def _remove_obsolete_files(target_root: Path, old_paths: set[str], new_paths: se
 def _copy_update_tree(source_root: Path, target_root: Path) -> None:
     for source in sorted(source_root.rglob("*")):
         relative = source.relative_to(source_root).as_posix()
-        if _is_preserved(relative):
+        is_app_config = _is_app_config_relative(relative)
+        if _is_preserved(relative) and not is_app_config:
             continue
         target = target_root / relative
         if source.is_dir():
             target.mkdir(parents=True, exist_ok=True)
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+        _copy_or_merge_update_file(source, target, relative)
 
 
 def _write_error_log(target_root: Path, message: str) -> None:
