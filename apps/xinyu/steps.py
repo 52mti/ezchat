@@ -1601,6 +1601,52 @@ def _main_nav_ocr_result(
     return ocr_result
 
 
+def _screen_detection_rule_ocr_result(
+    image: Any,
+    config: dict[str, Any],
+    reporter: Reporter | None = None,
+) -> dict[str, Any] | None:
+    """Recognize a configured Xinyu main tab using its own OCR region."""
+    rules = config.get("screen_detection_rules")
+    if not isinstance(rules, list):
+        return None
+    for rule in rules:
+        if not isinstance(rule, dict) or not str(rule.get("screen", "")).startswith("xinyu-"):
+            continue
+        condition = rule.get("condition")
+        if not isinstance(condition, dict) or condition.get("type") != "ocr_raw":
+            continue
+        region = _valid_region(condition.get("region") or rule.get("match_region"))
+        text = _clean_list_text(condition.get("text"))
+        if region is None or not text:
+            continue
+        ocr_result = _run_ocr_mode(image, config, "list", region=region)
+        min_confidence = float(condition.get("min_confidence", 0.0) or 0.0)
+        for item in ocr_result.get("ocr_items", []):
+            if not isinstance(item, dict):
+                continue
+            item_text = _clean_list_text(item.get("text"))
+            try:
+                confidence = float(item.get("confidence", 1.0) or 1.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if confidence < min_confidence:
+                continue
+            if condition.get("match_mode", "contains") == "contains" and text not in item_text:
+                continue
+            if condition.get("match_mode", "contains") != "contains" and item_text != text:
+                continue
+            ocr_result["_xinyu_main_screen_rule"] = str(rule.get("screen"))
+            _report(
+                reporter,
+                "startup_recover",
+                "OCR 识别到心遇主界面特征",
+                log_label=f"OCR 识别到心遇主界面特征：{rule.get('screen')}，关键词={text}",
+            )
+            return ocr_result
+    return None
+
+
 def ensure_list_screen(
     robot: Any,
     config: dict[str, Any] | None = None,
@@ -1649,7 +1695,10 @@ def ensure_list_screen(
         # The app home has a stable five-item bottom navigation.  Check this
         # before the chat template because the chat template can overlap the
         # home screen in camera-captured images.
-        if _main_nav_ocr_result(current_image, cfg, reporter=reporter) is not None:
+        main_nav_result = _main_nav_ocr_result(current_image, cfg, reporter=reporter)
+        if main_nav_result is None:
+            main_nav_result = _screen_detection_rule_ocr_result(current_image, cfg, reporter=reporter)
+        if main_nav_result is not None:
             if _try_open_message_list(robot, cfg, current_image, reporter=reporter):
                 current_image = capture_after_popups(
                     robot, cfg, label="after_message_nav", reporter=reporter
@@ -1696,15 +1745,6 @@ def ensure_list_screen(
             _report(reporter, "startup_recover", "启动时在我的界面，先 OCR 读取积分和底部导航")
             read_my_points(robot, cfg, reporter=reporter, image=current_image, assume_my=True)
             current_image = _capture_image(robot, cfg, pre_move=True, label="after_message_button")
-            continue
-
-        # Other app tabs can still expose the stable bottom-nav message entry.
-        # Prefer it as the direct route to the chat list before using back
-        # recovery, which may leave the app or hit an unrelated page.
-        if _try_open_message_list(robot, cfg, current_image, reporter=reporter):
-            current_image = capture_after_popups(
-                robot, cfg, label="after_message_nav", reporter=reporter
-            )
             continue
 
         last_state = "unknown"

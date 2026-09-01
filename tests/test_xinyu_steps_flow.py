@@ -419,6 +419,52 @@ def test_xinyu_ensure_list_screen_reports_unknown_screen_back_failure(monkeypatc
     assert steps.ensure_list_screen(robot, config) is None
 
 
+def test_xinyu_unknown_screen_does_not_use_cached_message_anchor(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    config["_runtime_cache"] = {"screen_anchors": {"bottom_message": (0.7, 0.9)}}
+    robot = FakeRobot(["unknown"])
+    message_clicks: list[object] = []
+
+    monkeypatch.setattr(steps, "capture_transform_image", lambda robot, cfg, pre_move=True, label="screen": robot.get_transform_image())
+    monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
+    monkeypatch.setattr(steps, "_run_ocr_mode", lambda image, cfg, mode, region=None: {"ocr_items": [], "result": {}})
+    monkeypatch.setattr(steps, "_try_open_message_list", lambda *args, **kwargs: message_clicks.append(True) or False)
+
+    assert steps.ensure_list_screen(robot, config) is None
+    assert message_clicks == []
+
+
+def test_xinyu_screen_detection_rules_recognize_main_tab_by_own_ocr_region(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    config["screen_detection_rules"] = [
+        {
+            "screen": "xinyu-缘分",
+            "match_region": [0.0, 0.1, 0.5, 0.2],
+            "condition": {
+                "type": "ocr_raw",
+                "region": [0.0, 0.1, 0.5, 0.2],
+                "text": "推荐在线",
+                "match_mode": "contains",
+                "min_confidence": 0.75,
+            },
+        }
+    ]
+    seen: list[object] = []
+
+    monkeypatch.setattr(
+        steps,
+        "_run_ocr_mode",
+        lambda image, cfg, mode, region=None: seen.append(region)
+        or {"ocr_items": [{"text": "推荐在线", "confidence": 0.9}]},
+    )
+
+    result = steps._screen_detection_rule_ocr_result("main", config)
+
+    assert result is not None
+    assert result["_xinyu_main_screen_rule"] == "xinyu-缘分"
+    assert seen == [[0.0, 0.1, 0.5, 0.2]]
+
+
 def test_xinyu_waits_until_call_screen_variant_disappears(monkeypatch, tmp_path):
     config = _config(tmp_path)
     screens_dir = Path(config["templates"]["screens"])
