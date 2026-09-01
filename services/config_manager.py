@@ -24,6 +24,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "credits_bearer": "",
         "greetings_dir": "runtime/greetings",
         "ocr_max_concurrency": 1,
+        "rule_learning": {
+            "upload_url": "",
+            "rules_url": "https://jixiebi-1311918180.cos.ap-shanghai.myqcloud.com/rule-learning/{app}/rules.json",
+            "bearer_token": "",
+        },
         "persona": {
             "requestPersona": "",
             "name": "",
@@ -44,11 +49,21 @@ DEFAULT_MATCH_THRESHOLD = 0.7
 APP_LEVEL_KEYS = {
     "ocr",
     "ocr_modes",
+    "dialogue_engine",
+    "dialogue_llm",
     "templates",
     "match_threshold",
     "popup_match_threshold",
+    "enable_enhanced_template_match",
+    "template_match_region_expand_ratio",
+    "template_match_region_expand_ratios",
+    "template_match_scales",
+    "template_match_scales_by_key",
+    "template_match_channels",
+    "template_match_channels_by_key",
     "template_match_regions",
     "template_match_thresholds",
+    "screen_detection_rules",
 }
 DEVICE_LEVEL_KEYS = {
     "poll_interval",

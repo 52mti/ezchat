@@ -1622,20 +1622,26 @@ def _screen_detection_rule_ocr_result(
             continue
         ocr_result = _run_ocr_mode(image, config, "list", region=region)
         min_confidence = float(condition.get("min_confidence", 0.0) or 0.0)
+        recognized_texts: list[str] = []
         for item in ocr_result.get("ocr_items", []):
             if not isinstance(item, dict):
                 continue
             item_text = _clean_list_text(item.get("text"))
+            if not item_text:
+                continue
             try:
                 confidence = float(item.get("confidence", 1.0) or 1.0)
             except (TypeError, ValueError):
                 confidence = 0.0
             if confidence < min_confidence:
                 continue
-            if condition.get("match_mode", "contains") == "contains" and text not in item_text:
-                continue
-            if condition.get("match_mode", "contains") != "contains" and item_text != text:
-                continue
+            recognized_texts.append(item_text)
+        recognized = "".join(recognized_texts)
+        if condition.get("match_mode", "contains") == "contains" and text not in recognized:
+            continue
+        if condition.get("match_mode", "contains") != "contains" and text != recognized:
+            continue
+        if recognized_texts:
             ocr_result["_xinyu_main_screen_rule"] = str(rule.get("screen"))
             _report(
                 reporter,

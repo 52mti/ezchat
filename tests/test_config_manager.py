@@ -545,3 +545,15 @@ def test_config_manager_remove_device(tmp_path):
     assert manager.remove_device("192.168.1.20") is True
     assert manager.remove_device("192.168.1.20") is False
     assert [device["ip"] for device in manager.devices()] == ["192.168.1.3"]
+
+
+def test_config_manager_preserves_app_screen_detection_rules(tmp_path):
+    app_dir = tmp_path / "apps" / "xinyu"
+    app_dir.mkdir(parents=True)
+    rules = [{"screen": "xinyu-缘分", "condition": {"type": "ocr_raw", "text": "推荐在线"}}]
+    (app_dir / "config.json").write_text(json.dumps({"screen_detection_rules": rules}), encoding="utf-8")
+
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    config = manager.get_app_config("192.168.1.1", "xinyu", {})
+
+    assert config["screen_detection_rules"] == rules

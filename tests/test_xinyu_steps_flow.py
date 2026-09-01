@@ -465,6 +465,37 @@ def test_xinyu_screen_detection_rules_recognize_main_tab_by_own_ocr_region(monke
     assert seen == [[0.0, 0.1, 0.5, 0.2]]
 
 
+def test_xinyu_screen_detection_rule_combines_split_raw_ocr_text(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    config["screen_detection_rules"] = [
+        {
+            "screen": "xinyu-娱乐交友",
+            "condition": {
+                "type": "ocr_raw",
+                "region": [0.0, 0.0, 0.5, 0.2],
+                "text": "娱乐交友",
+                "match_mode": "contains",
+                "min_confidence": 0.75,
+            },
+        }
+    ]
+    monkeypatch.setattr(
+        steps,
+        "_run_ocr_mode",
+        lambda image, cfg, mode, region=None: {
+            "ocr_items": [
+                {"text": "娱乐", "confidence": 0.91},
+                {"text": "交友", "confidence": 0.92},
+            ]
+        },
+    )
+
+    result = steps._screen_detection_rule_ocr_result("main", config)
+
+    assert result is not None
+    assert result["_xinyu_main_screen_rule"] == "xinyu-娱乐交友"
+
+
 def test_xinyu_waits_until_call_screen_variant_disappears(monkeypatch, tmp_path):
     config = _config(tmp_path)
     screens_dir = Path(config["templates"]["screens"])
