@@ -69,7 +69,7 @@ DEFAULT_CONFIG = {
     "list_compact_top_margin": 0.02,
     "list_compact_bottom_margin": 0.02,
     "list_compact_min_height": 0.2,
-    "dialogue_message_input_box_top_margin": 0.04,
+    "dialogue_message_input_box_top_margin": 0.065,
     # 视觉模型确认双方消息后，本地 OCR 坐标向左右扩展的安全边距。
     "dialogue_sender1_left_margin": 0.05,
     "dialogue_sender2_right_margin": 0.05,
