@@ -1750,6 +1750,22 @@ def ensure_list_screen(
             if _matches_chat_list_screen(current_image, cfg, reporter=reporter):
                 _report(reporter, "startup_recover", f"已确认聊天列表（第 {attempt} 轮）")
                 return current_image
+            main_nav_result = _main_nav_ocr_result(current_image, cfg, reporter=reporter)
+            if main_nav_result is None:
+                main_nav_result = _screen_detection_rule_ocr_result(current_image, cfg, reporter=reporter)
+            if main_nav_result is not None:
+                if _try_open_message_list(robot, cfg, current_image, reporter=reporter):
+                    current_image = capture_after_popups(
+                        robot, cfg, label="after_message_nav", reporter=reporter
+                    )
+                    continue
+                _report(
+                    reporter,
+                    "startup_recover",
+                    "已确认心遇主界面，但未找到消息坐标",
+                    log_label="已确认心遇主界面，但未找到底部消息坐标，本轮不使用聊天界面模板",
+                )
+                return None
             is_chat = _matches_screen(current_image, cfg, CHAT_WINDOW_SCREEN)
 
         if is_chat:
