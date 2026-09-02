@@ -3261,7 +3261,11 @@ def go_back(
         else:
             _report(reporter, "back_click", "使用缓存坐标", log_label=f"使用缓存坐标：返回按钮 {format_point(*pos)}")
         click_point = pos
-        click_times = 2 if attempt == 0 and double_click_on_first_attempt else 1
+        click_times = 1
+        if attempt == 0 and double_click_on_first_attempt:
+            microphone = _template_center(image, cfg, MICROPHONE_BUTTON, group="buttons")
+            if microphone is not None:
+                click_times = 2
         if click_times == 2:
             _report(
                 reporter,
