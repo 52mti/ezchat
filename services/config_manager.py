@@ -64,8 +64,6 @@ APP_LEVEL_KEYS = {
     "template_match_regions",
     "template_match_thresholds",
     "screen_detection_rules",
-    "photo_sent_cooldown_seconds",
-    "online_photo_send_count",
 }
 DEVICE_LEVEL_KEYS = {
     "poll_interval",
@@ -76,6 +74,8 @@ DEVICE_LEVEL_KEYS = {
 }
 DEVICE_APP_LEVEL_KEYS = {
     "persona",
+    "photo_sent_cooldown_seconds",
+    "online_photo_send_count",
     "new_greeting_click_x_offset",
     "new_greeting_click_y_offset",
     "next_message_click_x_offset",

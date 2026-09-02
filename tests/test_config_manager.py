@@ -436,10 +436,12 @@ def test_config_manager_keeps_template_match_thresholds_in_app_scope(tmp_path):
     assert merged["template_match_thresholds"]["screen.chat_window"] == 0.7
 
 
-def test_config_manager_keeps_xinyu_photo_settings_in_app_scope(tmp_path):
+def test_config_manager_keeps_xinyu_photo_settings_in_device_app_scope(tmp_path):
     manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    manager.add_device({"ip": "1.1.1.1", "selected_app": "xinyu"})
 
-    manager.update_app_config(
+    manager.update_device_app_overrides(
+        "1.1.1.1",
         "xinyu",
         {
             "online_photo_send_count": 0,
@@ -447,11 +449,13 @@ def test_config_manager_keeps_xinyu_photo_settings_in_app_scope(tmp_path):
         },
     )
 
-    app_saved = _read_app_config(tmp_path, "xinyu")
+    saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     merged = manager.get_app_config("1.1.1.1", "xinyu", XINYU_DEFAULT_CONFIG)
 
-    assert app_saved["online_photo_send_count"] == 0
-    assert app_saved["photo_sent_cooldown_seconds"] == 3600
+    device_app = saved["devices"][0]["app_overrides"]["xinyu"]
+    assert device_app["online_photo_send_count"] == 0
+    assert device_app["photo_sent_cooldown_seconds"] == 3600
+    assert not (tmp_path / "apps" / "xinyu" / "config.json").exists()
     assert merged["online_photo_send_count"] == 0
     assert merged["photo_sent_cooldown_seconds"] == 3600
 

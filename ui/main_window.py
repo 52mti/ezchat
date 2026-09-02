@@ -1709,8 +1709,6 @@ try {
                 "popup_match_threshold",
                 "template_match_regions",
                 "template_match_thresholds",
-                "photo_sent_cooldown_seconds",
-                "online_photo_send_count",
             )
             if key in values
         }
@@ -1720,7 +1718,13 @@ try {
             if key in values
         }
         persona = values.get("persona", {})
-        device_app_updates = {"persona": copy.deepcopy(persona)} if isinstance(persona, dict) else {}
+        device_app_updates = {
+            key: copy.deepcopy(values[key])
+            for key in ("photo_sent_cooldown_seconds", "online_photo_send_count")
+            if key in values
+        }
+        if isinstance(persona, dict):
+            device_app_updates["persona"] = copy.deepcopy(persona)
 
         self.config_manager.update_app_config(app_name, app_updates)
         self.config_manager.update_device_runtime(device_ip, runtime_updates)
