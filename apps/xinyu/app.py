@@ -27,6 +27,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 class XinyuApp(BaseApp):
     name = "心遇"
     description = "Xinyu unread message scan and TTS reply flow"
+    REMOTE_FILTER_RULE_SYNC_INTERVAL_SECONDS = 3600.0
 
     def __init__(
         self,
@@ -46,6 +47,18 @@ class XinyuApp(BaseApp):
         self.idle_points_checked = False
         self.idle_online_photo_attempted = False
         self._last_selected_signature: tuple[str, str, int] | None = None
+        self._last_remote_filter_rule_sync_at = 0.0
+
+    def _sync_remote_filter_rules_if_due(self) -> None:
+        now = time.monotonic()
+        if now - self._last_remote_filter_rule_sync_at < self.REMOTE_FILTER_RULE_SYNC_INTERVAL_SECONDS:
+            return
+        self._last_remote_filter_rule_sync_at = now
+        success, added = steps.sync_remote_filter_rules(self.config)
+        if success:
+            self.emit_runtime_log("info", "心遇云端过滤词同步完成", {"新增": added, "间隔秒": 3600})
+        else:
+            self.emit_runtime_log("warning", "心遇云端过滤词同步失败，继续使用本地规则", {})
 
     def _reset_round_metrics(self) -> None:
         cache = self.config.setdefault("_runtime_cache", {})
@@ -159,6 +172,7 @@ class XinyuApp(BaseApp):
         round_started_at = time.monotonic()
         self._reset_round_metrics()
         try:
+            self._sync_remote_filter_rules_if_due()
             reporter = self.set_runtime_step
             reporter("popup_check", "检查并关闭弹窗")
             # 启动首图也必须走完整弹窗处理，不能只写状态日志。

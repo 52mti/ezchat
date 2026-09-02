@@ -2844,6 +2844,51 @@ def _learn_llm_system_messages(config: dict[str, Any], llm_payload: dict[str, An
     return len(added)
 
 
+def sync_remote_filter_rules(config: dict[str, Any]) -> tuple[bool, int]:
+    """拉取心遇共享过滤词并热更新当前运行配置。"""
+    runtime = config.get("_runtime", {})
+    rule_config = runtime.get("rule_learning", {}) if isinstance(runtime, dict) else {}
+    if not isinstance(rule_config, dict):
+        return False, 0
+    rules_url = str(rule_config.get("rules_url", "") or "").strip()
+    upload_url = str(rule_config.get("upload_url", "") or "").strip()
+    if not rules_url and not upload_url:
+        return False, 0
+    try:
+        keywords = RuleLearningStore().sync(
+            "xinyu",
+            upload_url=upload_url,
+            rules_url=rules_url,
+            bearer_token=str(rule_config.get("bearer_token", "") or ""),
+        )
+    except (OSError, ValueError, RuntimeError):
+        return False, 0
+    dialogue = config.get("ocr_modes", {}).get("dialogue", {})
+    rules = dialogue.get("rules", {}) if isinstance(dialogue, dict) else {}
+    if not isinstance(rules, dict):
+        return True, 0
+    current = rules.get("line_excluded_keywords", [])
+    current_values = (
+        [str(value).strip() for value in current.splitlines() if str(value).strip()]
+        if isinstance(current, str)
+        else [str(value).strip() for value in current if str(value).strip()]
+        if isinstance(current, (list, tuple))
+        else []
+    )
+    merged = list(dict.fromkeys(current_values + [str(value).strip() for value in keywords if str(value).strip()]))
+    added = len(merged) - len(current_values)
+    if added <= 0:
+        return True, 0
+    rules["line_excluded_keywords"] = merged
+    manager = runtime.get("config_manager") if isinstance(runtime, dict) else None
+    if manager is not None and hasattr(manager, "update_app_config"):
+        manager.update_app_config(
+            "xinyu",
+            {"ocr_modes": {"dialogue": {"rules": {"line_excluded_keywords": merged}}}},
+        )
+    return True, added
+
+
 def _dialogue_payload_from_ocr(ocr_result: dict[str, Any]) -> dict[str, Any]:
     result = ocr_result.get("result", {}) if isinstance(ocr_result, dict) else {}
     dialogues = result.get("dialogues", []) if isinstance(result, dict) else []
