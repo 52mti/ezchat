@@ -3293,23 +3293,26 @@ def go_back(
             )
             click_image_point(robot, *click_point)
             back_clicks += 1
-        time.sleep(0.4)
-        image = capture_after_popups(robot, cfg, label="after_go_back", reporter=reporter)
-        if _matches_chat_list_screen(image, cfg, reporter=reporter):
-            _report(
-                reporter,
-                "back_click",
-                "返回聊天列表成功",
-                log_label=f"返回聊天列表成功：返回点击 {back_clicks} 次",
-            )
-            _set_metric(cfg, "return_clicks", back_clicks)
-            if back_clicks == 2 and double_click_on_first_attempt:
-                _set_metric(cfg, "return_reason", "after_send_double_back")
-            elif back_clicks == 1:
-                _set_metric(cfg, "return_reason", "single_back_success")
-            else:
-                _set_metric(cfg, "return_reason", "retry_back_success")
-            return back_clicks
+        for confirmation_attempt in range(3):
+            time.sleep(0.4)
+            image = capture_after_popups(robot, cfg, label="after_go_back", reporter=reporter)
+            if _matches_chat_list_screen(image, cfg, reporter=reporter):
+                _report(
+                    reporter,
+                    "back_click",
+                    "返回聊天列表成功",
+                    log_label=f"返回聊天列表成功：返回点击 {back_clicks} 次",
+                )
+                _set_metric(cfg, "return_clicks", back_clicks)
+                if back_clicks == 2 and double_click_on_first_attempt:
+                    _set_metric(cfg, "return_reason", "after_send_double_back")
+                elif back_clicks == 1:
+                    _set_metric(cfg, "return_reason", "single_back_success")
+                else:
+                    _set_metric(cfg, "return_reason", "retry_back_success")
+                return back_clicks
+            if confirmation_attempt < 2:
+                continue
         _set_metric(cfg, "return_reason", "cached_back_recheck_failed" if cached is not None else "template_back_recheck_failed")
         _report(
             reporter,

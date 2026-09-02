@@ -51,3 +51,32 @@ def test_xinyu_send_return_double_click_requires_microphone(monkeypatch, microph
 
     assert clicks == expected_clicks
     assert robot.clicks == [pytest.approx((0.2, 0.1))] * expected_clicks
+
+
+def test_xinyu_return_waits_for_delayed_list_transition(monkeypatch):
+    config = deepcopy(DEFAULT_CONFIG)
+    robot = FakeRobot()
+    images = iter(["chat", "chat", "chat", "list"])
+
+    monkeypatch.setattr(steps, "ensure_send_cleared", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(
+        steps,
+        "capture_after_popups",
+        lambda *_args, **_kwargs: next(images),
+    )
+    monkeypatch.setattr(
+        steps,
+        "_matches_chat_list_screen",
+        lambda image, *_args, **_kwargs: image == "list",
+    )
+    monkeypatch.setattr(
+        steps,
+        "_template_center",
+        lambda _image, _config, key, **_kwargs: (0.2, 0.1) if key == steps.BACK_BUTTON else None,
+    )
+    monkeypatch.setattr(steps.time, "sleep", lambda _seconds: None)
+
+    clicks = steps.go_back(robot, config)
+
+    assert clicks == 1
+    assert robot.clicks == [pytest.approx((0.2, 0.1))]
