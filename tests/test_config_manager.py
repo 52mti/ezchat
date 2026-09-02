@@ -436,6 +436,26 @@ def test_config_manager_keeps_template_match_thresholds_in_app_scope(tmp_path):
     assert merged["template_match_thresholds"]["screen.chat_window"] == 0.7
 
 
+def test_config_manager_keeps_xinyu_photo_settings_in_app_scope(tmp_path):
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+
+    manager.update_app_config(
+        "xinyu",
+        {
+            "online_photo_send_count": 0,
+            "photo_sent_cooldown_seconds": 3600,
+        },
+    )
+
+    app_saved = _read_app_config(tmp_path, "xinyu")
+    merged = manager.get_app_config("1.1.1.1", "xinyu", XINYU_DEFAULT_CONFIG)
+
+    assert app_saved["online_photo_send_count"] == 0
+    assert app_saved["photo_sent_cooldown_seconds"] == 3600
+    assert merged["online_photo_send_count"] == 0
+    assert merged["photo_sent_cooldown_seconds"] == 3600
+
+
 def test_xinyu_partial_app_config_keeps_default_template_regions(tmp_path):
     app_dir = tmp_path / "apps" / "xinyu"
     app_dir.mkdir(parents=True)
