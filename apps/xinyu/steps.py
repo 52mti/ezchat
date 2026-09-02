@@ -2400,7 +2400,12 @@ def read_message(
         if _update_dynamic_chat_area(cfg, llm_payload, compact_result):
             _report(reporter, "dialogue_chat_area", "已根据双方消息坐标更新聊天范围")
         message, has_content = _extract_message_from_dialogue_ocr(compact_result, cfg, target)
-        if has_content:
+        needs_quick_reply_calibration = (
+            isinstance(llm_payload, dict)
+            and bool(_quick_reply_texts(llm_payload))
+            and _cached_quick_reply_bottom(cfg) is None
+        )
+        if has_content and not needs_quick_reply_calibration:
             if llm_payload is not None:
                 combined = _merge_dialogue_sources(llm_payload, compact_result)
                 combined_message, combined_has_content = _extract_message_from_dialogue_llm(combined, cfg, target)
@@ -2451,12 +2456,74 @@ def _dialogue_message_region(image: Any, config: dict[str, Any]) -> list[float] 
     top = float(chat_region[1])
     width = float(chat_region[2])
     configured_bottom = top + float(chat_region[3])
-    bottom = min(configured_bottom, float(input_box[1]) - margin)
+    quick_reply_bottom = _cached_quick_reply_bottom(config)
+    input_bottom = float(input_box[1]) - margin
+    bottom = min(configured_bottom, input_bottom)
+    if quick_reply_bottom is not None:
+        bottom = min(bottom, quick_reply_bottom)
     if bottom - top < float(config.get("dialogue_compact_min_height", 0.2) or 0.2):
         return None
     region = [left, top, width, bottom - top]
     _cache_set(config, "ocr_regions", "dialogue_message", region)
     return region
+
+
+def _cached_quick_reply_bottom(config: dict[str, Any]) -> float | None:
+    value = _cache_get(config, "ocr_regions", "dialogue_quick_reply_bottom")
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if 0.0 < value < 1.0 else None
+
+
+def _quick_reply_texts(payload: dict[str, Any]) -> list[str]:
+    values = payload.get("quick_replies", [])
+    if not isinstance(values, list):
+        return []
+    texts: list[str] = []
+    for value in values:
+        content = value.get("content", "") if isinstance(value, dict) else value
+        text = re.sub(r"\s+", "", str(content or "").strip())
+        if text:
+            texts.append(text)
+    return texts
+
+
+def _quick_reply_ocr_top(
+    payload: dict[str, Any],
+    ocr_items: list[Any],
+) -> float | None:
+    quick_replies = _quick_reply_texts(payload)
+    if not quick_replies or not isinstance(ocr_items, list):
+        return None
+    matches: list[tuple[float, float]] = []
+    for item in ocr_items:
+        if not isinstance(item, dict):
+            continue
+        text = re.sub(r"\s+", "", str(item.get("text", "") or "").strip())
+        bounds = item.get("bounds")
+        if not text or not isinstance(bounds, (list, tuple)) or len(bounds) < 4:
+            continue
+        try:
+            top = float(bounds[1])
+            height = float(bounds[3])
+        except (TypeError, ValueError):
+            continue
+        if not 0.0 <= top < 1.0 or height <= 0.0:
+            continue
+        for quick_text in quick_replies:
+            score = difflib.SequenceMatcher(None, quick_text, text).ratio()
+            if quick_text in text or text in quick_text:
+                score = max(score, 0.85)
+            if score >= 0.72:
+                matches.append((top, score))
+                break
+    if not matches:
+        return None
+    # If the same wording appears in a message and a shortcut, the shortcut
+    # is the lower OCR match near the input toolbar.
+    return max(top for top, _score in matches)
 
 
 def _update_dynamic_chat_area(
@@ -2518,16 +2585,34 @@ def _update_dynamic_chat_area(
         else:
             right = left + width
             sender2_right = right if sender2_right is None else max(sender2_right, right)
+    quick_reply_top = _quick_reply_ocr_top(llm_payload, items)
+    quick_reply_bottom = None if quick_reply_top is None else max(0.0, quick_reply_top - 0.01)
+    if quick_reply_bottom is not None:
+        _cache_set(config, "ocr_regions", "dialogue_quick_reply_bottom", round(quick_reply_bottom, 3))
+
     margin_left = float(config.get("dialogue_sender1_left_margin", 0.05) or 0.05)
     margin_right = float(config.get("dialogue_sender2_right_margin", 0.05) or 0.05)
     left = max(float(base[0]), sender1_left - margin_left) if sender1_left is not None else float(current[0])
     right = min(float(base[0]) + float(base[2]), sender2_right + margin_right) if sender2_right is not None else float(current[0]) + float(current[2])
     right = max(left + 0.1, right)
-    updated = [round(max(0.0, left), 3), float(current[1]), round(min(1.0, right - left), 3), float(current[3])]
+    current_bottom = float(current[1]) + float(current[3])
+    bottom = min(float(base[1]) + float(base[3]), current_bottom)
+    if quick_reply_bottom is not None:
+        bottom = min(bottom, quick_reply_bottom)
+    updated = [
+        round(max(0.0, left), 3),
+        float(current[1]),
+        round(min(1.0, right - left), 3),
+        round(max(0.0, bottom - float(current[1])), 3),
+    ]
     if updated == list(_cache_get(config, "ocr_regions", "chat_area_dynamic") or []):
         return False
     _cache_set(config, "ocr_regions", "chat_area_dynamic", updated)
-    _set_metric(config, "dialogue_chat_area_source", "vision_sender_bounds")
+    _set_metric(
+        config,
+        "dialogue_chat_area_source",
+        "vision_sender_bounds_and_quick_replies" if quick_reply_bottom is not None else "vision_sender_bounds",
+    )
     _set_metric(config, "dialogue_chat_area", updated)
     return True
 
