@@ -711,11 +711,17 @@ def _list_candidate_score(index: int, row: dict[str, Any]) -> tuple[int, int, di
     return favorability_value, -index, row
 
 
-def _select_list_target_from_rows(rows: Any, *, require_unread: bool = False) -> dict[str, Any] | None:
+def _select_list_target_from_rows(
+    rows: Any,
+    *,
+    require_unread: bool = False,
+    prefer_detected_unread: bool = True,
+) -> dict[str, Any] | None:
     if not isinstance(rows, list):
         return None
     unread_candidates: list[tuple[int, int, dict[str, Any]]] = []
     content_candidates: list[tuple[int, int, dict[str, Any]]] = []
+    available_candidates: list[tuple[int, int, dict[str, Any]]] = []
     for index, row in enumerate(rows):
         if not isinstance(row, dict) or _is_empty_list_row(row):
             continue
@@ -729,10 +735,16 @@ def _select_list_target_from_rows(rows: Any, *, require_unread: bool = False) ->
         candidate = _list_candidate_score(index, row)
         if unread_count >= 1:
             unread_candidates.append(candidate)
-            continue
         if _clean_list_text(row.get("content")):
             content_candidates.append(candidate)
-    candidates = unread_candidates if require_unread else (unread_candidates or content_candidates)
+        if unread_count >= 1 or _clean_list_text(row.get("content")):
+            available_candidates.append(candidate)
+    if require_unread:
+        candidates = unread_candidates
+    elif prefer_detected_unread:
+        candidates = unread_candidates or content_candidates
+    else:
+        candidates = available_candidates
     if not candidates:
         return None
     _favorability, _position, selected_row = max(candidates, key=lambda item: (item[0], item[1]))
@@ -753,10 +765,15 @@ def _select_list_target_from_ocr_result(
     ocr_result: dict[str, Any],
     *,
     require_unread: bool = False,
+    prefer_detected_unread: bool = True,
 ) -> dict[str, Any] | None:
     result = ocr_result.get("result", {}) if isinstance(ocr_result, dict) else {}
     rows = result.get("message_list", []) if isinstance(result, dict) else []
-    return _select_list_target_from_rows(rows, require_unread=require_unread)
+    return _select_list_target_from_rows(
+        rows,
+        require_unread=require_unread,
+        prefer_detected_unread=prefer_detected_unread,
+    )
 
 
 def _photo_contact_key(value: Any) -> str:
@@ -1916,7 +1933,10 @@ def find_unread_target(
     if not isinstance(checked_ocr_result, dict) or checked_ocr_result.get("_xinyu_unread_tab_has_red") is not True:
         _report(reporter, "list_target_skipped", "未回复入口不是红色，不读取列表目标")
         return None
-    target = _select_list_target_from_ocr_result(checked_ocr_result)
+    target = _select_list_target_from_ocr_result(
+        checked_ocr_result,
+        prefer_detected_unread=False,
+    )
     if target is not None:
         return target
     return None

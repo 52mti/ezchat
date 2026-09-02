@@ -862,6 +862,25 @@ def test_xinyu_list_selects_highest_favorability_target(monkeypatch, tmp_path):
     assert target["name"] == "乙"
 
 
+def test_xinyu_confirmed_unread_tab_does_not_skip_row_with_missing_unread_badge():
+    result = {
+        "result": {
+            "message_list": [
+                {"name": "青山如黛", "favorability": 38, "unread_count": None, "content": "没有", "bounds": [0.177, 0.297, 0.973, 0.369]},
+                {"name": "清风徐来", "favorability": None, "unread_count": 1, "content": "你好", "bounds": [0.177, 0.395, 0.97, 0.469]},
+            ]
+        }
+    }
+
+    target = steps._select_list_target_from_ocr_result(
+        result,
+        prefer_detected_unread=False,
+    )
+
+    assert target is not None
+    assert target["name"] == "青山如黛"
+
+
 def test_xinyu_list_uses_compact_region_after_unread_tab_click(monkeypatch, tmp_path):
     config = _config(tmp_path)
     robot = FakeRobot(["after_unread"])
