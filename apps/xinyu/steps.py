@@ -1604,10 +1604,8 @@ def _main_nav_ocr_result(
             if any(keyword in item_name for keyword in keywords):
                 names.add(nav_name)
                 break
-    # Any known item in the bottom navigation proves this is an app main tab,
-    # not a chat detail screen.  Finding the message coordinate is a separate
-    # concern handled by _try_open_message_list.
     if not names:
+        _report(reporter, "startup_recover", "主界面底部导航 OCR 未命中")
         return None
     _report(
         reporter,
@@ -1627,6 +1625,7 @@ def _screen_detection_rule_ocr_result(
     rules = config.get("screen_detection_rules")
     if not isinstance(rules, list):
         return None
+    attempted_rules: list[str] = []
     for rule in rules:
         if not isinstance(rule, dict) or not str(rule.get("screen", "")).startswith("xinyu-"):
             continue
@@ -1637,6 +1636,7 @@ def _screen_detection_rule_ocr_result(
         text = _clean_list_text(condition.get("text"))
         if region is None or not text:
             continue
+        attempted_rules.append(str(rule.get("screen", "")))
         ocr_result = _run_ocr_mode(image, config, "list", region=region)
         min_confidence = float(condition.get("min_confidence", 0.0) or 0.0)
         recognized_texts: list[str] = []
@@ -1667,6 +1667,13 @@ def _screen_detection_rule_ocr_result(
                 log_label=f"OCR 识别到心遇主界面特征：{rule.get('screen')}，关键词={text}",
             )
             return ocr_result
+    if attempted_rules:
+        _report(
+            reporter,
+            "startup_recover",
+            "主界面范围规则 OCR 未命中",
+            log_label=f"主界面范围规则 OCR 未命中：{'、'.join(attempted_rules)}",
+        )
     return None
 
 
@@ -1699,8 +1706,6 @@ def ensure_list_screen(
             _report(reporter, "startup_recover", f"已确认聊天列表（第 {attempt} 轮）")
             return current_image
 
-        # 聊天页也可能被 OCR 识别到底部“消息”。先用更强的麦克风特征
-        # 判断当前是否仍在聊天页，避免 AI 异常后误点击底部消息入口。
         if _template_center(current_image, cfg, MICROPHONE_BUTTON, group="buttons") is not None:
             last_state = CHAT_WINDOW_SCREEN
             _report(reporter, "startup_recover", "检测到麦克风按钮，连续点击返回两次回到聊天列表")
@@ -1715,9 +1720,6 @@ def ensure_list_screen(
                 )
             continue
 
-        # The app home has a stable five-item bottom navigation.  Check this
-        # before the chat template because the chat template can overlap the
-        # home screen in camera-captured images.
         main_nav_result = _main_nav_ocr_result(current_image, cfg, reporter=reporter)
         if main_nav_result is None:
             main_nav_result = _screen_detection_rule_ocr_result(current_image, cfg, reporter=reporter)
