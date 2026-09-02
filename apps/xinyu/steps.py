@@ -2647,6 +2647,7 @@ def _extract_message_from_dialogue_ocr(
     dialogue_mode = config.get("ocr_modes", {}).get("dialogue", {})
     dialogue_rules = dialogue_mode.get("rules", {}) if isinstance(dialogue_mode, dict) else {}
     target_sender = str(dialogue_rules.get("target_sender", "sender1"))
+    excluded_keywords = _dialogue_excluded_keywords(dialogue_rules)
     trailing_target_messages: list[str] = []
     for item in reversed(dialogues if isinstance(dialogues, list) else []):
         if not isinstance(item, dict):
@@ -2654,6 +2655,8 @@ def _extract_message_from_dialogue_ocr(
         sender = str(item.get("sender", ""))
         content = str(item.get("content", "")).strip()
         if not content:
+            continue
+        if _is_dialogue_system_content(content, excluded_keywords):
             continue
         if sender == target_sender:
             trailing_target_messages.append(content)
@@ -2670,7 +2673,7 @@ def _extract_message_from_dialogue_ocr(
             continue
         sender = str(item.get("sender", ""))
         dialogue_content = str(item.get("content", "")).strip()
-        if sender in continuity and dialogue_content:
+        if sender in continuity and dialogue_content and not _is_dialogue_system_content(dialogue_content, excluded_keywords):
             continuity[sender].append(dialogue_content)
     return {
         "user": contact,
@@ -2682,6 +2685,30 @@ def _extract_message_from_dialogue_ocr(
         "favorability": str(target.get("favorability", "")) if isinstance(target, dict) else "",
         "continuity": {sender: values[-3:] for sender, values in continuity.items()},
     }, bool(content)
+
+
+def _dialogue_excluded_keywords(dialogue_rules: dict[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+    for key in ("ocr_result_excluded_keywords", "line_excluded_keywords", "line_and_below_keywords"):
+        raw_values = dialogue_rules.get(key, [])
+        if isinstance(raw_values, str):
+            values.extend(raw_values.splitlines())
+        elif isinstance(raw_values, (list, tuple)):
+            values.extend(str(value) for value in raw_values)
+    return tuple(value.strip() for value in values if value and value.strip())
+
+
+def _is_dialogue_system_content(content: str, excluded_keywords: tuple[str, ...]) -> bool:
+    normalized = re.sub(r"\s+", "", str(content or "")).strip()
+    if not normalized:
+        return False
+    if any(keyword in normalized for keyword in excluded_keywords):
+        return True
+    return (
+        looks_like_debug_text(normalized)
+        or looks_like_reward_text(normalized)
+        or looks_like_time_text(normalized)
+    )
 
 
 def _dialogue_engine(config: dict[str, Any]) -> str:
