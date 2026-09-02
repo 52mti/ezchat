@@ -8,7 +8,7 @@
     "min_confidence": 0.3,
     "min_box_height_ratio": 0.018,
     "line_gap": 24,
-    "main_top_ratio": 0.12,
+    "main_top_ratio": 0.0,
     "main_top_from_top_nav": true,
     "main_bottom_ratio": 0.92,
     "max_unread_count": 99,
@@ -80,3 +80,4 @@
     ]
   }
 }
+
