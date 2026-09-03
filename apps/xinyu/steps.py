@@ -83,6 +83,7 @@ NEW_GREETING_BUTTON = "button.new_greeting"
 PHOTO_BUTTON = "button.photo"
 COMPLETE_BUTTON = "button.complete"
 BACK_BUTTON_2 = "button.back.secondary"
+XINYU_APP_ENTRY_BUTTON = "button.custom.主界面心遇按钮"
 UNREAD_TAB_KEYWORDS = ("\u672a\u56de\u590d",)
 TTS_POST_DELAY_SECONDS = 3.0
 POPUP_MAX_X = 0.9
@@ -114,6 +115,7 @@ BUTTON_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
     PHOTO_BUTTON: ("btn_照片按钮.jpg", "btn_相册按钮.jpg", "btn_photo.jpg"),
     COMPLETE_BUTTON: ("btn_完成按钮.jpg", "btn_complete.jpg"),
     BACK_BUTTON_2: ("btn_返回按钮_2.jpg",),
+    XINYU_APP_ENTRY_BUTTON: ("btn_主界面心遇按钮.jpg",),
 }
 
 
@@ -1695,6 +1697,23 @@ def ensure_list_screen(
             reporter=reporter,
         )
         _raise_if_black_screen(current_image, cfg)
+
+        # Android home is outside the app. Re-enter Xinyu before any popup or
+        # chat-template detection; the chat template is known to false-match
+        # controls on the Android home screen.
+        app_entry = _template_center(current_image, cfg, XINYU_APP_ENTRY_BUTTON, group="buttons")
+        if app_entry is not None:
+            last_state = "android_home"
+            _report(
+                reporter,
+                "startup_recover",
+                "识别到主界面心遇按钮，点击进入心遇",
+                log_label=f"点击主界面心遇按钮：{format_point(*app_entry)}",
+            )
+            click_image_point(robot, *app_entry)
+            time.sleep(0.8)
+            current_image = _capture_image(robot, cfg, pre_move=True, label="after_xinyu_app_entry")
+            continue
 
         # A list confirmation is stronger than a chat-window template match: the
         # latter may falsely match a shared bottom control on the list screen.

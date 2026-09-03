@@ -384,6 +384,29 @@ def test_xinyu_ensure_list_screen_accepts_title_ocr_when_template_misses(monkeyp
     assert robot.clicks == []
 
 
+def test_xinyu_ensure_list_screen_enters_app_from_android_home(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    robot = FakeRobot(["android_home", "list"])
+
+    monkeypatch.setattr(
+        steps,
+        "_template_center",
+        lambda image, _config, key, group="buttons": (
+            (0.5, 0.4)
+            if image == "android_home" and key == steps.XINYU_APP_ENTRY_BUTTON
+            else None
+        ),
+    )
+    monkeypatch.setattr(steps, "_matches_chat_list_screen", lambda image, *_args, **_kwargs: image == "list")
+    monkeypatch.setattr(steps, "_raise_if_black_screen", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(steps.time, "sleep", lambda _seconds: None)
+
+    image = steps.ensure_list_screen(robot, config)
+
+    assert image == "list"
+    assert robot.clicks == [pytest.approx((0.5, 0.4))]
+
+
 def test_xinyu_ensure_list_screen_reports_back_clicked_but_not_returned(monkeypatch, tmp_path):
     config = _config(tmp_path)
     robot = FakeRobot(["chat", "still_chat"])
