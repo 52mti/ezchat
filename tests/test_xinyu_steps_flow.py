@@ -693,9 +693,9 @@ def test_xinyu_popup_dismiss_ignores_after_two_clicks(monkeypatch, tmp_path):
     assert robot.clicks == [pytest.approx((0.46, 0.23)), pytest.approx((0.46, 0.23))]
 
 
-def test_xinyu_popup_detection_skips_when_chat_window(monkeypatch, tmp_path):
+def test_xinyu_popup_detection_clicks_popup_when_chat_template_also_matches(monkeypatch, tmp_path):
     config = _config(tmp_path)
-    robot = FakeRobot(["chat"])
+    robot = FakeRobot(["chat_popup", "chat"])
     checked_templates: list[str] = []
 
     def fake_match(image, template, threshold=0.85):
@@ -703,7 +703,7 @@ def test_xinyu_popup_detection_skips_when_chat_window(monkeypatch, tmp_path):
         checked_templates.append(template_name)
         if image == "chat" and template_name == "screen_聊天界面.jpg":
             return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
-        if image == "chat" and template_name == "popup_custom_1.jpg":
+        if image == "chat_popup" and template_name == "popup_custom_1.jpg":
             return {"x": 0.1, "y": 0.2, "w": 0.4, "h": 0.3, "score": 0.99}
         return None
 
@@ -712,9 +712,8 @@ def test_xinyu_popup_detection_skips_when_chat_window(monkeypatch, tmp_path):
     image = steps.capture_after_popups(robot, config)
 
     assert image == "chat"
-    assert robot.clicks == []
-    assert "screen_聊天界面.jpg" in checked_templates
-    assert "popup_custom_1.jpg" not in checked_templates
+    assert robot.clicks == [pytest.approx((0.46, 0.23))]
+    assert "popup_custom_1.jpg" in checked_templates
 
 
 def test_xinyu_popup_detection_stops_when_after_popup_image_is_chat(monkeypatch, tmp_path):
@@ -729,8 +728,6 @@ def test_xinyu_popup_detection_stops_when_after_popup_image_is_chat(monkeypatch,
             return {"x": 0.1, "y": 0.2, "w": 0.4, "h": 0.3, "score": 0.99}
         if image == "chat" and template_name == "screen_聊天界面.jpg":
             return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
-        if image == "chat" and template_name == "popup_custom_1.jpg":
-            return {"x": 0.1, "y": 0.2, "w": 0.4, "h": 0.3, "score": 0.99}
         return None
 
     monkeypatch.setattr(steps, "match", fake_match)
@@ -739,8 +736,7 @@ def test_xinyu_popup_detection_stops_when_after_popup_image_is_chat(monkeypatch,
 
     assert image == "chat"
     assert robot.clicks == [pytest.approx((0.46, 0.23))]
-    assert ("chat", "screen_聊天界面.jpg") in checked_templates
-    assert ("chat", "popup_custom_1.jpg") not in checked_templates
+    assert ("chat", "popup_custom_1.jpg") in checked_templates
 
 
 def test_xinyu_unknown_screen_does_not_click_default_back(monkeypatch, tmp_path):

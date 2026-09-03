@@ -1388,8 +1388,6 @@ def dismiss_popups(
     current_image = image if image is not None else _capture_image(
         robot, config, pre_move=True, label="popup_check"
     )
-    if _is_chat_window_image(current_image, config):
-        return False
     close_point = _popup_close_point(current_image, config)
     if close_point is None:
         return False
@@ -1462,8 +1460,6 @@ def capture_after_popups(
     if skip_popup_detection:
         return image
     for _ in range(max_dismiss):
-        if _is_chat_window_image(image, config):
-            break
         close_point = _popup_close_point(image, config)
         if close_point is None:
             break
