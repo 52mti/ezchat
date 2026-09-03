@@ -37,6 +37,12 @@ DEFAULT_CONFIG = {
     "template_match_channels": ["gray_norm", "gray", "edge"],
     "template_match_channels_by_key": {
         "screen.chat_window": ["bgr"],
+        # The Android-home app icon is small and visually distinctive by color;
+        # grayscale/edge matching produces false positives on unrelated icons.
+        "button.custom.主界面心遇按钮": ["bgr"],
+    },
+    "template_match_scales_by_key": {
+        "button.custom.主界面心遇按钮": [1.0],
     },
     "template_match_regions": {
         "button.back": [0.0, 0.911, 0.993, 0.089],
@@ -53,6 +59,7 @@ DEFAULT_CONFIG = {
     },
     "template_match_thresholds": {
         "screen.chat_window": 0.7,
+        "button.custom.主界面心遇按钮": 0.88,
     },
     **DEFAULT_RUNTIME_CONFIG,
     "idle_poll_interval_seconds": 5,

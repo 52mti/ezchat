@@ -139,6 +139,14 @@
   "template_match_channels_by_key": {
     "screen.chat_window": [
       "bgr"
+    ],
+    "button.custom.主界面心遇按钮": [
+      "bgr"
+    ]
+  },
+  "template_match_scales_by_key": {
+    "button.custom.主界面心遇按钮": [
+      1.0
     ]
   },
   "template_match_regions": {
@@ -270,7 +278,8 @@
     ]
   },
   "template_match_thresholds": {
-    "screen.chat_window": 0.7
+    "screen.chat_window": 0.7,
+    "button.custom.主界面心遇按钮": 0.88
   },
   "ocr_modes": {
     "points": {

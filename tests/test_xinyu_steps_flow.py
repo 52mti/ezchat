@@ -407,6 +407,15 @@ def test_xinyu_ensure_list_screen_enters_app_from_android_home(monkeypatch, tmp_
     assert robot.clicks == [pytest.approx((0.5, 0.4))]
 
 
+def test_xinyu_android_home_entry_uses_strict_match_settings():
+    from apps.xinyu.config import DEFAULT_CONFIG
+
+    key = "button.custom.主界面心遇按钮"
+    assert DEFAULT_CONFIG["template_match_thresholds"][key] == pytest.approx(0.88)
+    assert DEFAULT_CONFIG["template_match_channels_by_key"][key] == ["bgr"]
+    assert DEFAULT_CONFIG["template_match_scales_by_key"][key] == [1.0]
+
+
 def test_xinyu_ensure_list_screen_reports_back_clicked_but_not_returned(monkeypatch, tmp_path):
     config = _config(tmp_path)
     robot = FakeRobot(["chat", "still_chat"])
