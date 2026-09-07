@@ -56,6 +56,8 @@ MICROPHONE_BUTTON = "button.microphone"
 VOICE_INPUT_BUTTON = MICROPHONE_BUTTON
 SEND_BUTTON = "button.send"
 NEW_GREETING_BUTTON = "button.new_greeting"
+PHOTO_BUTTON = "button.photo"
+COMPLETE_BUTTON = "button.complete"
 BACK_BUTTON = "button.back"
 CUSTOM_BACK_BUTTON = "button.back.custom"
 CUSTOM_POPUP = "popup.custom"
@@ -148,6 +150,22 @@ FIXED_TEMPLATE_RULES: tuple[TemplateRule, ...] = (
         filename="btn_新招呼按钮.jpg",
         phase="action",
         description="用于定位新招呼按钮。",
+    ),
+    TemplateRule(
+        key=PHOTO_BUTTON,
+        label="照片按钮",
+        group="buttons",
+        filename="btn_照片按钮.jpg",
+        phase="action",
+        description="用于打开相册并选择照片。",
+    ),
+    TemplateRule(
+        key=COMPLETE_BUTTON,
+        label="完成按钮",
+        group="buttons",
+        filename="btn_完成按钮.jpg",
+        phase="action",
+        description="用于确认照片选择并返回发送流程。",
     ),
     TemplateRule(
         key=BACK_BUTTON,

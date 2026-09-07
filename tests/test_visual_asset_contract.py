@@ -49,10 +49,14 @@ def test_template_names_align_main_program_and_helper_tool_contract(tmp_path):
     assert targets[visual_assets.MICROPHONE_BUTTON] == "btn_麦克风按钮.jpg"
     assert targets[visual_assets.SEND_BUTTON] == "btn_发送按钮.jpg"
     assert targets[visual_assets.NEW_GREETING_BUTTON] == "btn_新招呼按钮.jpg"
+    assert targets[visual_assets.PHOTO_BUTTON] == "btn_照片按钮.jpg"
+    assert targets[visual_assets.COMPLETE_BUTTON] == "btn_完成按钮.jpg"
     assert targets[visual_assets.BACK_BUTTON] == "btn_back.jpg"
     assert targets[visual_assets.CUSTOM_BACK_BUTTON] == visual_assets.next_back_button_template_path(buttons_dir).name
     assert targets[visual_assets.CUSTOM_POPUP] == "popup_custom_1.jpg"
     assert tool_filenames[visual_assets.SEND_BUTTON] == targets[visual_assets.SEND_BUTTON]
+    assert tool_filenames[visual_assets.PHOTO_BUTTON] == targets[visual_assets.PHOTO_BUTTON]
+    assert tool_filenames[visual_assets.COMPLETE_BUTTON] == targets[visual_assets.COMPLETE_BUTTON]
     assert visual_assets.BACK_BUTTON not in tool_filenames
     assert popup_rule["key"] == visual_assets.CUSTOM_POPUP
     assert popup_rule["multiple"] is True
@@ -269,6 +273,17 @@ def test_template_variant_paths_load_incremental_templates(tmp_path):
     paths = visual_assets.template_variant_paths(buttons_dir, "btn_发送按钮.jpg")
 
     assert [path.name for path in paths] == ["btn_发送按钮.jpg", "btn_发送按钮_2.jpg", "btn_发送按钮_10.jpg"]
+
+
+def test_photo_button_variant_is_discoverable_without_base_template(tmp_path):
+    buttons_dir = tmp_path / "buttons"
+    buttons_dir.mkdir()
+    variant = buttons_dir / "btn_照片按钮_2.jpg"
+    variant.write_bytes(b"template")
+
+    paths = visual_assets.template_variant_paths(buttons_dir, "btn_照片按钮.jpg")
+
+    assert paths == [variant]
 
 
 def test_runtime_loads_multiple_back_button_templates(tmp_path):
