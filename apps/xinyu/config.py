@@ -58,7 +58,7 @@ DEFAULT_CONFIG = {
         "screen.call_window": [0.004, 0.722, 0.415, 0.278],
     },
     "template_match_thresholds": {
-        "screen.chat_window": 0.7,
+        "screen.chat_window": 0.8,
         "button.custom.主界面心遇按钮": 0.88,
     },
     **DEFAULT_RUNTIME_CONFIG,
