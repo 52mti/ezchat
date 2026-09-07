@@ -278,7 +278,26 @@
     ]
   },
   "template_match_thresholds": {
+    "button.back": 0.8,
+    "button.input_box": 0.8,
+    "button.microphone": 0.8,
+    "button.new_greeting": 0.8,
+    "button.send": 0.8,
+    "screen.chat_list": 0.8,
     "screen.chat_window": 0.8,
+    "screen.my": 0.8,
+    "popup.custom.popup_custom_4": 0.8,
+    "popup.custom.popup_custom_1": 0.8,
+    "popup.custom.popup_custom_2": 0.8,
+    "popup.custom.popup_custom_3": 0.8,
+    "screen.call_window": 0.8,
+    "button.custom.相册": 0.8,
+    "button.custom.完成按钮": 0.8,
+    "button.photo": 0.8,
+    "button.complete": 0.8,
+    "popup.custom.popup_custom_5": 0.8,
+    "button.custom.照片按钮": 0.8,
+    "popup.custom.popup_custom__customer_1": 0.8,
     "button.custom.主界面心遇按钮": 0.88
   },
   "ocr_modes": {
