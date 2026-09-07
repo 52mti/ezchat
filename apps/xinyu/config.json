@@ -1,305 +1,4 @@
 {
-  "screen_detection_rules": [
-    {
-      "name": "判定xinyu-消息",
-      "screen": "xinyu-消息",
-      "match_region": [
-        0.0,
-        0.004651162790697674,
-        0.3294314381270903,
-        0.11317829457364341
-      ],
-      "match_region_format": "[x, y, w, h]，相对于完整竖屏截图的 0~1 比例",
-      "match_region_description": "主程序必须仅在此范围内执行该规则的 OCR 或模板匹配。",
-      "condition": {
-        "type": "ocr_raw",
-        "region": [
-          0.0,
-          0.004651162790697674,
-          0.3294314381270903,
-          0.11317829457364341
-        ],
-        "text": "消息通话",
-        "match_mode": "contains",
-        "min_confidence": 0.75,
-        "processing": "raw",
-        "recognition_profile": "list"
-      }
-    },
-    {
-      "name": "判定xinyu-我的",
-      "screen": "xinyu-我的",
-      "match_region": [
-        0.5,
-        0.6131782945736434,
-        0.46153846153846156,
-        0.24806201550387597
-      ],
-      "match_region_format": "[x, y, w, h]，相对于完整竖屏截图的 0~1 比例",
-      "match_region_description": "主程序必须仅在此范围内执行该规则的 OCR 或模板匹配。",
-      "condition": {
-        "type": "ocr_raw",
-        "region": [
-          0.5,
-          0.6131782945736434,
-          0.46153846153846156,
-          0.24806201550387597
-        ],
-        "text": "设置",
-        "match_mode": "contains",
-        "min_confidence": 0.75,
-        "processing": "raw",
-        "recognition_profile": "list"
-      }
-    },
-    {
-      "name": "判定xinyu-娱乐交友",
-      "screen": "xinyu-娱乐交友",
-      "match_region": [
-        0.0,
-        0.008527131782945736,
-        0.3862876254180602,
-        0.08682170542635659
-      ],
-      "match_region_format": "[x, y, w, h]，相对于完整竖屏截图的 0~1 比例",
-      "match_region_description": "主程序必须仅在此范围内执行该规则的 OCR 或模板匹配。",
-      "condition": {
-        "type": "ocr_raw",
-        "region": [
-          0.0,
-          0.008527131782945736,
-          0.3862876254180602,
-          0.08682170542635659
-        ],
-        "text": "娱乐交友",
-        "match_mode": "contains",
-        "min_confidence": 0.75,
-        "processing": "raw",
-        "recognition_profile": "list"
-      }
-    },
-    {
-      "name": "判定xinyu-动态",
-      "screen": "xinyu-动态",
-      "match_region": [
-        0.0,
-        0.021705426356589147,
-        0.4816053511705686,
-        0.1
-      ],
-      "match_region_format": "[x, y, w, h]，相对于完整竖屏截图的 0~1 比例",
-      "match_region_description": "主程序必须仅在此范围内执行该规则的 OCR 或模板匹配。",
-      "condition": {
-        "type": "ocr_raw",
-        "region": [
-          0.0,
-          0.021705426356589147,
-          0.4816053511705686,
-          0.1
-        ],
-        "text": "动态",
-        "match_mode": "contains",
-        "min_confidence": 0.75,
-        "processing": "raw",
-        "recognition_profile": "list"
-      }
-    },
-    {
-      "name": "判定xinyu-缘分",
-      "screen": "xinyu-缘分",
-      "match_region": [
-        0.010033444816053512,
-        0.15193798449612403,
-        0.42474916387959866,
-        0.14806201550387596
-      ],
-      "match_region_format": "[x, y, w, h]，相对于完整竖屏截图的 0~1 比例",
-      "match_region_description": "主程序必须仅在此范围内执行该规则的 OCR 或模板匹配。",
-      "condition": {
-        "type": "ocr_raw",
-        "region": [
-          0.010033444816053512,
-          0.15193798449612403,
-          0.42474916387959866,
-          0.14806201550387596
-        ],
-        "text": "推荐在线",
-        "match_mode": "contains",
-        "min_confidence": 0.75,
-        "processing": "raw",
-        "recognition_profile": "list"
-      }
-    }
-  ],
-  "templates": {
-    "buttons": "apps\\xinyu\\templates\\buttons",
-    "screens": "apps\\xinyu\\templates\\screens"
-  },
-  "match_threshold": 0.8,
-  "template_match_channels_by_key": {
-    "screen.chat_window": [
-      "bgr"
-    ],
-    "button.custom.主界面心遇按钮": [
-      "bgr"
-    ]
-  },
-  "template_match_scales_by_key": {
-    "button.custom.主界面心遇按钮": [
-      1.0
-    ]
-  },
-  "template_match_regions": {
-    "button.back": [
-      0.0,
-      0.911,
-      0.993,
-      0.089
-    ],
-    "button.input_box": [
-      0.624,
-      0.759,
-      0.36,
-      0.186
-    ],
-    "button.microphone": [
-      0.012,
-      0.555,
-      0.984,
-      0.168
-    ],
-    "button.new_greeting": [
-      0.011,
-      0.687,
-      0.98,
-      0.171
-    ],
-    "button.send": [
-      0.637,
-      0.312,
-      0.355,
-      0.628
-    ],
-    "screen.chat_list": [
-      0.0,
-      0.023,
-      0.489,
-      0.127
-    ],
-    "screen.chat_window": [
-      0.321,
-      0.849,
-      0.391,
-      0.147
-    ],
-    "screen.my": [
-      0.468,
-      0.686,
-      0.488,
-      0.187
-    ],
-    "popup.custom.popup_custom_4": [
-      0.084,
-      0.278,
-      0.786,
-      0.462
-    ],
-    "popup.custom.popup_custom_1": [
-      0.06,
-      0.292,
-      0.819,
-      0.406
-    ],
-    "popup.custom.popup_custom_2": [
-      0.92,
-      0.447,
-      0.027,
-      0.012
-    ],
-    "popup.custom.popup_custom_3": [
-      0.037,
-      0.282,
-      0.954,
-      0.443
-    ],
-    "screen.call_window": [
-      0.004,
-      0.722,
-      0.415,
-      0.278
-    ],
-    "button.custom.相册": [
-      0.012,
-      0.826,
-      0.228,
-      0.131
-    ],
-    "button.custom.完成按钮": [
-      0.734,
-      0.027,
-      0.254,
-      0.094
-    ],
-    "button.photo": [
-      0.0,
-      0.55,
-      0.65,
-      0.45
-    ],
-    "button.complete": [
-      0.0,
-      0.0,
-      1.0,
-      0.35
-    ],
-    "popup.custom.popup_custom_5": [
-      0.92,
-      0.447,
-      0.027,
-      0.012
-    ],
-    "button.custom.照片按钮": [
-      0.06,
-      0.89,
-      0.063,
-      0.031
-    ],
-    "popup.custom.popup_custom__customer_1": [
-      0.304,
-      0.696,
-      0.346,
-      0.136
-    ],
-    "button.custom.主界面心遇按钮": [
-      0.065,
-      0.062,
-      0.893,
-      0.805
-    ]
-  },
-  "template_match_thresholds": {
-    "button.back": 0.8,
-    "button.input_box": 0.8,
-    "button.microphone": 0.8,
-    "button.new_greeting": 0.8,
-    "button.send": 0.8,
-    "screen.chat_list": 0.8,
-    "screen.chat_window": 0.8,
-    "screen.my": 0.8,
-    "popup.custom.popup_custom_4": 0.8,
-    "popup.custom.popup_custom_1": 0.8,
-    "popup.custom.popup_custom_2": 0.8,
-    "popup.custom.popup_custom_3": 0.8,
-    "screen.call_window": 0.8,
-    "button.custom.相册": 0.8,
-    "button.custom.完成按钮": 0.8,
-    "button.photo": 0.8,
-    "button.complete": 0.8,
-    "popup.custom.popup_custom_5": 0.8,
-    "button.custom.照片按钮": 0.8,
-    "popup.custom.popup_custom__customer_1": 0.8,
-    "button.custom.主界面心遇按钮": 0.88
-  },
   "ocr_modes": {
     "points": {
       "preprocess": {
@@ -320,6 +19,7 @@
       }
     }
   },
+  "match_threshold": 0.8,
   "ocr": {
     "lang": "ch",
     "runtime_enabled": true,
@@ -345,5 +45,114 @@
       ]
     }
   },
-  "popup_match_threshold": 0.8
+  "templates": {
+    "buttons": "apps\\xinyu\\templates\\buttons",
+    "screens": "apps\\xinyu\\templates\\screens"
+  },
+  "popup_match_threshold": 0.8,
+  "template_match_regions": {
+    "button.back": [
+      0.0,
+      0.911,
+      0.993,
+      0.089
+    ],
+    "button.input_box": [
+      0.651,
+      0.737,
+      0.349,
+      0.188
+    ],
+    "button.microphone": [
+      0.012,
+      0.555,
+      0.984,
+      0.168
+    ],
+    "button.new_greeting": [
+      0.011,
+      0.687,
+      0.98,
+      0.171
+    ],
+    "button.photo": [
+      0.0,
+      0.55,
+      0.65,
+      0.45
+    ],
+    "button.complete": [
+      0.0,
+      0.0,
+      1.0,
+      0.35
+    ],
+    "button.send": [
+      0.63,
+      0.305,
+      0.367,
+      0.376
+    ],
+    "screen.chat_list": [
+      0.0,
+      0.023,
+      0.489,
+      0.127
+    ],
+    "screen.chat_window": [
+      0.007,
+      0.476,
+      0.261,
+      0.523
+    ],
+    "screen.my": [
+      0.468,
+      0.686,
+      0.488,
+      0.187
+    ],
+    "screen.call_window": [
+      0.004,
+      0.722,
+      0.415,
+      0.278
+    ],
+    "popup.custom.popup_custom_1": [
+      0.06,
+      0.292,
+      0.819,
+      0.406
+    ],
+    "popup.custom.popup_custom_2": [
+      0.037,
+      0.282,
+      0.954,
+      0.443
+    ],
+    "popup.custom.popup_custom_3": [
+      0.037,
+      0.282,
+      0.954,
+      0.443
+    ],
+    "popup.custom.popup_custom_4": [
+      0.084,
+      0.278,
+      0.786,
+      0.462
+    ],
+    "popup.custom.popup_custom_5": [
+      0.319,
+      0.422,
+      0.48,
+      0.285
+    ],
+    "popup.custom.popup_custom__customer_1": [
+      0.304,
+      0.696,
+      0.346,
+      0.136
+    ]
+  },
+  "template_match_thresholds": {}
 }

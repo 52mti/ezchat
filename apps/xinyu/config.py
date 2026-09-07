@@ -56,6 +56,12 @@ DEFAULT_CONFIG = {
         "screen.chat_window": [0.007, 0.476, 0.261, 0.523],
         "screen.my": [0.468, 0.686, 0.488, 0.187],
         "screen.call_window": [0.004, 0.722, 0.415, 0.278],
+        "popup.custom.popup_custom_1": [0.06, 0.292, 0.819, 0.406],
+        "popup.custom.popup_custom_2": [0.037, 0.282, 0.954, 0.443],
+        "popup.custom.popup_custom_3": [0.037, 0.282, 0.954, 0.443],
+        "popup.custom.popup_custom_4": [0.084, 0.278, 0.786, 0.462],
+        "popup.custom.popup_custom_5": [0.319, 0.422, 0.48, 0.285],
+        "popup.custom.popup_custom__customer_1": [0.304, 0.696, 0.346, 0.136],
     },
     "template_match_thresholds": {
     },
