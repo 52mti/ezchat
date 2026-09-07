@@ -135,7 +135,7 @@
     "buttons": "apps\\xinyu\\templates\\buttons",
     "screens": "apps\\xinyu\\templates\\screens"
   },
-  "match_threshold": 0.7,
+  "match_threshold": 0.8,
   "template_match_channels_by_key": {
     "screen.chat_window": [
       "bgr"
