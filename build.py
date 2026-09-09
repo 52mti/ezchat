@@ -900,6 +900,10 @@ def _archive_excludes(
         or _relative_matches_prefix(relative, "runtime/ocr_nvidia")
         or _relative_matches_prefix(relative, "runtime/ocr_directml")
         or _relative_matches_prefix(relative, "runtime/tts/piper")
+        # 顶层 tts/piper 是引擎安装源（约 119MB）。客户机由全量包安装到
+        # runtime/tts/piper 并被更新器保留；更新包携带它只增加下载体积，
+        # 运行时也永远优先使用 runtime/tts/piper 下的副本。
+        or _relative_matches_prefix(relative, "tts/piper")
         or _relative_matches_prefix(relative, "models/ocr")
     ):
         return True
@@ -1058,8 +1062,8 @@ def _copy_bundled_data(root: Path, package_root: Path) -> None:
         source = root / relative
         if source.is_file():
             _copy_item(source, package_root / relative)
-    # Piper 模型首次可随更新包下发；安装后由更新器保留在 runtime/tts/piper，
-    # 后续普通更新不再携带模型也不会将客户本地模型删除。
+    # Piper 引擎只随全量包安装到 runtime/tts/piper；更新器保留客户本地副本，
+    # 普通更新包不携带引擎（见 _archive_excludes），换语音模型需发全量包。
     piper_source = root / PIPER_SOURCE_ASSETS_DIR
     if piper_source.is_dir():
         _copy_item(piper_source, package_root / PIPER_RUNTIME_ASSETS_DIR)

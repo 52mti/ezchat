@@ -45,3 +45,56 @@ def test_tts_url_uses_device_route_local_ip(monkeypatch) -> None:
     monkeypatch.setattr(local_tts, "local_ip_for_device", lambda _ip: "192.168.1.96")
 
     assert local_tts.tts_url_for_device("192.168.1.210", port=9988) == "http://192.168.1.96:9988/tts"
+
+
+def test_expected_server_version_matches_tts_server() -> None:
+    from tts.server import SERVER_VERSION
+
+    assert local_tts.EXPECTED_SERVER_VERSION == SERVER_VERSION
+
+
+class _FakeProcess:
+    def __init__(self) -> None:
+        self.terminated = False
+
+    def poll(self) -> int | None:
+        return None if not self.terminated else 0
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+
+def _server_with_health(monkeypatch, tmp_path, payload: dict) -> tuple[local_tts.LocalTtsServer, list[str]]:
+    server = local_tts.LocalTtsServer(port=9999, root=tmp_path)
+    events: list[str] = []
+
+    monkeypatch.setattr(server, "_health_payload", lambda: payload)
+    monkeypatch.setattr(server, "_stop_port_orphans", lambda: events.append("swept"))
+    monkeypatch.setattr(
+        local_tts.subprocess,
+        "Popen",
+        lambda *args, **kwargs: events.append("spawned") or _FakeProcess(),
+    )
+    return server, events
+
+
+def test_start_reuses_ready_server_with_matching_version(monkeypatch, tmp_path) -> None:
+    _server, events = _server_with_health(
+        monkeypatch, tmp_path, {"status": "ok", "server_version": local_tts.EXPECTED_SERVER_VERSION}
+    )
+    _server.start()
+    assert events == []
+
+
+def test_start_replaces_ready_server_from_old_version(monkeypatch, tmp_path) -> None:
+    _server, events = _server_with_health(monkeypatch, tmp_path, {"status": "ok"})
+    _server.start()
+    assert events == ["swept", "spawned"]
+
+
+def test_stop_sweeps_port_orphans(monkeypatch) -> None:
+    server = local_tts.LocalTtsServer(port=9999)
+    swept: list[str] = []
+    monkeypatch.setattr(server, "_stop_port_orphans", lambda: swept.append("swept"))
+    server.stop()
+    assert swept == ["swept"]

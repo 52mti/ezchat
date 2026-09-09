@@ -389,3 +389,41 @@ def test_base_app_tracks_average_reply_seconds():
     status = app.get_status()
     assert status["reply_round_count"] == 2
     assert status["average_reply_seconds"] == 10.0
+
+
+def test_coordinate_cache_invalidates_across_app_versions():
+    import contextlib
+    import json
+
+    import services.coordinate_cache as coordinate_cache
+
+    runtime = {
+        "device_ip": "192.168.1.10",
+        "app_name": "xinyu",
+        "perspective_signature": "version-probe",
+    }
+    saved_cache = coordinate_cache._APP_VERSION_CACHE[:]
+    path_v1 = path_v2 = None
+    try:
+        coordinate_cache._APP_VERSION_CACHE[:] = ["test-1.0"]
+        coordinate_cache.persist_from_runtime(
+            {"_runtime": runtime, "_runtime_cache": {"template_points": {"back": [0.2, 0.3]}}}
+        )
+        path_v1 = coordinate_cache._path({"_runtime": runtime})
+
+        coordinate_cache._APP_VERSION_CACHE[:] = ["test-2.0"]
+        path_v2 = coordinate_cache._path({"_runtime": runtime})
+        assert path_v1 != path_v2 and path_v1.parent != path_v2.parent
+
+        restored = {"_runtime": runtime, "_runtime_cache": {}}
+        assert not coordinate_cache.load_into_runtime(restored)
+        assert restored["_runtime_cache"] == {}
+
+        payload = json.loads(path_v1.read_text(encoding="utf-8"))
+        assert payload["app_version"] == "test-1.0"
+    finally:
+        coordinate_cache._APP_VERSION_CACHE[:] = saved_cache
+        for path in (path_v1, path_v2):
+            if path is not None:
+                with contextlib.suppress(OSError):
+                    path.unlink(missing_ok=True)

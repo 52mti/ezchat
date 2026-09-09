@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import os
 import socket
@@ -16,6 +17,8 @@ import requests
 DEFAULT_TTS_PORT = 9999
 DEFAULT_DEVICE_BACKEND_PASSWORD = "admin"
 DEFAULT_DEVICE_BACKEND_TIMEOUT_SECONDS = 30.0
+# 必须与 tts/server.py 的 SERVER_VERSION 一致；单测会校验两者同步。
+EXPECTED_SERVER_VERSION = "2"
 _RECOVERY_LOCK = threading.RLock()
 _RECOVERY_SERVER: "LocalTtsServer | None" = None
 
@@ -74,16 +77,104 @@ class LocalTtsServer:
         return f"http://127.0.0.1:{self.port}/health"
 
     def is_ready(self) -> bool:
+        return self._health_payload().get("status") == "ok"
+
+    def _health_payload(self) -> dict[str, object]:
         try:
             response = requests.get(self.health_url, timeout=0.5)
-            return response.ok and response.json().get("status") == "ok"
+            if not response.ok:
+                return {}
+            payload = response.json()
         except (OSError, ValueError, requests.RequestException):
-            return False
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _served_version_matches(self) -> bool:
+        """端口上活着的服务是否为当前版本。旧孤儿进程的 /health 没有版本字段。"""
+        return str(self._health_payload().get("server_version", "")) == EXPECTED_SERVER_VERSION
+
+    def _stop_port_orphans(self) -> None:
+        """清理占用本端口的遗留 TTS 进程（更新退出未走 closeEvent 时产生的孤儿）。
+
+        只处理处于 LISTENING 状态且端口完全匹配的进程，尽力而为，失败不影响主流程。
+        """
+        if not self.is_ready() and not self._port_is_listening():
+            return
+        if os.name == "nt":
+            self._stop_windows_port_processes()
+        else:
+            self._stop_posix_port_processes()
+
+    def _port_is_listening(self) -> bool:
+        with contextlib.suppress(OSError):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.3)
+                probe.connect(("127.0.0.1", self.port))
+                return True
+        return False
+
+    def _stop_windows_port_processes(self) -> None:
+        try:
+            output = subprocess.run(
+                ["netstat", "-ano", "-p", "tcp"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return
+        pids: set[str] = set()
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) < 5 or fields[-1] == "PID":
+                continue
+            if fields[3].upper() != "LISTENING":
+                continue
+            local_address = fields[1]
+            if not local_address.endswith(f":{self.port}"):
+                continue
+            # 端口必须完全匹配，避免误杀 99990 这类长端口进程。
+            host, _, port = local_address.rpartition(":")
+            if port != str(self.port) or not host:
+                continue
+            pids.add(fields[-1])
+        for pid in pids:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", pid],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+
+    def _stop_posix_port_processes(self) -> None:
+        try:
+            output = subprocess.run(
+                ["lsof", "-ti", f"tcp:{self.port}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return
+        for pid in output.split():
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(
+                    ["kill", "-9", pid],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
 
     def start(self, *, timeout: float = 8.0) -> None:
         with self._lock:
             if self.is_ready():
-                return
+                if self._served_version_matches():
+                    return
+                # 端口上是被更新流程遗落的旧版本服务，清掉后重新拉起当前版本。
+                self._stop_port_orphans()
             if self._process is not None and self._process.poll() is None:
                 raise RuntimeError("本地 TTS 服务启动超时")
             log_path = self.root / "runtime" / "logs" / "local_tts_server.log"
@@ -146,6 +237,9 @@ class LocalTtsServer:
             self._process = None
             if process is not None and process.poll() is None:
                 process.terminate()
+        # 兜底清掉端口上的遗留进程：正常退出只杀自己拉起的子进程，历史上
+        # 自动更新用 quit() 退出、不走 closeEvent，会在端口上留下旧服务。
+        self._stop_port_orphans()
 
     def restart(self) -> None:
         """停止并重新拉起同一个受管理的 TTS 子进程。"""

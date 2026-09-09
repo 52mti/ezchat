@@ -966,6 +966,9 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.critical(self, "更新失败", f"无法启动更新程序：{exc}")
             return
+        # quit() 不会触发 closeEvent；TTS 子进程必须在这里显式停掉，
+        # 否则它会在端口上遗留旧版本孤儿进程，被更新后的新会话一直复用。
+        self.local_tts_server.stop()
         QApplication.instance().quit()
 
     def _update_apply_command(self, *, root: Path, updater: Path, archive_path: str) -> list[str]:

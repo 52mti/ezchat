@@ -23,6 +23,9 @@ FALLBACK_TTS_ENGINE = "piper"
 DEFAULT_SPEAKER_RATE = 1.0
 PIPER_MODEL_FILENAME = "zh_CN-huayan-medium.onnx"
 PIPER_ENGINE_VERSION = "piper-tts-1.7.0"
+# 服务端行为版本。客户端按此判断端口上活着的服务是否为旧代码（历史
+# 更新退出时遗留的孤儿进程），不匹配就会清掉重启。
+SERVER_VERSION = "2"
 LOGGER = logging.getLogger("local_tts")
 if not LOGGER.handlers:
     _log_handler = logging.StreamHandler()
@@ -199,7 +202,12 @@ def create_app(
 
     @app.get("/health")
     async def health() -> dict[str, str]:
-        return {"status": "ok", "engine": DEFAULT_TTS_ENGINE, "fallback": FALLBACK_TTS_ENGINE}
+        return {
+            "status": "ok",
+            "engine": DEFAULT_TTS_ENGINE,
+            "fallback": FALLBACK_TTS_ENGINE,
+            "server_version": SERVER_VERSION,
+        }
 
     @app.post("/tts")
     async def tts(request: Request):
