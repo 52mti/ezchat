@@ -395,6 +395,14 @@ def build_dialogue_result(
             return "user_name"
         if basic["enable_max_x_filter"] and item["max_x"] >= image_width * float(basic["max_x_ratio"]):
             return "too_far_right"
+        if basic.get("enable_edge_spanning_filter", False):
+            left_ratio = float(basic.get("edge_spanning_left_ratio", 0.1))
+            right_ratio = float(basic.get("edge_spanning_right_ratio", 0.9))
+            if (
+                item["min_x"] < image_width * left_ratio
+                or item["max_x"] > image_width * right_ratio
+            ):
+                return "edge_spanning_text"
         if basic["enable_max_width_filter"] and item["width"] > image_width * float(basic["max_width_ratio"]):
             return "too_wide"
         if basic["enable_low_conf_single_char_filter"]:
@@ -465,9 +473,24 @@ def build_dialogue_result(
             sender_stats["position_fallback"] += 1
             return center_position_sender
         if method == "bubble_color":
+            strong_position_min_x_ratio = sender_detection.get("strong_sender2_min_x_ratio")
+            if (
+                strong_position_min_x_ratio is not None
+                and item["center_x"] > image_width * float(strong_position_min_x_ratio)
+            ):
+                # 右侧气泡位置非常明确时，避免暗色/反光导致的颜色采样误判。
+                item["sender_color"] = ""
+                item["sender_position"] = "sender2"
+                item["sender_method"] = "strong_position_override"
+                item["sender_conflict"] = False
+                item["sender_confidence"] = round(
+                    min(1.0, (item["center_x"] / max(1.0, float(image_width))) * 1.25), 4
+                )
+                return "sender2"
             hue = item.get("background_hue")
             saturation = float(item.get("background_saturation") or 0.0)
             value = float(item.get("background_value") or 0.0)
+            color_sender: str | None = None
             min_saturation = float(sender_detection.get("bubble_color_min_saturation", 0.12))
             min_value = float(sender_detection.get("bubble_color_min_value", 0.20))
             hue_min = float(sender_detection.get("bubble_color_sender2_hue_min", 125))
@@ -481,10 +504,16 @@ def build_dialogue_result(
             if hue is not None and saturation >= min_saturation and value >= min_value:
                 hue_value = float(hue)
                 if matches_sender1_color_override(hue_value, saturation, value):
-                    return "sender1"
+                    color_sender = "sender1"
                 is_sender2_hue = hue_min <= hue_value <= hue_max
                 if hue_min_2 is not None and hue_max_2 is not None:
-                    is_sender2_hue = is_sender2_hue or float(hue_min_2) <= hue_value <= float(hue_max_2)
+                    wraparound_min_saturation = float(
+                        sender_detection.get("bubble_color_sender2_hue_min_2_saturation", 0.0)
+                    )
+                    is_sender2_hue = is_sender2_hue or (
+                        float(hue_min_2) <= hue_value <= float(hue_max_2)
+                        and saturation >= wraparound_min_saturation
+                    )
                 blue_green_delta = float(item.get("background_blue_green_delta") or 0.0)
                 blue_red_ratio = float(item.get("background_blue_red_ratio") or 0.0)
                 is_sender2_blue = (
@@ -493,7 +522,32 @@ def build_dialogue_result(
                     and blue_green_delta >= blue_green_min
                     and blue_red_ratio >= blue_red_ratio_min
                 )
-                return "sender2" if is_sender2_hue or is_sender2_blue else "sender1"
+                if color_sender is None:
+                    color_sender = "sender2" if is_sender2_hue or is_sender2_blue else "sender1"
+            if color_sender is not None:
+                position_sender = center_position_sender
+                try:
+                    ocr_confidence = max(0.0, min(1.0, float(item.get("confidence", 1.0))))
+                except (TypeError, ValueError):
+                    ocr_confidence = 1.0
+                color_weight = float(sender_detection.get("sender_color_weight", 0.72))
+                position_weight = float(sender_detection.get("sender_position_weight", 0.28))
+                # Low OCR confidence weakens the sampled-color evidence, while
+                # the bubble's horizontal placement remains usable.
+                color_weight *= ocr_confidence
+                color_score = color_weight if color_sender == "sender2" else -color_weight
+                position_score = position_weight if position_sender == "sender2" else -position_weight
+                total_weight = color_weight + position_weight
+                score = color_score + position_score
+                sender = "sender2" if score >= 0.0 else "sender1"
+                item["sender_color"] = color_sender
+                item["sender_position"] = position_sender
+                item["sender_method"] = "color_position_fusion"
+                item["sender_conflict"] = color_sender != position_sender
+                item["sender_confidence"] = round(abs(score) / max(total_weight, 1e-6), 4)
+                if color_sender != position_sender:
+                    sender_stats["color_position_conflict"] = sender_stats.get("color_position_conflict", 0) + 1
+                return sender
             sender_stats["color_unclear"] += 1
             sender_stats["position_fallback"] += 1
             sender_stats["color_unclear_position_fallback"] += 1

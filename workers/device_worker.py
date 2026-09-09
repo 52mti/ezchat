@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import queue
+import sys
 import threading
 import time
+import traceback
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from apps import get_registered_apps, resolve_app_name
@@ -14,11 +19,13 @@ from apps.visual_assets import back_button_template_paths
 from lgb.lgb import RobotInterface
 from services import (
     AIClient,
+    ChatHistoryStore,
     ConfigManager,
     LicenseClient,
     MemoryStore,
     MessageProcessor,
     setup_runtime_logging,
+    write_error_incident,
 )
 from services.license_client import _is_future_time
 
@@ -29,6 +36,30 @@ class WorkerEvent:
     level: str
     message: str
     payload: dict[str, Any] | None = None
+
+
+RECENT_LOG_BUFFER_LIMIT = 100
+PRE_ERROR_LOG_LIMIT = 10
+TIMELINE_LOG_LIMIT = 200
+
+
+def _ocr_backend_label_from_state() -> str:
+    state_path = Path("runtime") / "install_state.json"
+    if not state_path.is_file():
+        return ""
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    device = str(payload.get("ocr_device", "") or "").strip().lower()
+    backend = str(payload.get("backend", "") or "").strip().lower()
+    if device.startswith(("gpu", "cuda", "dml")) or backend in {"paddle_cuda", "onnx_directml", "gpu", "cuda", "directml"}:
+        return "GPU"
+    if device == "cpu" or backend == "cpu":
+        return "CPU"
+    return ""
 
 
 class DeviceWorker(threading.Thread):
@@ -71,6 +102,11 @@ class DeviceWorker(threading.Thread):
             runtime_context["device_ip"] = str(device["ip"])
             runtime_context["app_name"] = app_name
             runtime_context["should_stop"] = self._stop_event.is_set
+            runtime_context["ocr_backend"] = _ocr_backend_label_from_state()
+            # App 运行期间用于保存视觉模型学习到的 App 级 OCR 规则。
+            # _runtime 不会写入 config.json。
+            runtime_context["config_manager"] = self.config_manager
+            runtime_context["rule_learning"] = global_config.get("rule_learning", {}) if isinstance(global_config, dict) else {}
         self.robot = robot or RobotInterface(str(device["ip"]))
         try:
             setattr(self.robot, "_codex_click_jitter_enabled", True)
@@ -91,12 +127,14 @@ class DeviceWorker(threading.Thread):
             project_secret=str(global_config.get("project_secret", "")),
         )
         self.memory_store = MemoryStore()
+        self.chat_history_store = ChatHistoryStore()
         self.message_processor = MessageProcessor(
             device=device,
             app_name=app_name,
             config_manager=self.config_manager,
             ai_client=self.ai_client,
             memory_store=self.memory_store,
+            chat_history_store=self.chat_history_store,
             logger=self._emit,
         )
         app_cls = app_registry[app_name]
@@ -112,6 +150,57 @@ class DeviceWorker(threading.Thread):
         if hasattr(self.app, "set_log_callback"):
             self.app.set_log_callback(self._emit)
         self._last_license_check = 0.0
+        self._last_progress_event_key: tuple[str, str, str] | None = None
+        self._last_progress_event_at = 0.0
+        self._recent_logs: deque[dict[str, Any]] = deque(maxlen=RECENT_LOG_BUFFER_LIMIT)
+        self._active_incident: dict[str, Any] | None = None
+        self._incident_sequence = 0
+        self._last_error_count_seen = 0
+        self._live_config_fingerprint = self._config_fingerprint(self.app_config)
+
+    @staticmethod
+    def _config_fingerprint(config: dict[str, Any]) -> str:
+        try:
+            payload = {key: value for key, value in config.items() if key not in {"_runtime", "_runtime_cache"}}
+            return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            return repr(config)
+
+    def _reload_live_app_config(self) -> None:
+        """重新加载当前设备当前 App 配置，避免运行中新增模板范围要重启才生效。"""
+        fresh = with_app_defaults(
+            self.config_manager.get_app_config(str(self.device["ip"]), self.app_name, {})
+        )
+        fingerprint = self._config_fingerprint(fresh)
+        if fingerprint == self._live_config_fingerprint:
+            return
+
+        old_runtime = self.app_config.get("_runtime", {})
+        old_cache = self.app_config.get("_runtime_cache", {})
+        fresh["_runtime"] = old_runtime if isinstance(old_runtime, dict) else {}
+        fresh["_runtime_cache"] = old_cache if isinstance(old_cache, dict) else {}
+        global_config = self.config_manager.get("global", default={})
+        runtime = fresh.setdefault("_runtime", {})
+        if isinstance(runtime, dict):
+            runtime["device_ip"] = str(self.device["ip"])
+            runtime["app_name"] = self.app_name
+            runtime["should_stop"] = self._stop_event.is_set
+            runtime["ocr_backend"] = _ocr_backend_label_from_state()
+            runtime["config_manager"] = self.config_manager
+            runtime["rule_learning"] = global_config.get("rule_learning", {}) if isinstance(global_config, dict) else {}
+        try:
+            ocr_max_concurrency = int(global_config.get("ocr_max_concurrency", 1) or 1)
+        except (TypeError, ValueError):
+            ocr_max_concurrency = 1
+        fresh["ocr_max_concurrency"] = min(16, max(1, ocr_max_concurrency))
+        ocr_config = fresh.get("ocr")
+        if isinstance(ocr_config, dict):
+            ocr_config["max_concurrency"] = fresh["ocr_max_concurrency"]
+
+        self.app_config.clear()
+        self.app_config.update(fresh)
+        self._live_config_fingerprint = fingerprint
+        self._emit("info", "当前设备当前 App 配置已热刷新", {"app_name": self.app_name})
 
     def pause(self, detail: str = "") -> None:
         self._pause_event.clear()
@@ -122,6 +211,7 @@ class DeviceWorker(threading.Thread):
         if self.app.status.is_circuit_open:
             self.app.status.is_circuit_open = False
             self.app.status.error_count = 0
+            self._last_error_count_seen = 0
         self._emit("info", "resumed")
 
     def stop(self) -> None:
@@ -130,11 +220,15 @@ class DeviceWorker(threading.Thread):
         self._emit("info", "stopping")
 
     def _emit(self, level: str, message: str, payload: dict[str, Any] | None = None) -> None:
+        self._record_log_entry(self._log_entry(level, message, payload))
         self.events.put(WorkerEvent(str(self.device["ip"]), level, message, payload))
         safe_payload = "" if payload is None else f" {payload}"
+        log_level = {"error": 40, "warning": 30, "info": 20, "status": 20}.get(level, 20)
+        if log_level < 30:
+            return
         try:
             setup_runtime_logging().log(
-                {"error": 40, "warning": 30, "info": 20, "status": 20}.get(level, 20),
+                log_level,
                 "%s %s%s",
                 self.device["ip"],
                 message,
@@ -143,12 +237,182 @@ class DeviceWorker(threading.Thread):
         except Exception:
             return
 
+    def _log_entry(self, level: str, message: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "level": str(level),
+            "message": str(message),
+            "payload": dict(payload) if isinstance(payload, dict) else {},
+        }
+
+    def _should_buffer_log(self, entry: dict[str, Any]) -> bool:
+        level = str(entry.get("level", "") or "")
+        message = str(entry.get("message", "") or "")
+        if level == "status" and message == "tick":
+            return False
+        return level in {"info", "warning", "error", "status"}
+
+    def _record_log_entry(self, entry: dict[str, Any]) -> None:
+        if not self._should_buffer_log(entry):
+            return
+        self._recent_logs.append(entry)
+        if self._active_incident is None:
+            return
+        timeline = self._active_incident.setdefault("timeline_logs", [])
+        timeline.append(entry)
+        if len(timeline) > TIMELINE_LOG_LIMIT:
+            del timeline[:-TIMELINE_LOG_LIMIT]
+
+    def _runtime_context(self) -> dict[str, Any]:
+        runtime = self.app_config.get("_runtime")
+        if not isinstance(runtime, dict):
+            runtime = {}
+            self.app_config["_runtime"] = runtime
+        return runtime
+
+    def _runtime_snapshot(self) -> dict[str, Any]:
+        runtime = self._runtime_context()
+        related_capture_paths = runtime.get("related_capture_paths", [])
+        template_paths = runtime.get("template_paths", [])
+        if not isinstance(related_capture_paths, list):
+            related_capture_paths = []
+        if not isinstance(template_paths, list):
+            template_paths = []
+        return {
+            "ocr_backend": str(runtime.get("ocr_backend", "") or ""),
+            "error_screenshot": str(runtime.get("error_screenshot", "") or runtime.get("last_error_capture_path", "") or ""),
+            "current_capture_path": str(runtime.get("current_capture_path", "") or runtime.get("last_capture_path", "") or ""),
+            "related_capture_paths": [str(item) for item in related_capture_paths[-10:]],
+            "template_paths": [str(item) for item in template_paths[-10:]],
+            "last_template_path": str(runtime.get("last_template_path", "") or ""),
+            "last_template_match_key": str(runtime.get("last_template_match_key", "") or ""),
+        }
+
+    def _merge_incident_context(self, incident: dict[str, Any], snapshot: dict[str, Any]) -> None:
+        if snapshot.get("ocr_backend"):
+            incident["ocr_backend"] = snapshot["ocr_backend"]
+        if snapshot.get("error_screenshot"):
+            incident["error_screenshot"] = snapshot["error_screenshot"]
+        if snapshot.get("current_capture_path"):
+            incident["current_capture_path"] = snapshot["current_capture_path"]
+        related = incident.setdefault("related_capture_paths", [])
+        for item in snapshot.get("related_capture_paths", []):
+            if item and item not in related:
+                related.append(item)
+        templates = incident.setdefault("template_paths", [])
+        for item in snapshot.get("template_paths", []):
+            if item and item not in templates:
+                templates.append(item)
+        last_template = str(snapshot.get("last_template_path", "") or "")
+        if last_template and last_template not in templates:
+            templates.append(last_template)
+        if snapshot.get("last_template_match_key"):
+            incident["last_template_match_key"] = snapshot["last_template_match_key"]
+
+    def _ensure_incident_started(self) -> dict[str, Any]:
+        if self._active_incident is not None:
+            return self._active_incident
+        self._incident_sequence += 1
+        recent_logs = list(self._recent_logs)
+        pre_error_logs = recent_logs[-PRE_ERROR_LOG_LIMIT:]
+        timeline_logs: list[dict[str, Any]] = []
+        if pre_error_logs and pre_error_logs[-1].get("level") in {"warning", "error"}:
+            timeline_logs = [pre_error_logs[-1]]
+            pre_error_logs = pre_error_logs[:-1]
+        incident = {
+            "incident_id": f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self._incident_sequence:03d}",
+            "device_ip": str(self.device["ip"]),
+            "app_name": self.app_name,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "status": "active",
+            "circuit_open": False,
+            "error_count_peak": 0,
+            "pre_error_logs": pre_error_logs,
+            "timeline_logs": timeline_logs,
+            "errors": [],
+            "ocr_backend": str(self._runtime_context().get("ocr_backend", "") or ""),
+            "error_screenshot": "",
+            "current_capture_path": "",
+            "related_capture_paths": [],
+            "template_paths": [],
+        }
+        self._merge_incident_context(incident, self._runtime_snapshot())
+        self._active_incident = incident
+        return incident
+
+    def _record_incident_error(self, status: dict[str, Any]) -> None:
+        incident = self._ensure_incident_started()
+        snapshot = self._runtime_snapshot()
+        self._merge_incident_context(incident, snapshot)
+        threshold = int(getattr(self.app, "circuit_breaker_threshold", 5) or 5)
+        current_count = int(status.get("error_count", 0) or 0)
+        incident["error_count_peak"] = max(int(incident.get("error_count_peak", 0) or 0), current_count)
+        incident["errors"].append(
+            {
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "error_count": current_count,
+                "threshold": threshold,
+                "step": str(status.get("current_step", "") or ""),
+                "step_label": str(status.get("current_step_label", "") or ""),
+                "error": str(status.get("last_error", "") or ""),
+                "circuit_open": bool(status.get("is_circuit_open", False)),
+                "error_screenshot": snapshot.get("error_screenshot", ""),
+                "current_capture_path": snapshot.get("current_capture_path", ""),
+                "template_paths": snapshot.get("template_paths", []),
+            }
+        )
+
+    def _flush_incident(self, status_name: str, status: dict[str, Any] | None = None) -> None:
+        if self._active_incident is None:
+            return
+        incident = self._active_incident
+        self._active_incident = None
+        if status is not None:
+            self._merge_incident_context(incident, self._runtime_snapshot())
+            incident["error_count_peak"] = max(
+                int(incident.get("error_count_peak", 0) or 0),
+                int(status.get("error_count", 0) or 0),
+            )
+            incident["circuit_open"] = bool(status.get("is_circuit_open", False))
+            incident["last_error"] = str(status.get("last_error", "") or "")
+            incident["last_step"] = str(status.get("current_step_label", "") or status.get("current_step", "") or "")
+        incident["status"] = status_name
+        incident["ended_at"] = datetime.now().isoformat(timespec="seconds")
+        try:
+            write_error_incident(incident)
+        except Exception as exc:
+            try:
+                setup_runtime_logging().exception("failed to write error incident for %s: %s", self.device["ip"], exc)
+            except Exception:
+                pass
+
+    def _track_error_window(self, status: dict[str, Any]) -> None:
+        try:
+            current_count = int(status.get("error_count", 0) or 0)
+        except (TypeError, ValueError):
+            current_count = 0
+        previous_count = self._last_error_count_seen
+        if current_count > previous_count:
+            self._record_incident_error(status)
+        if current_count == 0 and previous_count > 0:
+            self._flush_incident("recovered", status)
+        elif bool(status.get("is_circuit_open", False)) and current_count > 0:
+            self._flush_incident("circuit_open", status)
+        self._last_error_count_seen = current_count
+
     def _emit_app_status(self, payload: dict[str, Any]) -> None:
         if self._stop_event.is_set():
             return
         detail = str(payload.get("current_step_label", "") or payload.get("current_step", "") or "progress")
         log_detail = str(payload.get("current_step_log_label", "") or detail)
-        self._emit("info", "runtime_step", {"step": payload.get("current_step", ""), "detail": log_detail})
+        step = str(payload.get("current_step", "") or "")
+        event_key = (step, detail, log_detail)
+        now = time.monotonic()
+        if event_key == self._last_progress_event_key and now - self._last_progress_event_at < 0.8:
+            return
+        self._last_progress_event_key = event_key
+        self._last_progress_event_at = now
+        self._emit("info", "runtime_step", {"step": step, "detail": log_detail})
         self._emit("status", f"progress: {detail}", payload)
 
     def _license_allows_run(self) -> bool:
@@ -246,6 +510,12 @@ class DeviceWorker(threading.Thread):
         status = self._fallback_status()
         status["error_count"] = error_count
         status["last_error"] = str(exc)
+        # 仅在错误事件中保存完整调用栈，便于定位客户机上的第三方运行时异常。
+        # 正常运行日志仍只显示简短错误，不增加客户日志噪音。
+        error_traceback = traceback.format_exc()
+        module_path = self._runtime_context().get("module_archive", "")
+        if not module_path:
+            module_path = str(Path(__file__).resolve().parents[1] / "app_modules.zip")
         label = str(status.get("current_step_label", "") or status.get("current_step", "") or "run_once")
         self._emit(
             "error",
@@ -257,6 +527,11 @@ class DeviceWorker(threading.Thread):
                 "error_count": error_count,
                 "app_name": self.app_name,
                 "thread_isolated": True,
+                "traceback": error_traceback,
+                "python_executable": sys.executable,
+                "module_archive": str(module_path),
+                "module_archive_exists": Path(module_path).is_file() if module_path else False,
+                "module_archive_is_dir": Path(module_path).is_dir() if module_path else False,
             },
         )
         return status
@@ -271,6 +546,7 @@ class DeviceWorker(threading.Thread):
             except Exception as exc:
                 status = self._record_unhandled_app_exception(exc)
                 status["checked_at"] = datetime.now().isoformat(timespec="seconds")
+                self._track_error_window(status)
                 self._emit("status", "tick", status)
                 return
             while not self._stop_event.is_set():
@@ -278,6 +554,7 @@ class DeviceWorker(threading.Thread):
                 if self._stop_event.is_set():
                     break
                 try:
+                    self._reload_live_app_config()
                     if not self._license_allows_run():
                         continue
                     self.app.run_once()
@@ -286,6 +563,7 @@ class DeviceWorker(threading.Thread):
                     status = self._record_unhandled_app_exception(exc)
                 if self._stop_event.is_set():
                     break
+                self._track_error_window(status)
                 status["checked_at"] = datetime.now().isoformat(timespec="seconds")
                 self._emit("status", "tick", status)
                 if status.get("is_circuit_open"):
@@ -295,4 +573,5 @@ class DeviceWorker(threading.Thread):
                 if self._stop_event.wait(wait_interval):
                     break
         finally:
+            self._flush_incident("stopped")
             self._emit("info", "stopped")

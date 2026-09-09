@@ -18,12 +18,15 @@ WAIT_TIMEOUT_SECONDS = 120
 PRESERVE_PREFIXES = (
     "config.json",
     "outbox.json",
+    "runtime/",
+    "models/",
     "runtime/install_state.json",
     "runtime/logs/",
     "runtime/errors/",
     "runtime/memory/",
     "runtime/reports/",
     "runtime/tmp/",
+    "runtime/tts/piper/",
     "runtime/.paddlex/",
     "photo/",
     "jiekou/",
@@ -210,6 +213,17 @@ def _write_error_log(target_root: Path, message: str) -> None:
         pass
 
 
+def _read_app_version(root: Path) -> str:
+    manifest_path = root / "runtime_manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("更新后 runtime_manifest.json 格式无效。")
+    version = str(payload.get("appVersion", "") or "").strip()
+    if not version:
+        raise RuntimeError("更新后 runtime_manifest.json 缺少 appVersion。")
+    return version
+
+
 def apply_update(*, package_root: Path, archive_path: Path, pid: int) -> None:
     _wait_for_process_exit(pid, WAIT_TIMEOUT_SECONDS)
     extracted_root = _extract_archive(archive_path)
@@ -217,6 +231,10 @@ def apply_update(*, package_root: Path, archive_path: Path, pid: int) -> None:
     new_paths = _read_manifest_paths(extracted_root)
     _remove_obsolete_files(package_root, existing_paths, new_paths)
     _copy_update_tree(extracted_root, package_root)
+    expected_version = _read_app_version(extracted_root)
+    actual_version = _read_app_version(package_root)
+    if actual_version != expected_version:
+        raise RuntimeError(f"更新版本校验失败：期望 {expected_version}，实际 {actual_version}。")
     archive_path.unlink(missing_ok=True)
 
 

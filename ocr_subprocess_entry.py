@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
+    bridge_modules = root / "ocr_bridge_modules.zip"
+    if bridge_modules.is_file() and str(bridge_modules) not in sys.path:
+        sys.path.insert(0, str(bridge_modules))
+    os.environ["JIXIEBI_PACKAGE_ROOT"] = str(root)
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 

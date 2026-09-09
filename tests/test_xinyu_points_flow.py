@@ -76,7 +76,7 @@ def test_xinyu_read_my_points_clicks_my_reads_points_and_returns_message(monkeyp
 
     assert steps.read_my_points(robot, config) == "1288"
     assert seen_modes == ["list", "points"]
-    assert robot.clicks == [pytest.approx((0.84, 0.9)), pytest.approx((0.62, 0.9))]
+    assert robot.clicks == [pytest.approx((0.84, 0.88)), pytest.approx((0.62, 0.88))]
 
 
 def test_xinyu_read_my_points_reuses_cached_my_coordinate(monkeypatch, tmp_path):
@@ -101,6 +101,35 @@ def test_xinyu_read_my_points_reuses_cached_my_coordinate(monkeypatch, tmp_path)
     assert robot.clicks[0] == pytest.approx((0.91, 0.93))
 
 
+def test_xinyu_read_my_points_uses_cached_my_without_list_ocr(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    config["_runtime_cache"] = {"screen_anchors": {"bottom_my": (0.91, 0.93)}}
+    robot = FakeRobot(["list", "list", "my", "list"])
+    seen_modes: list[str] = []
+
+    def fake_match(image, template, threshold=0.85):
+        name = Path(template).name
+        if image == "list" and name == "screen_聊天列表.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        if image == "my" and name == "screen_我的界面.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        return None
+
+    def fake_ocr(image, cfg, mode, region=None):
+        seen_modes.append(mode)
+        if mode == "list":
+            raise AssertionError("cached bottom_my should avoid list OCR before reading points")
+        return {"result": {"points": "100"}, "ocr_items": []}
+
+    monkeypatch.setattr(steps, "match", fake_match)
+    monkeypatch.setattr(steps, "run_ocr_mode", fake_ocr)
+    monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
+
+    assert steps.read_my_points(robot, config) == "100"
+    assert seen_modes == ["points"]
+    assert robot.clicks == [pytest.approx((0.91, 0.93)), pytest.approx((0.71, 0.93))]
+
+
 def test_xinyu_read_my_points_skips_when_bottom_nav_has_no_my(monkeypatch, tmp_path):
     config = _config(tmp_path)
     robot = FakeRobot(["list", "list"])
@@ -116,7 +145,7 @@ def test_xinyu_read_my_points_skips_when_bottom_nav_has_no_my(monkeypatch, tmp_p
         steps,
         "run_ocr_mode",
         lambda image, cfg, mode, region=None: {
-            "result": {"bottom_nav": [{"name": "消息", "bounds": [0.56, 0.86, 0.68, 0.94]}]},
+            "result": {"bottom_nav": [{"name": "主页", "bounds": [0.56, 0.86, 0.68, 0.94]}]},
             "ocr_items": [],
         },
     )
@@ -130,13 +159,15 @@ def test_xinyu_read_my_points_skips_when_bottom_nav_has_no_my(monkeypatch, tmp_p
     assert any(label == "底部导航未识别到我的，跳过积分读取" for _step, label, _log_label in reports)
 
 
-def test_xinyu_read_my_points_skips_when_bottom_nav_has_no_message(monkeypatch, tmp_path):
+def test_xinyu_read_my_points_uses_cached_my_without_message_ocr(monkeypatch, tmp_path):
     config = _config(tmp_path)
-    robot = FakeRobot(["list", "list"])
-    reports: list[tuple[str, str, str | None]] = []
+    robot = FakeRobot(["list", "list", "my", "list"])
 
     def fake_match(image, template, threshold=0.85):
-        if image == "list" and Path(template).name == "screen_聊天列表.jpg":
+        name = Path(template).name
+        if image == "list" and name == "screen_聊天列表.jpg":
+            return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        if image == "my" and name == "screen_我的界面.jpg":
             return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
         return None
 
@@ -144,19 +175,19 @@ def test_xinyu_read_my_points_skips_when_bottom_nav_has_no_message(monkeypatch, 
     monkeypatch.setattr(
         steps,
         "run_ocr_mode",
-        lambda image, cfg, mode, region=None: {
-            "result": {"bottom_nav": [{"name": "我的", "bounds": [0.78, 0.86, 0.90, 0.94]}]},
-            "ocr_items": [],
-        },
+        lambda image, cfg, mode, region=None: (
+            {
+                "result": {"bottom_nav": [{"name": "我的", "bounds": [0.78, 0.86, 0.90, 0.94]}]},
+                "ocr_items": [],
+            }
+            if mode == "list"
+            else {"result": {"points": "100"}, "ocr_items": []}
+        ),
     )
+    monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
 
-    assert steps.read_my_points(
-        robot,
-        config,
-        reporter=lambda step, label, log_label=None: reports.append((step, label, log_label)),
-    ) is None
-    assert robot.clicks == []
-    assert any(label == "底部导航未识别到消息，跳过积分读取" for _step, label, _log_label in reports)
+    assert steps.read_my_points(robot, config) == "100"
+    assert robot.clicks == [pytest.approx((0.84, 0.88)), pytest.approx((0.64, 0.88))]
 
 
 def test_xinyu_app_reads_points_once_per_idle_wait_and_reports_balance(monkeypatch, tmp_path):

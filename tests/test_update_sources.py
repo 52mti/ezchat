@@ -16,10 +16,18 @@ class _CookieJar:
 
 
 class _FakeResponse:
-    def __init__(self, url: str, text: str, *, status_code: int = 200) -> None:
+    def __init__(
+        self,
+        url: str,
+        text: str,
+        *,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.url = url
         self.text = text
         self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -41,7 +49,7 @@ class _FakeSession:
     def queue_post(self, url: str, *responses: _FakeResponse) -> None:
         self._post_queue.setdefault(url, []).extend(responses)
 
-    def get(self, url: str, headers=None, timeout=None):  # noqa: ANN001
+    def get(self, url: str, headers=None, timeout=None, allow_redirects=True):  # noqa: ANN001
         queue = self._get_queue.get(url, [])
         if not queue:
             raise AssertionError(f"Unexpected GET: {url}")
@@ -123,6 +131,8 @@ $.ajax({
         "dom": "https://developer3.lanrar.com",
         "url": "?B2FUal1sDj8IAQc/example-token",
     }
+    fake_download_url = "https://developer3.lanrar.com/file/?B2FUal1sDj8IAQc/example-token"
+    final_download_url = "https://zip.example.com/update.zip"
 
     session = _FakeSession()
     session.queue_get(
@@ -134,6 +144,10 @@ $.ajax({
     session.queue_get(detail_url, _FakeResponse(detail_url, detail_html))
     session.queue_get(frame_url, _FakeResponse(frame_url, frame_html))
     session.queue_post(ajax_url, _FakeResponse(ajax_url, json.dumps(ajax_json)))
+    session.queue_get(
+        fake_download_url,
+        _FakeResponse(fake_download_url, "", status_code=302, headers={"Location": final_download_url}),
+    )
 
     resolved = update_sources.resolve_lanzou_update_package(session=session)
 
@@ -142,11 +156,112 @@ $.ajax({
     assert resolved.detail_url == detail_url
     assert resolved.frame_url == frame_url
     assert resolved.ajax_url == ajax_url
-    assert resolved.download_url == "https://developer3.lanrar.com/file/?B2FUal1sDj8IAQc/example-token"
+    assert resolved.download_url == final_download_url
     assert resolved.size == "14.5 M"
     assert session.cookies.values == [
         ("acw_sc__v2", "6a251ba7dca237c712fd76de5191b922ec3b6160", "liaotianbao.lanzouq.com", "/")
     ]
+
+
+def test_resolve_lanzou_update_package_handles_verification_page(monkeypatch: pytest.MonkeyPatch):
+    share_url = "https://liaotianbao.lanzouq.com/b006712hbg"
+    detail_url = "https://liaotianbao.lanzouq.com/io9Bl3rbb3de"
+    frame_url = "https://liaotianbao.lanzouq.com/fn?frame-token"
+    filemore_url = "https://liaotianbao.lanzouq.com/filemoreajax.php?file=13580356"
+    ajax_url = "https://liaotianbao.lanzouq.com/ajaxm.php?file=289469534"
+    fake_download_url = "https://developer3.lanrar.com/file/?B2FUal1sDj8IAQc/example-token"
+    verify_ajax_url = "https://developer3.lanrar.com/file/ajax.php"
+
+    monkeypatch.setattr(update_sources.time, "sleep", lambda _: None)
+
+    share_html = """
+<script type="text/javascript">
+var ib2801 = '1780817496';
+var _h0k1u = 'd23aa3bedb658a092356887b1c24e112';
+function file(){
+  $.ajax({
+    url : '/filemoreajax.php?file=13580356',
+    data : {
+      'uid':'2680763',
+      'puid':'UGJXNlw5VTEBYAdnBmFccANoUGJVMgc1BTpSZVA6W2IIMVQ1C3tQNlI0UzcAYlZnVTkHMgVs'
+    }
+  });
+}
+</script>
+"""
+    filemore_json = {
+        "zt": 1,
+        "info": "sucess",
+        "text": [
+            {
+                "icon": "zip",
+                "t": 0,
+                "id": "io9Bl3rbb3de",
+                "name_all": "jixiebijiaoben_update_20260607_0904.zip",
+                "size": "14.5 M",
+            },
+        ],
+    }
+    detail_html = '<html><iframe src="/fn?frame-token"></iframe></html>'
+    frame_html = """
+<script type="text/javascript">
+var wp_sign = 'token-sign';
+var ajaxdata = 'w9pk';
+$.ajax({
+  url : '/ajaxm.php?file=289469534',
+  data : { 'action':'downprocess' }
+});
+</script>
+"""
+    ajax_json = {
+        "zt": 1,
+        "dom": "https://developer3.lanrar.com",
+        "url": "?B2FUal1sDj8IAQc/example-token",
+    }
+    verify_html = """
+<div>系统发现您的网络异常，需要验证后下载文件</div>
+<script>
+$.ajax({
+  type : 'post',
+  url : 'ajax.php',
+  data : { 'file':'encoded-file-token','el':el,'sign':'encoded-sign-token' }
+});
+</script>
+"""
+    verify_json = {"zt": 1, "dom": None, "url": "https://zip.example.com/update.zip"}
+
+    session = _FakeSession()
+    session.queue_get(share_url, _FakeResponse(share_url, share_html))
+    session.queue_post(filemore_url, _FakeResponse(filemore_url, json.dumps(filemore_json)))
+    session.queue_get(detail_url, _FakeResponse(detail_url, detail_html))
+    session.queue_get(frame_url, _FakeResponse(frame_url, frame_html))
+    session.queue_post(ajax_url, _FakeResponse(ajax_url, json.dumps(ajax_json)))
+    session.queue_get(fake_download_url, _FakeResponse(fake_download_url, verify_html))
+    session.queue_post(verify_ajax_url, _FakeResponse(verify_ajax_url, json.dumps(verify_json)))
+
+    resolved = update_sources.resolve_lanzou_update_package(session=session)
+
+    assert resolved.download_url == "https://zip.example.com/update.zip"
+
+
+def test_build_frame_ajax_request_supports_current_ajaxfile_endpoint():
+    frame_html = """
+    <script>
+    var wp_sign = 'token-sign';
+    var ajaxdata = 'token-data';
+    var kdns = 0;
+    $.ajax({ url : '/ajaxfile.php?file=289803412' });
+    </script>
+    """
+
+    ajax_url, payload = update_sources._build_frame_ajax_request(
+        frame_html,
+        "https://liaotianbao.lanzouq.com/fn?token",
+    )
+
+    assert ajax_url == "https://liaotianbao.lanzouq.com/ajaxfile.php?file=289803412"
+    assert payload["kd"] == "0"
+    assert payload["sign"] == "token-sign"
 
 
 def test_full_package_download_page_url_matches_configured_manual_link():

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 
 
 def _load_mode_config(filename: str) -> dict:
-    path = Path(__file__).with_name(filename)
+    root = str(os.environ.get("JIXIEBI_PACKAGE_ROOT", "") or "").strip()
+    path = Path(root) / "apps" / "huanyou" / filename if root else Path(__file__).with_name(filename)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -16,6 +18,7 @@ def _load_mode_config(filename: str) -> dict:
 
 DIALOGUE_OCR_MODE = _load_mode_config("dialogue_ocr_config.json")
 LIST_OCR_MODE = _load_mode_config("list_ocr_config.json")
+LLM_DIALOGUE_CONFIG = _load_mode_config("dialogue_llm_config.json")
 
 
 # 聚合入口：保留旧导入路径不变。

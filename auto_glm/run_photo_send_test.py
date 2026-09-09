@@ -26,6 +26,7 @@ from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PHOTO_ROOT = ROOT / "photo"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if hasattr(sys.stdout, "reconfigure"):
@@ -123,9 +124,15 @@ def _xinyu_config() -> dict[str, Any]:
 def _capture(robot: RobotInterface, output_dir: Path, label: str, logger: TestLogger) -> Image.Image:
     target = output_dir / f"{label}.jpg"
     logger.info(f"截图：{label}")
-    image = Image.open(BytesIO(robot.get_transform_image(pre_move=True))).convert("RGB")
+    PHOTO_ROOT.mkdir(parents=True, exist_ok=True)
+    device_photo = PHOTO_ROOT / f"{str(robot.host).replace(':', '_')}.jpg"
+    image = Image.open(
+        BytesIO(robot.get_transform_image(pre_move=True, save_path=device_photo))
+    ).convert("RGB")
     image.save(target, quality=95)
-    logger.info(f"已保存截图：{target.name}，尺寸={image.width}x{image.height}")
+    logger.info(
+        f"已保存截图：{target.name}，设备当前图={device_photo}，尺寸={image.width}x{image.height}"
+    )
     return image
 
 

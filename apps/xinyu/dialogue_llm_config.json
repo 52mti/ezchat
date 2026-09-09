@@ -1,0 +1,18 @@
+{
+  "enabled": true,
+  "prompt_path": "apps/xinyu/dialogue_llm_prompt.txt",
+  "openrouter_url": "https://openrouter.ai/api/v1/chat/completions",
+  "openrouter_ensemble": {
+    "analysis_models": [
+      "z-ai/glm-5.3-flash",
+      "minimax/minimax-m3",
+      "x-ai/grok-4.6"
+    ],
+    "judge_model": "z-ai/glm-5.3-flash",
+    "parallel": true
+  },
+  "temperature": 0.1,
+  "max_tokens": 4096,
+  "timeout": 90,
+  "user_text": "请识别这张心遇聊天截图，只输出 JSON。"
+}

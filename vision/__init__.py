@@ -36,4 +36,10 @@ def screen_matches(*args, **kwargs):
 
     return _screen_matches(*args, **kwargs)
 
-__all__ = ["crop_region", "load_image", "match", "ocr", "run_ocr_mode", "screen_matches"]
+
+def get_ocr_queue_status():
+    from .ocr import get_ocr_queue_status as _get_ocr_queue_status
+
+    return _get_ocr_queue_status()
+
+__all__ = ["crop_region", "load_image", "match", "ocr", "run_ocr_mode", "screen_matches", "get_ocr_queue_status"]

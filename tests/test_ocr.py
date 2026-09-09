@@ -6,10 +6,12 @@ from concurrent.futures import ThreadPoolExecutor
 import importlib
 
 import numpy as np
+import pytest
 from PIL import Image
 
 ocr_module = importlib.import_module("vision.ocr")
 from vision.ocr import ocr
+from vision.screen import annotate_image_bytes, load_image
 
 
 class FakeEngine:
@@ -47,6 +49,34 @@ def test_ocr_returns_empty_without_backend():
     result = ocr(image, {})
 
     assert isinstance(result, list)
+
+
+def test_load_image_error_includes_file_path(tmp_path):
+    broken = tmp_path / "broken.jpg"
+    broken.write_bytes(b"\xff\xd8broken")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        load_image(broken)
+
+    message = str(exc_info.value)
+    assert "图片读取失败" in message
+    assert str(broken.resolve()) in message
+
+
+def test_load_image_error_includes_capture_source(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    image = annotate_image_bytes(b"\xff\xd8broken", "机械臂截图 device=192.168.5.4 app=huanyou label=after_bottom_nav_message")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        load_image(image)
+
+    message = str(exc_info.value)
+    assert "device=192.168.5.4" in message
+    assert "app=huanyou" in message
+    assert "label=after_bottom_nav_message" in message
+    assert "问题图片已保存=" in message
+    saved = list((tmp_path / "photo" / "errors").glob("image_load_failed_*.jpg"))
+    assert len(saved) == 1
 
 
 class FakePredictEngine:

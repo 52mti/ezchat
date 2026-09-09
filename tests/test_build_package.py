@@ -102,12 +102,14 @@ def test_write_customer_update_archive_excludes_full_runtimes_and_models(tmp_pat
     (package_root / "apps").mkdir(parents=True)
     (package_root / "runtime" / "app").mkdir(parents=True)
     (package_root / "runtime" / "ocr_cpu").mkdir(parents=True)
+    (package_root / "runtime" / "tts" / "piper").mkdir(parents=True)
     (package_root / "models" / "ocr" / "paddlex_named_models").mkdir(parents=True)
     (package_root / "main.py").write_text("print('ok')\n", encoding="utf-8")
     (package_root / build.LAUNCHER_EXE).write_bytes(b"binary")
     (package_root / "apps" / "config.json").write_text("{}", encoding="utf-8")
     (package_root / "runtime" / "app" / "python.exe").write_bytes(b"python")
     (package_root / "runtime" / "ocr_cpu" / "python.exe").write_bytes(b"python")
+    (package_root / "runtime" / "tts" / "piper" / "zh_CN-huayan-medium.onnx").write_bytes(b"piper")
     (package_root / "models" / "ocr" / "paddlex_named_models" / "demo.bin").write_bytes(b"model")
 
     archive_path = build._write_customer_update_archive(package_root, dist_root)
@@ -120,6 +122,7 @@ def test_write_customer_update_archive_excludes_full_runtimes_and_models(tmp_pat
     assert f"{build.PACKAGE_NAME}/{build.LAUNCHER_ALIAS_EXE}" not in names
     assert all(not name.startswith(f"{build.PACKAGE_NAME}/runtime/app/") for name in names)
     assert all(not name.startswith(f"{build.PACKAGE_NAME}/runtime/ocr_cpu/") for name in names)
+    assert all(not name.startswith(f"{build.PACKAGE_NAME}/runtime/tts/piper/") for name in names)
     assert all(not name.startswith(f"{build.PACKAGE_NAME}/models/ocr/") for name in names)
 
 

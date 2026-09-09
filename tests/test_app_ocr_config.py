@@ -105,6 +105,9 @@ def test_xinyu_owns_xinyu_list_layout_rules():
     assert "全部消息" in rules["system_keywords"]
 
 
+    assert rules["name_max_x_ratio"] == 0.8
+
+
 def test_huanyou_owns_points_ocr_mode():
     points_mode = HUANYOU_CONFIG["ocr_modes"]["points"]
 

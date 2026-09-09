@@ -74,6 +74,18 @@ _TEMPLATE_MATCH_CACHE: dict[tuple[Any, ...], dict[str, float] | None] = {}
 _TEMPLATE_MATCH_CACHE_LOCK = Lock()
 
 
+@dataclass(frozen=True)
+class TemplateMatchDiagnostic:
+    key: str
+    template_name: str
+    score: float | None
+    threshold: float
+    region: tuple[float, float, float, float] | None
+    channel: str
+    matched: bool
+    reason: str = ""
+
+
 class ScreenState(NamedTuple):
     name: str
     label: str
@@ -354,6 +366,46 @@ def template_match_region(config: dict[str, Any], key: str) -> tuple[float, floa
     return _coerce_region(regions.get(key))
 
 
+def expand_match_region(
+    region: tuple[float, float, float, float],
+    ratio: float,
+) -> tuple[float, float, float, float]:
+    if ratio <= 0.0:
+        return region
+    x, y, w, h = region
+    dx = w * ratio
+    dy = h * ratio
+    left = max(0.0, x - dx)
+    top = max(0.0, y - dy)
+    right = min(1.0, x + w + dx)
+    bottom = min(1.0, y + h + dy)
+    return left, top, max(0.0, right - left), max(0.0, bottom - top)
+
+
+def _match_region_expand_ratio(config: dict[str, Any], key: str) -> float:
+    raw_by_key = config.get("template_match_region_expand_ratios")
+    if isinstance(raw_by_key, dict) and key in raw_by_key:
+        try:
+            return max(0.0, min(0.2, float(raw_by_key[key])))
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return max(0.0, min(0.2, float(config.get("template_match_region_expand_ratio", 0.0))))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _match_region_for_key(config: dict[str, Any], key: str) -> tuple[float, float, float, float] | None:
+    if TEMPLATE_MATCH_REGIONS_CONFIG_KEY in config and isinstance(config.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY), dict):
+        if key in GLOBAL_MATCH_TEMPLATE_KEYS:
+            return None
+        region = _coerce_region(config[TEMPLATE_MATCH_REGIONS_CONFIG_KEY].get(key))
+        if region is None:
+            raise TemplateMatchRegionMissingError(key)
+        return expand_match_region(region, _match_region_expand_ratio(config, key))
+    return None
+
+
 def map_match_result_from_region(
     result: dict[str, float],
     region: tuple[float, float, float, float],
@@ -405,6 +457,147 @@ def _runtime_scope(config: dict[str, Any]) -> tuple[str, str]:
     return str(runtime.get("device_ip") or ""), str(runtime.get("app_name") or "")
 
 
+def _runtime_cache(config: dict[str, Any]) -> dict[str, Any]:
+    cache = config.setdefault("_runtime_cache", {})
+    if not isinstance(cache, dict):
+        cache = {}
+        config["_runtime_cache"] = cache
+    diagnostics = cache.setdefault("template_match_diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        cache["template_match_diagnostics"] = {}
+    return cache
+
+
+def _runtime_context(config: dict[str, Any]) -> dict[str, Any]:
+    runtime = config.get("_runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+        config["_runtime"] = runtime
+    return runtime
+
+
+def _append_runtime_path(runtime: dict[str, Any], key: str, path: str, *, limit: int = 10) -> None:
+    values = runtime.get(key)
+    if not isinstance(values, list):
+        values = []
+    path_text = str(path).strip()
+    if not path_text:
+        return
+    values = [item for item in values if str(item) != path_text]
+    values.append(path_text)
+    runtime[key] = values[-limit:]
+
+
+def _record_template_runtime_context(
+    config: dict[str, Any],
+    *,
+    key: str,
+    candidate_paths: list[Path] | None = None,
+    matched_path: Path | None = None,
+) -> None:
+    runtime = _runtime_context(config)
+    runtime["last_template_match_key"] = str(key)
+    if candidate_paths is not None:
+        runtime["last_template_paths"] = [str(path) for path in candidate_paths]
+    if matched_path is not None:
+        runtime["last_template_path"] = str(matched_path)
+        _append_runtime_path(runtime, "template_paths", str(matched_path))
+
+
+def _set_template_match_diagnostic(config: dict[str, Any], diagnostic: TemplateMatchDiagnostic) -> None:
+    diagnostics = _runtime_cache(config).setdefault("template_match_diagnostics", {})
+    if isinstance(diagnostics, dict):
+        diagnostics[diagnostic.key] = diagnostic
+
+
+def last_template_match_diagnostic(config: dict[str, Any], key: str) -> TemplateMatchDiagnostic | None:
+    cache = config.get("_runtime_cache", {})
+    if not isinstance(cache, dict):
+        return None
+    diagnostics = cache.get("template_match_diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        return None
+    value = diagnostics.get(key)
+    return value if isinstance(value, TemplateMatchDiagnostic) else None
+
+
+def format_template_match_diagnostic(config: dict[str, Any], key: str) -> str:
+    diagnostic = last_template_match_diagnostic(config, key)
+    if diagnostic is None:
+        return "最高候选：无"
+    region = (
+        "[" + ", ".join(f"{value:.3f}" for value in diagnostic.region) + "]"
+        if diagnostic.region is not None
+        else "全图"
+    )
+    score = "无" if diagnostic.score is None else f"{diagnostic.score:.3f}"
+    reason = f"，原因：{diagnostic.reason}" if diagnostic.reason else ""
+    return (
+        f"最高候选模板={diagnostic.template_name or '无'}，"
+        f"最高相似度={score}，阈值={diagnostic.threshold:.3f}，"
+        f"范围={region}，通道={diagnostic.channel or 'unknown'}{reason}"
+    )
+
+
+def _match_scales(config: dict[str, Any], key: str) -> tuple[float, ...]:
+    raw_by_key = config.get("template_match_scales_by_key")
+    raw: Any = None
+    if isinstance(raw_by_key, dict):
+        raw = raw_by_key.get(key)
+    if raw is None:
+        raw = config.get("template_match_scales", [0.92, 0.96, 1.0, 1.04, 1.08])
+    if not isinstance(raw, (list, tuple)):
+        raw = [raw]
+    values: list[float] = []
+    for value in raw:
+        try:
+            scale = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0.2 <= scale <= 3.0 and scale not in values:
+            values.append(scale)
+    return tuple(values or [1.0])
+
+
+def _match_channels(config: dict[str, Any], key: str) -> tuple[str, ...]:
+    raw_by_key = config.get("template_match_channels_by_key")
+    raw: Any = None
+    if isinstance(raw_by_key, dict):
+        raw = raw_by_key.get(key)
+    if raw is None:
+        raw = config.get("template_match_channels", ["gray_norm", "gray", "edge"])
+    if not isinstance(raw, (list, tuple)):
+        raw = [raw]
+    channels = [str(value) for value in raw if str(value) in {"bgr", "gray", "gray_norm", "edge"}]
+    return tuple(channels or ["gray"])
+
+
+def _effective_match_func(config: dict[str, Any], key: str, match_func: Any) -> tuple[Any, tuple[Any, ...]]:
+    if config.get("enable_enhanced_template_match", True) is False:
+        return match_func, ("basic",)
+    match_module = getattr(match_func, "__module__", "")
+    match_name = getattr(match_func, "__name__", "")
+    # Most app steps import the public lazy wrapper from ``vision``.  It is
+    # still the built-in matcher and must receive the configured enhanced
+    # channels instead of being mistaken for a caller-provided custom matcher.
+    if match_name != "match" or match_module not in {"vision", "vision.matcher"}:
+        return match_func, ("custom", id(match_func))
+    try:
+        from vision.matcher import match_enhanced
+    except (ImportError, ModuleNotFoundError):
+        # 更新覆盖过程中若仍加载到旧版视觉模块，模板测试至少可以使用基础匹配，
+        # 不应因增强匹配模块暂不可用而直接失败。
+        return match_func, ("basic-fallback",)
+
+    scales = _match_scales(config, key)
+    channels = _match_channels(config, key)
+
+    def enhanced(image: Any, template: Any, threshold: float = 0.85) -> dict[str, float] | None:
+        return match_enhanced(image, template, threshold=threshold, scales=scales, channels=channels)
+
+    return enhanced, ("enhanced", scales, channels)
+
+
 def _cached_template_match(cache_key: tuple[Any, ...]) -> dict[str, float] | None | object:
     with _TEMPLATE_MATCH_CACHE_LOCK:
         if cache_key not in _TEMPLATE_MATCH_CACHE:
@@ -429,15 +622,9 @@ def match_template_with_region(
     threshold: float,
     match_func: Any,
 ) -> dict[str, float] | None:
-    if TEMPLATE_MATCH_REGIONS_CONFIG_KEY in config and isinstance(config.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY), dict):
-        if key in GLOBAL_MATCH_TEMPLATE_KEYS:
-            return match_func(image, template, threshold=threshold)
-        regions = config[TEMPLATE_MATCH_REGIONS_CONFIG_KEY]
-        region = _coerce_region(regions.get(key))
-        if region is None:
-            raise TemplateMatchRegionMissingError(key)
-    else:
-        region = None
+    _record_template_runtime_context(config, key=key, candidate_paths=[template])
+    region = _match_region_for_key(config, key)
+    effective_match_func, strategy_key = _effective_match_func(config, key, match_func)
     if config.get("enable_template_match_cache", True) is not False:
         cache_key = (
             _runtime_scope(config),
@@ -446,7 +633,7 @@ def match_template_with_region(
             str(key),
             round(float(threshold), 4),
             tuple(round(float(value), 6) for value in region) if region is not None else None,
-            id(match_func),
+            strategy_key,
         )
         cached = _cached_template_match(cache_key)
         if cached is not ...:
@@ -454,11 +641,13 @@ def match_template_with_region(
     else:
         cache_key = None
     if region is None:
-        result = match_func(image, template, threshold=threshold)
+        result = effective_match_func(image, template, threshold=threshold)
         if cache_key is not None:
             _store_template_match(cache_key, result)
+        if result:
+            _record_template_runtime_context(config, key=key, matched_path=template)
         return result
-    result = match_func(crop_region(image, region), template, threshold=threshold)
+    result = effective_match_func(crop_region(image, region), template, threshold=threshold)
     if not result:
         if cache_key is not None:
             _store_template_match(cache_key, None)
@@ -466,7 +655,102 @@ def match_template_with_region(
     mapped = map_match_result_from_region(result, region)
     if cache_key is not None:
         _store_template_match(cache_key, mapped)
+    _record_template_runtime_context(config, key=key, matched_path=template)
     return mapped
+
+
+def match_template_candidates_with_region(
+    image: Any,
+    templates: list[Path],
+    config: dict[str, Any],
+    key: str,
+    *,
+    threshold: float,
+    match_func: Any,
+    single_match_func: Any | None = None,
+) -> dict[str, Any] | None:
+    region: tuple[float, float, float, float] | None = None
+    _record_template_runtime_context(config, key=key, candidate_paths=templates)
+    if not templates:
+        _set_template_match_diagnostic(
+            config,
+            TemplateMatchDiagnostic(
+                key=key,
+                template_name="",
+                score=None,
+                threshold=float(threshold),
+                region=region,
+                channel="",
+                matched=False,
+                reason="没有候选模板",
+            ),
+        )
+        return None
+    region = _match_region_for_key(config, key)
+    best: dict[str, Any] | None = None
+    best_path: Path | None = None
+    best_error = ""
+    run_single = single_match_func or match_template_with_region
+    probe_threshold = -1.0 if run_single is match_template_with_region else float(threshold)
+    for path in templates:
+        try:
+            result = run_single(
+                image,
+                path,
+                config,
+                key,
+                threshold=probe_threshold,
+                match_func=match_func,
+            )
+        except TemplateMatchRegionMissingError:
+            raise
+        except Exception as exc:
+            best_error = str(exc)
+            continue
+        if not result:
+            continue
+        score = float(result.get("score", threshold) if "score" in result else threshold)
+        if best is None or score > float(best.get("score", 0.0) or 0.0):
+            best = dict(result)
+            best["score"] = score
+            best_path = path
+    if best is None or best_path is None:
+        _set_template_match_diagnostic(
+            config,
+            TemplateMatchDiagnostic(
+                key=key,
+                template_name="",
+                score=None,
+                threshold=float(threshold),
+                region=region,
+                channel="",
+                matched=False,
+                reason=best_error or "全部模板无有效结果",
+            ),
+        )
+        return None
+    channel = str(best.get("channel") or "gray")
+    score = float(best.get("score", threshold) if "score" in best else threshold)
+    matched = score >= float(threshold)
+    best["_template_path"] = str(best_path)
+    best["_template_name"] = best_path.name
+    best["_template_threshold"] = float(threshold)
+    best["_template_region"] = region
+    best["_template_channel"] = channel
+    diagnostic = TemplateMatchDiagnostic(
+        key=key,
+        template_name=best_path.name,
+        score=score,
+        threshold=float(threshold),
+        region=region,
+        channel=channel,
+        matched=matched,
+    )
+    _set_template_match_diagnostic(config, diagnostic)
+    if not matched:
+        return None
+    _record_template_runtime_context(config, key=key, matched_path=best_path)
+    return best
 
 
 def popup_template_paths(config: dict[str, Any]) -> list[Path]:
@@ -510,6 +794,10 @@ def _template_variant_pattern(filename: str) -> tuple[str, str]:
     return stem, suffix
 
 
+CUSTOM_TEMPLATE_MARKER = "__customer"
+DEVELOPER_TEMPLATE_MARKER = "__developer"
+
+
 def _template_variant_sort_key(path: Path, base_filename: str) -> tuple[int, str]:
     base_stem, suffix = _template_variant_pattern(base_filename)
     if path.name == base_filename:
@@ -517,6 +805,13 @@ def _template_variant_sort_key(path: Path, base_filename: str) -> tuple[int, str
     match = re.fullmatch(rf"{re.escape(base_stem)}_(\d+){re.escape(suffix)}", path.name)
     if match:
         return (int(match.group(1)), path.name)
+    match = re.fullmatch(
+        rf"{re.escape(base_stem)}__(customer|developer)_(\d+){re.escape(suffix)}",
+        path.name,
+    )
+    if match:
+        # 旧的开发编号先保持原顺序，客户命名空间排在其后。
+        return (1000 + int(match.group(2)), path.name)
     return (9999, path.name)
 
 
@@ -527,25 +822,45 @@ def template_variant_paths(root: Path, filename: str) -> list[Path]:
     paths = [
         path
         for path in root.glob(f"{base_stem}*{suffix}")
-        if path.name == filename or re.fullmatch(rf"{re.escape(base_stem)}_\d+{re.escape(suffix)}", path.name)
+        if path.name == filename
+        or re.fullmatch(rf"{re.escape(base_stem)}_\d+{re.escape(suffix)}", path.name)
+        or re.fullmatch(
+            rf"{re.escape(base_stem)}__(?:customer|developer)_\d+{re.escape(suffix)}",
+            path.name,
+        )
     ]
     return sorted(paths, key=lambda path: _template_variant_sort_key(path, filename))
 
 
-def next_template_variant_path(root: Path, filename: str) -> Path:
+def next_template_variant_path(root: Path, filename: str, *, owner: str = "legacy") -> Path:
     first = root / filename
     if not first.exists():
         return first
     base_stem, suffix = _template_variant_pattern(filename)
-    index = 2
+    if owner not in {"customer", "developer"}:
+        index = 2
+        while True:
+            target = root / f"{base_stem}_{index}{suffix}"
+            if not target.exists():
+                return target
+            index += 1
+    marker = CUSTOM_TEMPLATE_MARKER if owner == "customer" else DEVELOPER_TEMPLATE_MARKER
+    index = 1
     while True:
-        target = root / f"{base_stem}_{index}{suffix}"
+        target = root / f"{base_stem}{marker}_{index}{suffix}"
         if not target.exists():
             return target
         index += 1
 
 
-def next_popup_template_path(buttons_dir: Path) -> Path:
+def next_popup_template_path(buttons_dir: Path, *, owner: str = "legacy") -> Path:
+    if owner == "customer":
+        index = 1
+        while True:
+            target = buttons_dir / f"popup_custom{CUSTOM_TEMPLATE_MARKER}_{index}.jpg"
+            if not target.exists():
+                return target
+            index += 1
     index = 1
     while True:
         target = buttons_dir / f"popup_custom_{index}.jpg"
@@ -554,7 +869,14 @@ def next_popup_template_path(buttons_dir: Path) -> Path:
         index += 1
 
 
-def next_back_button_template_path(buttons_dir: Path) -> Path:
+def next_back_button_template_path(buttons_dir: Path, *, owner: str = "legacy") -> Path:
+    if owner == "customer":
+        index = 1
+        while True:
+            target = buttons_dir / f"btn_返回按钮{CUSTOM_TEMPLATE_MARKER}_{index}.jpg"
+            if not target.exists():
+                return target
+            index += 1
     first = buttons_dir / "btn_返回按钮.jpg"
     if not first.exists():
         return first
@@ -571,21 +893,31 @@ def is_popup_template_name(filename: str) -> bool:
 
 
 def is_back_button_template_name(filename: str) -> bool:
-    return filename == "btn_返回按钮.jpg" or re.fullmatch(r"btn_返回按钮_\d+\.jpg", filename) is not None
+    return (
+        filename == "btn_返回按钮.jpg"
+        or re.fullmatch(r"btn_返回按钮_\d+\.jpg", filename) is not None
+        or re.fullmatch(r"btn_返回按钮__(?:customer|developer)_\d+\.jpg", filename) is not None
+    )
 
 
 def import_template_rules() -> tuple[TemplateRule | PopupTemplateRule, ...]:
     return (*FIXED_TEMPLATE_RULES, POPUP_TEMPLATE_RULE, BACK_BUTTON_TEMPLATE_RULE)
 
 
-def import_target_path(key: str, buttons_dir: Path, screens_dir: Path) -> Path:
+def import_target_path(
+    key: str,
+    buttons_dir: Path,
+    screens_dir: Path,
+    *,
+    owner: str = "legacy",
+) -> Path:
     if key == POPUP_TEMPLATE_RULE.key:
-        return next_popup_template_path(buttons_dir)
+        return next_popup_template_path(buttons_dir, owner=owner)
     if key == BACK_BUTTON_TEMPLATE_RULE.key:
-        return next_back_button_template_path(buttons_dir)
+        return next_back_button_template_path(buttons_dir, owner=owner)
     rule = template_rule(key)
     root = buttons_dir if rule.group == "buttons" else screens_dir
-    return next_template_variant_path(root, rule.filename)
+    return next_template_variant_path(root, rule.filename, owner=owner)
 
 
 def asset_rules_for_tool() -> dict[str, Any]:

@@ -88,6 +88,8 @@ class HuanyouApp(BaseApp):
             "huanyou_round_metrics",
             {
                 "ocr_count": int(metrics.get("ocr_count", 0) or 0),
+                "ocr_cache_hit_count": int(metrics.get("ocr_cache_hit_count", 0) or 0),
+                "detection_cache_hit_count": int(metrics.get("detection_cache_hit_count", 0) or 0),
                 "capture_count": int(metrics.get("capture_count", 0) or 0),
                 "seconds": round(time.monotonic() - started_at, 3),
                 "last_ocr": metrics.get("last_ocr"),
@@ -125,6 +127,13 @@ class HuanyouApp(BaseApp):
                 return
             if did_keep_awake:
                 self._mark_activity()
+
+    def _ensure_list_before_idle_maintenance(self, reporter: Callable[..., None]) -> bool:
+        image = steps.ensure_list_screen(self.robot, self.config, reporter=reporter)
+        if image is not None:
+            return True
+        reporter("idle_list_recover_failed", "未确认聊天列表，已尝试返回，本轮不进入防熄屏")
+        return False
 
     def _prepare_chat_window(
         self,
@@ -399,6 +408,10 @@ class HuanyouApp(BaseApp):
             if not target:
                 self.idle_waiting = True
                 reporter("empty_list_target", "暂无消息，进入防熄屏等待")
+                if not self._ensure_list_before_idle_maintenance(reporter):
+                    self._emit_round_metrics(round_started_at)
+                    self.mark_success()
+                    return
                 self._run_idle_maintenance(reporter)
                 self._emit_round_metrics(round_started_at)
                 self.mark_success()
@@ -430,7 +443,7 @@ class HuanyouApp(BaseApp):
             current_target = dict(target)
             chat_image, stopped_without_next, advanced_by_greetings = self._prepare_chat_window(reporter, expected_name=current_name)
             if stopped_without_next:
-                steps.go_back(self.robot, self.config, reporter=reporter)
+                steps.go_back(self.robot, self.config, reporter=reporter, force_click=True)
                 self._emit_round_metrics(round_started_at)
                 self.record_reply_round(time.monotonic() - round_started_at)
                 self.mark_success()
@@ -444,73 +457,132 @@ class HuanyouApp(BaseApp):
                 action = self._reply_to_message(reporter, message)
                 if action.skip:
                     reporter("skip_reply", "跳过本轮回复")
-                    steps.go_back(self.robot, self.config, reporter=reporter)
+                    steps.go_back(self.robot, self.config, reporter=reporter, force_click=True)
                     self._mark_activity()
                     self._emit_round_metrics(round_started_at)
                     self.mark_success()
                     return
                 input_box_opened = self._send_action(reporter, action, message)
 
-                try:
-                    chat_image, next_name, _next_clicks, next_name_point = self._advance_to_next_chat(
-                        reporter,
-                        current_name=current_name,
-                    )
-                except steps.StepUnavailable as exc:
-                    if "下一条按钮" not in str(exc):
-                        raise
-                    self.emit_runtime_log(
-                        "info",
-                        "huanyou_next_chat_missing",
-                        {"previous_name": current_name, "reason": str(exc)},
-                    )
-                    steps.go_back(self.robot, self.config, reporter=reporter, click_count=2)
-                    self._mark_activity()
-                    reporter("wait_next_round", "等待下一轮扫描")
-                    self._emit_round_metrics(round_started_at)
-                    self.record_reply_round(time.monotonic() - round_started_at)
-                    self.mark_success()
-                    return
+                while True:
+                    try:
+                        chat_image, next_name, _next_clicks, next_name_point = self._advance_to_next_chat(
+                            reporter,
+                            current_name=current_name,
+                        )
+                    except steps.StepUnavailable as exc:
+                        if "下一条按钮" not in str(exc):
+                            raise
+                        self.emit_runtime_log(
+                            "info",
+                            "huanyou_next_chat_missing",
+                            {"previous_name": current_name, "reason": str(exc)},
+                        )
+                        steps.go_back(self.robot, self.config, reporter=reporter, click_count=2, force_click=True)
+                        self._mark_activity()
+                        reporter("wait_next_round", "等待下一轮扫描")
+                        self._emit_round_metrics(round_started_at)
+                        self.record_reply_round(time.monotonic() - round_started_at)
+                        self.mark_success()
+                        return
 
-                prepare_image = chat_image
-                if input_box_opened:
-                    retract_x, retract_y = steps.retract_input_box(
-                        self.robot,
-                        self.config,
-                        reporter=reporter,
-                        click_point=next_name_point,
-                    )
-                    self.emit_runtime_log(
-                        "info",
-                        "huanyou_input_box_retracted",
-                        {"x": retract_x, "y": retract_y},
-                    )
-                    self._mark_activity()
-                    prepare_image = None
-                self._input_box_opened = False
+                    prepare_image = chat_image
+                    normalized_next = re.sub(r"\s+", "", str(next_name or "")).strip()
+                    next_name_unconfirmed = not normalized_next
+                    advanced_by_greetings = False
+                    stopped_without_next = False
 
-                normalized_next = re.sub(r"\s+", "", str(next_name or "")).strip()
-                if normalized_next:
-                    self._mark_recovered_progress()
-                    current_name = next_name
-                current_target = dict(current_target)
-                current_target["name"] = current_name
-                chat_image, stopped_without_next, advanced_by_greetings = self._prepare_chat_window(
-                    reporter,
-                    image=prepare_image,
-                    expected_name=None,
-                )
-                if stopped_without_next:
-                    steps.go_back(self.robot, self.config, reporter=reporter)
-                    self._mark_activity()
-                    reporter("wait_next_round", "等待下一轮扫描")
-                    self._emit_round_metrics(round_started_at)
-                    self.record_reply_round(time.monotonic() - round_started_at)
-                    self.mark_success()
-                    return
-                if advanced_by_greetings:
-                    current_name = steps.read_chat_contact_name(self.robot, self.config, image=chat_image, reporter=reporter) or current_name
+                    if next_name_unconfirmed:
+                        # The fast path only proves a new-greeting button was seen on the next screenshot.
+                        # Handle that screenshot before retracting the old input box; otherwise the button
+                        # position can become stale and the same contact may be processed again.
+                        chat_image, quick_greeting_count, stopped_without_next = steps.consume_new_greetings(
+                            self.robot,
+                            self.config,
+                            image=chat_image,
+                            expected_name=None,
+                            reporter=reporter,
+                        )
+                        if quick_greeting_count:
+                            self.emit_runtime_log("info", "huanyou_new_greetings", {"count": quick_greeting_count})
+                            self._mark_activity()
+                            prepare_image = chat_image
+                            advanced_by_greetings = True
+                            input_box_opened = False
+                        if stopped_without_next:
+                            steps.go_back(self.robot, self.config, reporter=reporter)
+                            self._mark_activity()
+                            reporter("wait_next_round", "等待下一轮扫描")
+                            self._emit_round_metrics(round_started_at)
+                            self.record_reply_round(time.monotonic() - round_started_at)
+                            self.mark_success()
+                            return
+
+                    if input_box_opened:
+                        retract_x, retract_y = steps.retract_input_box(
+                            self.robot,
+                            self.config,
+                            reporter=reporter,
+                            click_point=next_name_point,
+                        )
+                        self.emit_runtime_log(
+                            "info",
+                            "huanyou_input_box_retracted",
+                            {"x": retract_x, "y": retract_y},
+                        )
+                        self._mark_activity()
+                        prepare_image = None
+                    self._input_box_opened = False
+
+                    if next_name_unconfirmed and not advanced_by_greetings:
+                        verified_name = steps.read_chat_contact_name(
+                            self.robot,
+                            self.config,
+                            image=prepare_image,
+                            reporter=reporter,
+                        )
+                        normalized_verified = re.sub(r"\s+", "", str(verified_name or "")).strip()
+                        normalized_current = re.sub(r"\s+", "", str(current_name or "")).strip()
+                        if normalized_current and normalized_verified == normalized_current:
+                            reporter(
+                                "next_chat_unconfirmed_same_contact",
+                                "下一条未确认切人，仍是同一联系人，继续点击下一条",
+                                log_label=f"下一条未确认切人，仍是同一联系人：{current_name}",
+                            )
+                            input_box_opened = False
+                            continue
+                        if normalized_verified:
+                            next_name = verified_name
+                            normalized_next = normalized_verified
+                            self.emit_runtime_log(
+                                "info",
+                                "huanyou_next_chat_verified_after_retry",
+                                {"previous_name": current_name, "current_name": verified_name},
+                            )
+
+                    if normalized_next:
+                        self._mark_recovered_progress()
+                        current_name = next_name
+                    current_target = dict(current_target)
                     current_target["name"] = current_name
+                    chat_image, stopped_without_next, prepared_by_greetings = self._prepare_chat_window(
+                        reporter,
+                        image=prepare_image,
+                        expected_name=None,
+                    )
+                    advanced_by_greetings = advanced_by_greetings or prepared_by_greetings
+                    if stopped_without_next:
+                        steps.go_back(self.robot, self.config, reporter=reporter)
+                        self._mark_activity()
+                        reporter("wait_next_round", "等待下一轮扫描")
+                        self._emit_round_metrics(round_started_at)
+                        self.record_reply_round(time.monotonic() - round_started_at)
+                        self.mark_success()
+                        return
+                    if advanced_by_greetings:
+                        current_name = steps.read_chat_contact_name(self.robot, self.config, image=chat_image, reporter=reporter) or current_name
+                        current_target["name"] = current_name
+                    break
         except steps.NoPhoneScreenError as exc:
             self.set_runtime_step("no_phone_waiting", "无手机异常，停止进程")
             self.status.last_error = str(exc)

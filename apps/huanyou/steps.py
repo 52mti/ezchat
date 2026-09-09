@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
+import copy
 from decimal import Decimal, InvalidOperation
+import json
 import random
 import re
 import time
@@ -15,7 +17,9 @@ from apps.coordinates import click_image_point
 from apps.photo_capture import capture_transform_image
 from apps.reporting import Reporter, format_point, report_step
 from apps.step_timing import exclude_ocr_wait_from_step_timeout, step_deadline
-from apps.utils import tts_input
+from apps.utils import play_prepared_tts_input, prepare_tts_input
+from services.vision_dialogue_client import VisionDialogueClient, VisionDialogueError
+from services.coordinate_cache import persist_from_runtime
 from apps.visual_assets import (
     BACK_BUTTON,
     CHAT_AREA_REGION,
@@ -29,6 +33,8 @@ from apps.visual_assets import (
     popup_template_region_key,
     popup_template_paths,
     region_rule,
+    format_template_match_diagnostic,
+    match_template_candidates_with_region,
     match_template_with_region,
     template_match_region,
     screen_state_path,
@@ -37,7 +43,7 @@ from apps.visual_assets import (
     template_root,
 )
 from vision import match, run_ocr_mode
-from vision.screen import crop_region, load_image
+from vision.screen import crop_region, ensure_portrait_image, load_image
 
 from .config import DEFAULT_CONFIG
 
@@ -73,6 +79,7 @@ INPUT_BOX_RETRACT_CENTER = (0.5, 0.3)
 INPUT_BOX_RETRACT_JITTER = 0.02
 INPUT_BOX_RETRACT_DELAY_SECONDS = 0.3
 INPUT_BOX_FOCUS_SETTLE_SECONDS = 0.8
+_DIALOGUE_LLM_CLIENT = VisionDialogueClient()
 
 SCREEN_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
     CHAT_LIST_SCREEN: ("screen_聊天列表.jpg", "chat_list.jpg", "screen_message_list.jpg"),
@@ -159,6 +166,8 @@ def _cache_set(config: dict[str, Any], section: str, key: str, value: Any) -> No
     target = _runtime_cache(config).setdefault(section, {})
     if isinstance(target, dict):
         target[key] = value
+        if section in ("template_points", "screen_anchors", "ocr_regions"):
+            persist_from_runtime(config)
 
 
 def _cache_pop(config: dict[str, Any], section: str, key: str) -> None:
@@ -244,17 +253,206 @@ def _step_timeout(config: dict[str, Any]) -> float:
     return float(config.get("step_timeout", 10))
 
 
-def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = None) -> dict[str, Any]:
-    started_at = time.monotonic()
-    with exclude_ocr_wait_from_step_timeout(config):
-        result = run_ocr_mode(image, config, mode, region=region)
+def _json_cache_fragment(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        return repr(value)
+
+
+def _path_signature(path: Path) -> tuple[str, int, int]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return str(path), 0, 0
+    return str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size)
+
+
+def _configured_template_region(config: dict[str, Any], key: str) -> Any:
+    regions = config.get("template_match_regions", {})
+    if not isinstance(regions, dict):
+        return None
+    return regions.get(key)
+
+
+def _screenshot_reuse_signature(image: Any, region: Any = None) -> tuple[tuple[int, int], np.ndarray] | None:
+    try:
+        portrait = ensure_portrait_image(image).convert("L")
+    except Exception:
+        return None
+    if isinstance(region, (list, tuple)) and len(region) == 4:
+        x, y, w, h = (float(region[0]), float(region[1]), float(region[2]), float(region[3]))
+        width, height = portrait.size
+        left = int(max(0.0, min(1.0, x)) * width)
+        top = int(max(0.0, min(1.0, y)) * height)
+        right = int(max(0.0, min(1.0, x + w)) * width)
+        bottom = int(max(0.0, min(1.0, y + h)) * height)
+        if right > left and bottom > top:
+            portrait = portrait.crop((left, top, right, bottom))
+    # 直接保留竖屏原图灰度数据，避免中间区域的新消息在缩略图中被压掉。
+    return portrait.size, np.array(portrait, dtype=np.uint8)
+
+
+def _same_screenshot_signature(
+    current: tuple[tuple[int, int], np.ndarray] | None,
+    previous: tuple[tuple[int, int], np.ndarray] | None,
+    config: dict[str, Any],
+) -> bool:
+    if current is None or previous is None:
+        return False
+    current_size, current_thumb = current
+    previous_size, previous_thumb = previous
+    if current_size != previous_size or current_thumb.shape != previous_thumb.shape:
+        return False
+    diff = np.abs(current_thumb.astype(np.int16) - previous_thumb.astype(np.int16))
+    mean_threshold = float(config.get("ocr_reuse_image_mean_threshold", 0.5) or 0.5)
+    if float(diff.mean()) > mean_threshold:
+        return False
+    pixel_threshold = int(config.get("ocr_reuse_image_pixel_threshold", 5) or 5)
+    ratio_threshold = float(config.get("ocr_reuse_image_ratio_threshold", 0.001) or 0.001)
+    changed_ratio = float((diff > pixel_threshold).mean())
+    return changed_ratio <= ratio_threshold
+
+
+def _ocr_reuse_key(config: dict[str, Any], mode: str, region: Any) -> str:
+    base_ocr = dict(config.get("ocr", {}) if isinstance(config.get("ocr"), dict) else {})
+    base_ocr.pop("engine", None)
+    mode_config = {}
+    ocr_modes = config.get("ocr_modes", {})
+    if isinstance(ocr_modes, dict) and isinstance(ocr_modes.get(mode), dict):
+        mode_config = ocr_modes.get(mode, {})
+    runtime = config.get("_runtime", {}) if isinstance(config.get("_runtime"), dict) else {}
+    return "|".join(
+        (
+            str(runtime.get("device_ip", "")),
+            str(runtime.get("app_name", "")),
+            mode,
+            _json_cache_fragment(region),
+            _json_cache_fragment(base_ocr),
+            _json_cache_fragment(mode_config),
+        )
+    )
+
+
+def _reused_ocr_result(
+    config: dict[str, Any],
+    *,
+    key: str,
+    signature: tuple[tuple[int, int], np.ndarray] | None,
+) -> dict[str, Any] | None:
+    if not _optimization_enabled(config, "enable_screenshot_ocr_reuse"):
+        return None
+    reuse_cache = _runtime_cache(config).get("ocr_result_reuse", {})
+    if not isinstance(reuse_cache, dict):
+        return None
+    cached = reuse_cache.get(key)
+    if not isinstance(cached, dict):
+        return None
+    if not _same_screenshot_signature(signature, cached.get("signature"), config):
+        return None
+    result = copy.deepcopy(cached.get("result"))
+    if not isinstance(result, dict):
+        return None
+    result["_cache_hit"] = True
+    result["_cache_source"] = "huanyou_screenshot_ocr_reuse"
+    return result
+
+
+def _store_ocr_reuse_result(
+    config: dict[str, Any],
+    *,
+    key: str,
+    signature: tuple[tuple[int, int], np.ndarray] | None,
+    result: dict[str, Any],
+) -> None:
+    if not _optimization_enabled(config, "enable_screenshot_ocr_reuse") or signature is None:
+        return
+    cache = _runtime_cache(config)
+    reuse_cache = cache.setdefault("ocr_result_reuse", {})
+    if not isinstance(reuse_cache, dict):
+        reuse_cache = {}
+        cache["ocr_result_reuse"] = reuse_cache
+    if len(reuse_cache) >= 16 and key not in reuse_cache:
+        reuse_cache.clear()
+    stored = copy.deepcopy(result)
+    stored.pop("_cache_hit", None)
+    stored.pop("_cache_source", None)
+    reuse_cache[key] = {"signature": signature, "result": stored}
+
+
+def _reused_detection_result(
+    config: dict[str, Any],
+    *,
+    key: str,
+    signature: tuple[tuple[int, int], np.ndarray] | None,
+) -> Any:
+    if not _optimization_enabled(config, "enable_screenshot_detection_reuse"):
+        return ...
+    reuse_cache = _runtime_cache(config).get("detection_result_reuse", {})
+    if not isinstance(reuse_cache, dict):
+        return ...
+    cached = reuse_cache.get(key)
+    if not isinstance(cached, dict):
+        return ...
+    if not _same_screenshot_signature(signature, cached.get("signature"), config):
+        return ...
     metrics = _runtime_cache(config).get("metrics", {})
     if isinstance(metrics, dict):
-        metrics["ocr_count"] = int(metrics.get("ocr_count", 0) or 0) + 1
+        metrics["detection_cache_hit_count"] = int(metrics.get("detection_cache_hit_count", 0) or 0) + 1
+    return copy.deepcopy(cached.get("result"))
+
+
+def _store_detection_result(
+    config: dict[str, Any],
+    *,
+    key: str,
+    signature: tuple[tuple[int, int], np.ndarray] | None,
+    result: Any,
+) -> None:
+    if not _optimization_enabled(config, "enable_screenshot_detection_reuse") or signature is None:
+        return
+    cache = _runtime_cache(config)
+    reuse_cache = cache.setdefault("detection_result_reuse", {})
+    if not isinstance(reuse_cache, dict):
+        reuse_cache = {}
+        cache["detection_result_reuse"] = reuse_cache
+    if len(reuse_cache) >= 128 and key not in reuse_cache:
+        reuse_cache.clear()
+    reuse_cache[key] = {"signature": signature, "result": copy.deepcopy(result)}
+
+
+def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = None) -> dict[str, Any]:
+    started_at = time.monotonic()
+    signature = _screenshot_reuse_signature(image, region)
+    reuse_key = _ocr_reuse_key(config, mode, region)
+    reused = _reused_ocr_result(config, key=reuse_key, signature=signature)
+    if reused is not None:
+        metrics = _runtime_cache(config).get("metrics", {})
+        if isinstance(metrics, dict):
+            metrics["ocr_cache_hit_count"] = int(metrics.get("ocr_cache_hit_count", 0) or 0) + 1
+            metrics["last_ocr"] = {
+                "mode": mode,
+                "region": region,
+                "seconds": round(time.monotonic() - started_at, 4),
+                "cache_hit": True,
+                "cache_source": reused.get("_cache_source", ""),
+            }
+        return reused
+    with exclude_ocr_wait_from_step_timeout(config):
+        result = run_ocr_mode(image, config, mode, region=region)
+    _store_ocr_reuse_result(config, key=reuse_key, signature=signature, result=result)
+    metrics = _runtime_cache(config).get("metrics", {})
+    if isinstance(metrics, dict):
+        if result.get("_cache_hit"):
+            metrics["ocr_cache_hit_count"] = int(metrics.get("ocr_cache_hit_count", 0) or 0) + 1
+        else:
+            metrics["ocr_count"] = int(metrics.get("ocr_count", 0) or 0) + 1
         metrics["last_ocr"] = {
             "mode": mode,
             "region": region,
             "seconds": round(time.monotonic() - started_at, 4),
+            "cache_hit": bool(result.get("_cache_hit")),
+            "cache_source": result.get("_cache_source", ""),
         }
     return result
 
@@ -326,22 +524,40 @@ def _template_names(config: dict[str, Any], key: str, *, group: str) -> str:
 
 def _template_miss_message(config: dict[str, Any], key: str, *, group: str, action: str = "匹配") -> str:
     label = TEMPLATE_LABELS.get(key, key)
-    return f"{action}失败：没有匹配到{label}，已尝试图片：{_template_names(config, key, group=group)}"
+    return (
+        f"{action}失败：没有匹配到{label}，已尝试图片：{_template_names(config, key, group=group)}；"
+        f"{format_template_match_diagnostic(config, key)}"
+    )
 
 
 def _match_any(image: Any, paths: list[Path], config: dict[str, Any], key: str) -> dict[str, float] | None:
-    for path in paths:
-        result = match_template_with_region(
-            image,
-            path,
-            config,
+    threshold = _threshold(config, key)
+    cache_key = "|".join(
+        (
+            "template_candidates",
             key,
-            threshold=_threshold(config, key),
-            match_func=match,
+            str(round(float(threshold), 4)),
+            _json_cache_fragment([_path_signature(path) for path in paths]),
+            _json_cache_fragment(_configured_template_region(config, key)),
+            _json_cache_fragment(config.get("template_match_scales")),
+            _json_cache_fragment(config.get("template_match_channels")),
         )
-        if result:
-            return result
-    return None
+    )
+    signature = _screenshot_reuse_signature(image)
+    cached = _reused_detection_result(config, key=cache_key, signature=signature)
+    if cached is not ...:
+        return cached
+    result = match_template_candidates_with_region(
+        image,
+        paths,
+        config,
+        key,
+        threshold=threshold,
+        match_func=match,
+        single_match_func=match_template_with_region,
+    )
+    _store_detection_result(config, key=cache_key, signature=signature, result=result)
+    return result
 
 
 def _match_any_with_path(
@@ -350,18 +566,11 @@ def _match_any_with_path(
     config: dict[str, Any],
     key: str,
 ) -> tuple[dict[str, float], Path] | None:
-    for path in paths:
-        result = match_template_with_region(
-            image,
-            path,
-            config,
-            key,
-            threshold=_threshold(config, key),
-            match_func=match,
-        )
-        if result:
-            return result, path
-    return None
+    result = _match_any(image, paths, config, key)
+    if not result:
+        return None
+    path_text = str(result.get("_template_path") or "")
+    return result, Path(path_text) if path_text else Path(str(result.get("_template_name") or ""))
 
 
 def _template_match(image: Any, config: dict[str, Any], key: str, *, group: str) -> dict[str, float] | None:
@@ -440,11 +649,15 @@ def _chat_list_title_region(config: dict[str, Any]) -> tuple[float, float, float
 
 
 def _cache_chat_list_title_from_ocr(config: dict[str, Any], ocr_result: dict[str, Any]) -> bool:
-    found = False
+    normalized_items: list[tuple[dict[str, Any], str]] = []
     for item in ocr_result.get("ocr_items", []):
         if not isinstance(item, dict):
             continue
         text = _normalize_text(item.get("text") or item.get("raw_text"))
+        if text:
+            normalized_items.append((item, text))
+
+    for item, text in normalized_items:
         if "消息关系" not in text:
             continue
         x = float(item.get("x", 0.0) or 0.0)
@@ -453,8 +666,22 @@ def _cache_chat_list_title_from_ocr(config: dict[str, Any], ocr_result: dict[str
         h = float(item.get("h", 0.0) or 0.0)
         _cache_set(config, "screen_anchors", "chat_list_title", (x + w / 2, y + h / 2))
         _cache_set(config, "ocr_regions", "chat_list_title_bottom", y + h)
-        found = True
-    return found
+        return True
+
+    combined = "".join(text for _item, text in normalized_items)
+    if "消息关系" not in combined and not ("消息" in combined and "关系" in combined):
+        return False
+
+    matched_items = [item for item, text in normalized_items if "消息" in text or "关系" in text]
+    if not matched_items:
+        return False
+    left = min(float(item.get("x", 0.0) or 0.0) for item in matched_items)
+    right = max(float(item.get("x", 0.0) or 0.0) + float(item.get("w", 0.0) or 0.0) for item in matched_items)
+    top = min(float(item.get("y", 0.0) or 0.0) for item in matched_items)
+    bottom = max(float(item.get("y", 0.0) or 0.0) + float(item.get("h", 0.0) or 0.0) for item in matched_items)
+    _cache_set(config, "screen_anchors", "chat_list_title", ((left + right) / 2, (top + bottom) / 2))
+    _cache_set(config, "ocr_regions", "chat_list_title_bottom", bottom)
+    return True
 
 
 def _matches_chat_list_screen(
@@ -464,8 +691,6 @@ def _matches_chat_list_screen(
 ) -> bool:
     if _matches_screen(image, config, CHAT_LIST_SCREEN):
         return True
-    if not _optimization_enabled(config, "enable_bottom_message_recovery"):
-        return False
     region = _chat_list_title_region(config)
     if region is None:
         return False
@@ -551,6 +776,9 @@ def _cache_bottom_nav_from_ocr_result(config: dict[str, Any], ocr_result: dict[s
     my_item = _bottom_nav_item(bottom_nav, ("我的",), min_center_y=0.5)
     if my_item is not None:
         _cache_set(config, "screen_anchors", "bottom_my", my_item[1])
+    elif message is not None:
+        message_x, message_y = message[1]
+        _cache_set(config, "screen_anchors", "bottom_my", (min(0.98, message_x + 0.2), message_y))
     bounds_list = [
         item.get("bounds")
         for item in bottom_nav
@@ -590,7 +818,7 @@ def _click_cached_bottom_nav(
             reporter,
             step,
             label,
-            log_label=f"{label}{index + 1}/{total}（缓存）：{format_point(*point)}",
+            log_label=f"使用缓存坐标：{label}{index + 1}/{total} {format_point(*point)}，来源=bottom_nav",
         )
         click_image_point(robot, *point)
         time.sleep(0.15)
@@ -672,14 +900,31 @@ def _click_back_match(
 
 
 def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> dict[str, float] | None:
-    result = match_template_with_region(
-        image,
-        popup_template,
-        config,
-        popup_template_region_key(popup_template),
-        threshold=_popup_threshold(config, popup_template_region_key(popup_template)),
-        match_func=match,
+    region_key = popup_template_region_key(popup_template)
+    threshold = _popup_threshold(config, region_key)
+    cache_key = "|".join(
+        (
+            "template_single",
+            region_key,
+            _json_cache_fragment(_path_signature(popup_template)),
+            str(round(float(threshold), 4)),
+            _json_cache_fragment(_configured_template_region(config, region_key)),
+        )
     )
+    signature = _screenshot_reuse_signature(image)
+    cached = _reused_detection_result(config, key=cache_key, signature=signature)
+    if cached is not ...:
+        result = cached
+    else:
+        result = match_template_with_region(
+            image,
+            popup_template,
+            config,
+            region_key,
+            threshold=threshold,
+            match_func=match,
+        )
+        _store_detection_result(config, key=cache_key, signature=signature, result=result)
     if not result:
         return None
     max_x = float(config.get("popup_max_x", POPUP_MAX_X) or POPUP_MAX_X)
@@ -688,16 +933,44 @@ def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> di
     return result
 
 
+def _single_template_match(
+    image: Any,
+    template: Path,
+    config: dict[str, Any],
+    key: str,
+    *,
+    threshold: float,
+) -> dict[str, float] | None:
+    cache_key = "|".join(
+        (
+            "template_single",
+            key,
+            _json_cache_fragment(_path_signature(template)),
+            str(round(float(threshold), 4)),
+            _json_cache_fragment(_configured_template_region(config, key)),
+            _json_cache_fragment(config.get("template_match_scales")),
+            _json_cache_fragment(config.get("template_match_channels")),
+        )
+    )
+    signature = _screenshot_reuse_signature(image)
+    cached = _reused_detection_result(config, key=cache_key, signature=signature)
+    if cached is not ...:
+        return cached
+    result = match_template_with_region(
+        image,
+        template,
+        config,
+        key,
+        threshold=threshold,
+        match_func=match,
+    )
+    _store_detection_result(config, key=cache_key, signature=signature, result=result)
+    return result
+
+
 def current_screen(image: Any, config: dict[str, Any]) -> str:
     for state in all_screen_states(config):
-        if match_template_with_region(
-            image,
-            state.path,
-            config,
-            state.name,
-            threshold=_threshold(config, state.name),
-            match_func=match,
-        ):
+        if _single_template_match(image, state.path, config, state.name, threshold=_threshold(config, state.name)):
             return state.name
     if _matches_chat_list_screen(image, config):
         return CHAT_LIST_SCREEN
@@ -816,7 +1089,8 @@ def _click_back_once(
     cached = _cache_get(config, "template_points", "back")
     if isinstance(cached, (list, tuple)) and len(cached) == 2:
         point = (float(cached[0]), float(cached[1]))
-        _report(reporter, "return_to_list", "点击返回", log_label=f"点击返回（缓存）：{format_point(*point)}")
+        _report(reporter, "return_to_list", "使用缓存坐标", log_label=f"使用缓存坐标：返回按钮 {format_point(*point)}")
+        _report(reporter, "return_to_list", "点击返回", log_label=f"点击返回：{format_point(*point)}")
         click_image_point(robot, *point)
         time.sleep(0.4)
         return True
@@ -825,6 +1099,15 @@ def _click_back_once(
         _report(reporter, "return_to_list", "返回按钮未找到")
         return False
     _cache_set(config, "template_points", "back", (matched[0], matched[1]))
+    _report(
+        reporter,
+        "return_to_list",
+        "刷新缓存坐标",
+        log_label=(
+            f"刷新缓存坐标：返回按钮 {format_point(matched[0], matched[1])}；"
+            f"{format_template_match_diagnostic(config, BACK_BUTTON)}"
+        ),
+    )
     _click_back_match(robot, matched, click_count=1, reporter=reporter)
     return True
 
@@ -896,15 +1179,18 @@ def ensure_list_screen(
     config: dict[str, Any] | None = None,
     reporter: Reporter | None = None,
     image: Any | None = None,
+    *,
+    allow_unknown_back: bool = True,
 ) -> Any | None:
     cfg = _config(config)
-    _report(reporter, "screen_detect", "确认欢友聊天列表")
+    _report(reporter, "screen_detect", "检查欢友聊天列表")
     if image is None:
         image = capture_after_popups(robot, cfg, label="confirm_list", reporter=reporter)
     else:
         image = capture_after_popups(robot, cfg, label="confirm_list", image=image, reporter=reporter)
     _raise_if_abnormal_screen(image, cfg)
     if _matches_chat_list_screen(image, cfg, reporter=reporter):
+        _report(reporter, "screen_detect", "已确认欢友聊天列表")
         return image
 
     if _matches_screen(image, cfg, CHAT_WINDOW_SCREEN):
@@ -914,6 +1200,7 @@ def ensure_list_screen(
         image = capture_after_popups(robot, cfg, label="after_return_from_chat", reporter=reporter)
         _raise_if_abnormal_screen(image, cfg)
         if _matches_chat_list_screen(image, cfg, reporter=reporter):
+            _report(reporter, "screen_detect", "已确认欢友聊天列表")
             return image
 
     recovered = _recover_by_cached_bottom_message(robot, cfg, image, reporter=reporter)
@@ -927,7 +1214,12 @@ def ensure_list_screen(
         image = capture_after_popups(robot, cfg, label="after_return_from_my", reporter=reporter)
         _raise_if_abnormal_screen(image, cfg)
         if _matches_chat_list_screen(image, cfg, reporter=reporter):
+            _report(reporter, "screen_detect", "已确认欢友聊天列表")
             return image
+
+    if not allow_unknown_back:
+        _report(reporter, "unknown_screen_recover", "列表未确认，空闲复扫跳过返回")
+        return None
 
     _report(reporter, "unknown_screen_recover", "未知界面，点击返回恢复")
     if not _click_back_once(robot, cfg, image, reporter=reporter):
@@ -936,6 +1228,7 @@ def ensure_list_screen(
     image = capture_after_popups(robot, cfg, label="after_unknown_back", reporter=reporter)
     _raise_if_abnormal_screen(image, cfg)
     if _matches_chat_list_screen(image, cfg, reporter=reporter):
+        _report(reporter, "screen_detect", "已确认欢友聊天列表")
         return image
     return None
 
@@ -1012,7 +1305,6 @@ def find_unread_target(
         time.sleep(0.3)
         image = capture_after_popups(robot, cfg, label="after_cached_bottom_nav_message", reporter=reporter)
         if _matches_chat_list_screen(image, cfg, reporter=reporter):
-            _report(reporter, "chat_list_ocr", "列表 OCR 扫描")
             ocr_result = run_unread_list_ocr(image, cfg, reporter=reporter)
             return _select_unread_target_from_ocr_result(ocr_result, cfg, reporter=reporter)
         _cache_pop(cfg, "screen_anchors", "bottom_message")
@@ -1020,13 +1312,11 @@ def find_unread_target(
         if image is None:
             return None
 
-    _report(reporter, "chat_list_ocr", "列表 OCR 扫描")
     ocr_result = run_unread_list_ocr(image, cfg, reporter=reporter)
     clicked_bottom_nav = _click_bottom_nav_message(robot, ocr_result, cfg, reporter=reporter)
     if clicked_bottom_nav:
         time.sleep(0.3)
         image = capture_after_popups(robot, cfg, label="after_bottom_nav_message", reporter=reporter)
-        _report(reporter, "chat_list_ocr", "列表 OCR 复扫")
         ocr_result = run_unread_list_ocr(image, cfg, reporter=reporter)
 
     return _select_unread_target_from_ocr_result(ocr_result, cfg, reporter=reporter)
@@ -1041,14 +1331,23 @@ def run_unread_list_ocr(
     _ensure_chat_list_title_cache(image, cfg, reporter=reporter)
     compact_region = _compact_list_region(cfg)
     if compact_region is not None:
-        _report(reporter, "chat_list_ocr_region", "使用列表主体小范围 OCR")
         ocr_result = _run_ocr_mode(image, cfg, "list", region=compact_region)
+        _report(
+            reporter,
+            "chat_list_ocr_region",
+            "复用列表主体小范围 OCR 结果" if ocr_result.get("_cache_hit") else "使用列表主体小范围 OCR",
+        )
         rows = ocr_result.get("result", {}).get("message_list", [])
         if isinstance(rows, list) and rows:
             _cache_bottom_nav_from_ocr_result(cfg, ocr_result)
             return ocr_result
         _report(reporter, "chat_list_ocr_region", "列表主体无有效行，回退完整 OCR")
     ocr_result = _run_ocr_mode(image, cfg, "list", region=_region(cfg, MESSAGE_LIST_REGION))
+    _report(
+        reporter,
+        "chat_list_ocr",
+        "复用上一轮 list OCR 结果" if ocr_result.get("_cache_hit") else "列表 OCR 扫描",
+    )
     _cache_bottom_nav_from_ocr_result(cfg, ocr_result)
     return ocr_result
 
@@ -1109,9 +1408,9 @@ def rescan_unread_target(
     cfg = _config(config)
     _report(reporter, "chat_list_ocr", "列表 OCR 复扫")
     if image is None:
-        image = ensure_list_screen(robot, cfg, reporter=reporter)
+        image = ensure_list_screen(robot, cfg, reporter=reporter, allow_unknown_back=False)
     else:
-        image = ensure_list_screen(robot, cfg, reporter=reporter, image=image)
+        image = ensure_list_screen(robot, cfg, reporter=reporter, image=image, allow_unknown_back=False)
     if image is None:
         return None
     ocr_result = run_unread_list_ocr(image, cfg, reporter=reporter)
@@ -1135,10 +1434,6 @@ def read_my_points(
     reporter: Reporter | None = None,
 ) -> str | None:
     cfg = _config(config)
-    image = ensure_list_screen(robot, cfg, reporter=reporter)
-    if image is None:
-        return None
-
     _report(reporter, "points_open_my", "打开我的界面")
     list_ocr_result: dict[str, Any] | None = None
     clicked_my = _click_cached_bottom_nav(
@@ -1150,6 +1445,9 @@ def read_my_points(
         label="打开我的界面",
     )
     if not clicked_my:
+        image = ensure_list_screen(robot, cfg, reporter=reporter)
+        if image is None:
+            return None
         list_ocr_result = _run_ocr_mode(image, cfg, "list", region=_region(cfg, MESSAGE_LIST_REGION))
         _cache_bottom_nav_from_ocr_result(cfg, list_ocr_result)
         clicked_my = _click_bottom_nav_item(
@@ -1224,7 +1522,7 @@ def keep_screen_awake(
     reporter: Reporter | None = None,
 ) -> bool:
     cfg = _config(config)
-    image = ensure_list_screen(robot, cfg, reporter=reporter)
+    image = ensure_list_screen(robot, cfg, reporter=reporter, allow_unknown_back=False)
     if image is None:
         return False
 
@@ -1623,6 +1921,49 @@ def _extract_message_from_dialogue_ocr(
     }, bool(content)
 
 
+def _dialogue_engine(config: dict[str, Any]) -> str:
+    return str(config.get("dialogue_engine", "ocr") or "ocr").strip().lower()
+
+
+def _extract_message_from_dialogue_llm(
+    llm_result: dict[str, Any],
+    config: dict[str, Any],
+    target: dict[str, Any] | None,
+) -> tuple[dict[str, str], bool]:
+    messages = llm_result.get("messages", [])
+    if not isinstance(messages, list):
+        messages = []
+    target_sender = str(config["ocr_modes"]["dialogue"]["rules"]["target_sender"])
+    trailing_target_messages: list[str] = []
+    for item in reversed(messages):
+        if not isinstance(item, dict):
+            continue
+        sender = str(item.get("sender", "")).strip()
+        content = str(item.get("content", "") or "").strip()
+        if not content:
+            continue
+        if sender == target_sender:
+            trailing_target_messages.append(content)
+            continue
+        if trailing_target_messages:
+            break
+    fallback_contact = str(target.get("name", "")) if isinstance(target, dict) else ""
+    senders = llm_result.get("senders", {})
+    sender1_info = senders.get("sender1", {}) if isinstance(senders, dict) else {}
+    alias = str(sender1_info.get("alias", "") if isinstance(sender1_info, dict) else "").strip()
+    contact = fallback_contact or alias or str(llm_result.get("chat_title", "") or "").strip()
+    content = "".join(reversed(trailing_target_messages))
+    return {
+        "user": contact,
+        "contact": contact,
+        "content": content,
+        "sender": target_sender,
+        "message_time": "",
+        "unread_count": str(target.get("unread_count", "")) if isinstance(target, dict) else "",
+        "favorability": str(target.get("favorability", "")) if isinstance(target, dict) else "",
+    }, bool(content)
+
+
 def read_message(
     robot: Any,
     config: dict[str, Any] | None = None,
@@ -1632,6 +1973,38 @@ def read_message(
 ) -> dict[str, str]:
     cfg = _config(config)
     current_image = image if image is not None else confirm_chat_window(robot, cfg, reporter=reporter)
+    if _dialogue_engine(cfg) == "llm_vision":
+        _report(reporter, "dialogue_llm_read", "聊天详情视觉识别")
+        try:
+            with exclude_ocr_wait_from_step_timeout(cfg):
+                llm_reply = _DIALOGUE_LLM_CLIENT.parse_dialogue(current_image, cfg)
+        except (VisionDialogueError, RuntimeError) as exc:
+            _report(
+                reporter,
+                "dialogue_llm_error",
+                "视觉识别失败，回退本地 OCR",
+                log_label=f"视觉识别失败，回退本地 OCR：{exc}",
+            )
+        else:
+            message, has_target_content = _extract_message_from_dialogue_llm(llm_reply.payload, cfg, target)
+            if llm_reply.payload.get("messages"):
+                _report(
+                    reporter,
+                    "dialogue_llm_provider",
+                    f"视觉识别通道：{llm_reply.provider}",
+                    log_label=f"视觉识别通道：{llm_reply.provider}，模型={llm_reply.model}",
+                )
+                if not has_target_content:
+                    target_sender = str(cfg["ocr_modes"]["dialogue"]["rules"]["target_sender"])
+                    message["content"] = "你好"
+                    _report(
+                        reporter,
+                        "dialogue_llm_fallback",
+                        "未识别到对方消息，按“你好”处理",
+                        log_label=f"未识别到对方消息，按“你好”处理：目标 sender={target_sender}",
+                    )
+                return message
+
     message_region = _dialogue_message_region(cfg)
     message: dict[str, str] = {}
     has_target_content = False
@@ -1668,10 +2041,18 @@ def focus_input_box(
     image = capture_after_popups(robot, cfg, label="input_box", reporter=reporter)
     cached = _cache_get(cfg, "template_points", "input_box")
     pos = (float(cached[0]), float(cached[1])) if isinstance(cached, (list, tuple)) and len(cached) == 2 else None
+    if pos is not None:
+        _report(reporter, "input_box_locate", "使用缓存坐标", log_label=f"使用缓存坐标：输入框 {format_point(*pos)}")
     if pos is None:
         pos = _template_center(image, cfg, INPUT_BOX_BUTTON, group="buttons")
         if pos is not None:
             _cache_set(cfg, "template_points", "input_box", pos)
+            _report(
+                reporter,
+                "input_box_locate",
+                "刷新缓存坐标",
+                log_label=f"刷新缓存坐标：输入框 {format_point(*pos)}；{format_template_match_diagnostic(cfg, INPUT_BOX_BUTTON)}",
+            )
     if pos is None:
         raise StepUnavailable(_template_miss_message(cfg, INPUT_BOX_BUTTON, group="buttons", action="查找"))
     click_point = (pos[0] - 0.5, pos[1])
@@ -1691,6 +2072,19 @@ def play_voice_reply(
     retry_count = max(0, int(cfg.get("tts_retry_attempts", 1) or 0))
     last_error: Exception | None = None
     for attempt in range(retry_count + 1):
+        try:
+            _report(reporter, "tts_prepare", "合成 TTS 音频", log_label="TTS 音频合成中，完成后再点击麦克风")
+            prepared_chunks = prepare_tts_input(robot, text)
+            _report(reporter, "tts_prepared", "TTS 音频已就绪", log_label="TTS 音频已就绪，准备点击麦克风播放")
+        except OperationCancelled:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt >= retry_count:
+                break
+            _report(reporter, "tts_retry", "TTS 合成失败，准备重试", log_label=f"TTS 合成失败，准备重试：{exc}")
+            time.sleep(0.4)
+            continue
         deadline = step_deadline(cfg, _step_timeout(cfg))
         while True:
             image = capture_after_popups(robot, cfg, label="microphone", reporter=reporter)
@@ -1712,7 +2106,7 @@ def play_voice_reply(
 
         try:
             _report(reporter, "tts_playback", "播放 TTS 回复" if attempt == 0 else "重新播放 TTS 回复")
-            tts_input(robot, text)
+            play_prepared_tts_input(robot, prepared_chunks)
             time.sleep(TTS_POST_DELAY_SECONDS)
             return
         except OperationCancelled:
@@ -1814,18 +2208,20 @@ def go_back(
     reporter: Reporter | None = None,
     *,
     click_count: int = 1,
+    force_click: bool = False,
 ) -> None:
     cfg = _config(config)
     _report(reporter, "return_to_list", "返回聊天列表")
     ensure_send_cleared(robot, cfg, reporter=reporter)
     image = capture_after_popups(robot, cfg, label="go_back", reporter=reporter)
-    if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
+    if not force_click and _matches_screen(image, cfg, CHAT_LIST_SCREEN):
         return
 
     image = capture_after_popups(robot, cfg, label="go_back_button", reporter=reporter)
     cached = _cache_get(cfg, "template_points", "back")
     if isinstance(cached, (list, tuple)) and len(cached) == 2:
         x, y = float(cached[0]), float(cached[1])
+        _report(reporter, "return_to_list", "使用缓存坐标", log_label=f"使用缓存坐标：返回按钮 {format_point(x, y)}")
         _click_back_match(robot, (x, y, Path("cached_back")), click_count=click_count, reporter=reporter)
     else:
         matched = _template_center_with_path(image, cfg, BACK_BUTTON, group="buttons")
@@ -1833,6 +2229,15 @@ def go_back(
             _report(reporter, "return_to_list", "返回按钮未找到")
             raise StepUnavailable(_template_miss_message(cfg, BACK_BUTTON, group="buttons", action="查找"))
         _cache_set(cfg, "template_points", "back", (matched[0], matched[1]))
+        _report(
+            reporter,
+            "return_to_list",
+            "刷新缓存坐标",
+            log_label=(
+                f"刷新缓存坐标：返回按钮 {format_point(matched[0], matched[1])}；"
+                f"{format_template_match_diagnostic(cfg, BACK_BUTTON)}"
+            ),
+        )
         _click_back_match(robot, matched, click_count=click_count, reporter=reporter)
 
     image = capture_after_popups(robot, cfg, label="after_go_back", reporter=reporter)

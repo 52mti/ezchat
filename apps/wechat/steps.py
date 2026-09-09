@@ -8,7 +8,7 @@ from apps.coordinates import click_image_point
 from apps.photo_capture import capture_transform_image
 from apps.reporting import Reporter, format_point as _format_point, report_step
 from apps.step_timing import exclude_ocr_wait_from_step_timeout, step_deadline
-from apps.utils import tts_input
+from apps.utils import play_prepared_tts_input, prepare_tts_input
 from apps.visual_assets import (
     BACK_BUTTON,
     CHAT_AREA_REGION,
@@ -19,6 +19,8 @@ from apps.visual_assets import (
     popup_template_region_key,
     popup_template_paths,
     region_rule,
+    format_template_match_diagnostic,
+    match_template_candidates_with_region,
     match_template_with_region,
     screen_state_path,
     template_variant_paths,
@@ -57,7 +59,45 @@ TTS_POST_DELAY_SECONDS = 3.0
 
 
 def _config(config: dict[str, Any] | None) -> dict[str, Any]:
-    return _deep_merge(DEFAULT_CONFIG, config or {})
+    cfg = _deep_merge(DEFAULT_CONFIG, config or {})
+    if isinstance(config, dict):
+        cache = config.setdefault("_runtime_cache", {})
+        if not isinstance(cache, dict):
+            cache = {}
+            config["_runtime_cache"] = cache
+        cfg["_runtime_cache"] = cache
+    return cfg
+
+
+def _runtime_cache(config: dict[str, Any]) -> dict[str, Any]:
+    cache = config.setdefault("_runtime_cache", {})
+    if not isinstance(cache, dict):
+        cache = {}
+        config["_runtime_cache"] = cache
+    template_points = cache.setdefault("template_points", {})
+    if not isinstance(template_points, dict):
+        cache["template_points"] = {}
+    return cache
+
+
+def _cached_point(config: dict[str, Any], key: str) -> tuple[float, float] | None:
+    if config.get("enable_runtime_coordinate_cache", True) is False:
+        return None
+    points = _runtime_cache(config).get("template_points", {})
+    value = points.get(key) if isinstance(points, dict) else None
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    return float(value[0]), float(value[1])
+
+
+def _cache_point_once(config: dict[str, Any], key: str, point: tuple[float, float]) -> None:
+    if config.get("enable_runtime_coordinate_cache", True) is False:
+        return
+    if _cached_point(config, key) is not None:
+        return
+    points = _runtime_cache(config).setdefault("template_points", {})
+    if isinstance(points, dict):
+        points[key] = point
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -152,18 +192,15 @@ def _template_candidates(config: dict[str, Any], key: str, *, group: str) -> lis
 
 
 def _match_any(image: Any, paths: list[Path], config: dict[str, Any], key: str) -> dict[str, float] | None:
-    for path in paths:
-        result = match_template_with_region(
-            image,
-            path,
-            config,
-            key,
-            threshold=_threshold(config),
-            match_func=match,
-        )
-        if result:
-            return result
-    return None
+    return match_template_candidates_with_region(
+        image,
+        paths,
+        config,
+        key,
+        threshold=_threshold(config),
+        match_func=match,
+        single_match_func=match_template_with_region,
+    )
 
 
 def _template_center(image: Any, config: dict[str, Any], key: str, *, group: str) -> tuple[float, float] | None:
@@ -171,6 +208,15 @@ def _template_center(image: Any, config: dict[str, Any], key: str, *, group: str
     if not result:
         return None
     return result["x"] + result["w"] / 2, result["y"] + result["h"] / 2
+
+
+def _template_failure_detail(config: dict[str, Any], key: str, *, group: str) -> str:
+    aliases = SCREEN_TEMPLATE_ALIASES.get(key, ()) if group == "screens" else BUTTON_TEMPLATE_ALIASES.get(key, ())
+    names = " / ".join(aliases) if aliases else key
+    diagnostic = format_template_match_diagnostic(config, key)
+    if diagnostic != "最高候选：无":
+        return f"{names}；{diagnostic}"
+    return names
 
 
 def _matches_screen(image: Any, config: dict[str, Any], key: str) -> bool:
@@ -280,7 +326,19 @@ def _click_back_once(
     reporter: Reporter | None = None,
 ) -> bool:
     current_image = image if image is not None else capture_after_popups(robot, config, label="back_check", reporter=reporter)
-    pos = _template_center(current_image, config, BACK_BUTTON, group="buttons")
+    pos = _cached_point(config, "back")
+    if pos is not None:
+        _report(reporter, "back_once", "使用缓存坐标", log_label=f"使用缓存坐标：返回按钮 {_format_point(*pos)}")
+    else:
+        pos = _template_center(current_image, config, BACK_BUTTON, group="buttons")
+        if pos is not None:
+            _cache_point_once(config, "back", pos)
+            _report(
+                reporter,
+                "back_once",
+                "刷新缓存坐标",
+                log_label=f"刷新缓存坐标：返回按钮 {_format_point(*pos)}；{format_template_match_diagnostic(config, BACK_BUTTON)}",
+            )
     if pos is not None:
         _report(reporter, "back_once", "点击返回", log_label=f"点击返回：{_format_point(*pos)}")
         click_image_point(robot, *pos)
@@ -407,8 +465,13 @@ def read_message(
     image = capture_after_popups(robot, cfg, label="chat_window", reporter=reporter)
     if not _matches_screen(image, cfg, CHAT_WINDOW_SCREEN):
         if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
-            raise StepUnavailable("chat window screen template did not match; still on chat list")
-        raise StepUnavailable("chat window screen template did not match")
+            raise StepUnavailable(
+                f"chat window screen template did not match; still on chat list："
+                f"{_template_failure_detail(cfg, CHAT_WINDOW_SCREEN, group='screens')}"
+            )
+        raise StepUnavailable(
+            f"chat window screen template did not match：{_template_failure_detail(cfg, CHAT_WINDOW_SCREEN, group='screens')}"
+        )
 
     _report(reporter, "dialogue_ocr_read", "对话OCR读取")
     ocr_result = _run_ocr_mode(image, cfg, "dialogue", region=_region(cfg, CHAT_AREA_REGION))
@@ -448,9 +511,22 @@ def focus_input_box(
     cfg = _config(config)
     _report(reporter, "input_box_locate", "定位输入框")
     image = capture_after_popups(robot, cfg, label="input_box", reporter=reporter)
-    pos = _template_center(image, cfg, INPUT_BOX_BUTTON, group="buttons")
+    cached = _cached_point(cfg, "input_box")
+    if cached is not None:
+        pos = cached
+        _report(reporter, "input_box_locate", "使用缓存坐标", log_label=f"使用缓存坐标：输入框 {_format_point(*pos)}")
+    else:
+        pos = _template_center(image, cfg, INPUT_BOX_BUTTON, group="buttons")
+        if pos is not None:
+            _cache_point_once(cfg, "input_box", pos)
+            _report(
+                reporter,
+                "input_box_locate",
+                "刷新缓存坐标",
+                log_label=f"刷新缓存坐标：输入框 {_format_point(*pos)}；{format_template_match_diagnostic(cfg, INPUT_BOX_BUTTON)}",
+            )
     if pos is None:
-        raise StepUnavailable("input box button was not found")
+        raise StepUnavailable(f"input box button was not found：{_template_failure_detail(cfg, INPUT_BOX_BUTTON, group='buttons')}")
     click_point = (pos[0] - 0.5, pos[1] - 0.02)
     _report(reporter, "input_box_click", "点击输入框", log_label=f"点击输入框：{_format_point(*click_point)}")
     click_image_point(robot, *click_point)
@@ -463,6 +539,9 @@ def play_voice_reply(
     reporter: Reporter | None = None,
 ) -> None:
     cfg = _config(config)
+    _report(reporter, "tts_prepare", "合成 TTS 音频", log_label="TTS 音频合成中，完成后再点击麦克风")
+    prepared_chunks = prepare_tts_input(robot, text)
+    _report(reporter, "tts_prepared", "TTS 音频已就绪", log_label="TTS 音频已就绪，准备点击麦克风播放")
     deadline = step_deadline(cfg, _step_timeout(cfg))
     while True:
         _report(reporter, "microphone_locate", "定位麦克风按钮")
@@ -473,11 +552,11 @@ def play_voice_reply(
             click_image_point(robot, *microphone)
             break
         if deadline.expired():
-            raise StepUnavailable("microphone button was not found")
+            raise StepUnavailable(f"microphone button was not found：{_template_failure_detail(cfg, MICROPHONE_BUTTON, group='buttons')}")
         time.sleep(0.4)
 
     _report(reporter, "tts_playback", "播放TTS回复")
-    tts_input(robot, text)
+    play_prepared_tts_input(robot, prepared_chunks)
     _report(reporter, "tts_wait", "等待3秒后检测下一张图")
     time.sleep(TTS_POST_DELAY_SECONDS)
 
@@ -508,7 +587,7 @@ def send_reply(
             if clicked:
                 return
             if deadline.expired():
-                raise StepUnavailable("send button was not found")
+                raise StepUnavailable(f"send button was not found：{_template_failure_detail(cfg, SEND_BUTTON_KEY, group='buttons')}")
             time.sleep(0.4)
             continue
         if not clicked:
@@ -531,7 +610,20 @@ def go_back(
     if _matches_screen(image, cfg, CHAT_LIST_SCREEN):
         return
 
-    pos = _template_center(image, cfg, BACK_BUTTON, group="buttons")
+    cached = _cached_point(cfg, "back")
+    if cached is not None:
+        pos = cached
+        _report(reporter, "back_double_click", "使用缓存坐标", log_label=f"使用缓存坐标：返回按钮 {_format_point(*pos)}")
+    else:
+        pos = _template_center(image, cfg, BACK_BUTTON, group="buttons")
+        if pos is not None:
+            _cache_point_once(cfg, "back", pos)
+            _report(
+                reporter,
+                "back_double_click",
+                "刷新缓存坐标",
+                log_label=f"刷新缓存坐标：返回按钮 {_format_point(*pos)}；{format_template_match_diagnostic(cfg, BACK_BUTTON)}",
+            )
     if pos is not None:
         _report(reporter, "back_double_click", "连续点击返回两次", log_label=f"连续点击返回两次：{_format_point(*pos)}")
         click_image_point(robot, *pos)

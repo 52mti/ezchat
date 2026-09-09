@@ -8,7 +8,12 @@
     "chat_bearer": "",
     "credits_bearer": "",
     "greetings_dir": "runtime/greetings",
-    "ocr_max_concurrency": 1
+    "ocr_max_concurrency": 1,
+    "rule_learning": {
+      "upload_url": "http://liaotianbao.icu/rule-learning/{app}/upload",
+      "rules_url": "https://jixiebi-1311918180.cos.ap-shanghai.myqcloud.com/rule-learning/{app}/rules.json",
+      "bearer_token": ""
+    }
   },
   "devices": [
     {

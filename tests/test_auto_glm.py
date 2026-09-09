@@ -43,6 +43,21 @@ def test_parse_autoglm_tap_from_answer_markup():
     assert action.arguments["element"] == [86, 875]
 
 
+def test_parse_finish_keeps_quotes_in_official_terminal_message():
+    action = parse_action('finish(message="已进入\"照片\"选择界面")')
+
+    assert action.finished
+    assert action.name == "finish"
+    assert action.message == '已进入"照片"选择界面'
+
+
+def test_parse_official_launch_action():
+    action = parse_action('do(action="Launch", app="相册")')
+
+    assert action.name == "Launch"
+    assert action.arguments["app"] == "相册"
+
+
 def test_parse_rejects_out_of_range_coordinates():
     with pytest.raises(ValueError, match="0 到 999"):
         parse_action('do(action="Tap", element=[1000, 2])')

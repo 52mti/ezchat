@@ -8,6 +8,7 @@ from typing import Any
 
 
 _SUPPORTED_ACTIONS = {
+    "Launch",
     "Tap",
     "Double Tap",
     "Long Press",
@@ -18,6 +19,9 @@ _SUPPORTED_ACTIONS = {
     "Home",
     "Wait",
     "Take_over",
+    "Interact",
+    "Note",
+    "Call_API",
 }
 
 
@@ -37,6 +41,13 @@ class AutoGLMAction:
 def parse_action(content: str) -> AutoGLMAction:
     """Extract exactly one ``do(...)`` or ``finish(...)`` action safely."""
     action_text = _extract_action_text(content)
+    # Follow Open-AutoGLM: finish is a terminal marker, so its human-readable
+    # message is extracted without asking Python to parse its inner prose. This
+    # prevents ordinary quotes in a description such as "照片" from making an
+    # otherwise valid completion fail. Only the terminal finish action uses this
+    # permissive path; executable do(...) actions remain AST-validated.
+    if action_text.startswith("finish("):
+        return _parse_finish_action(action_text)
     try:
         expression = ast.parse(action_text, mode="eval").body
     except SyntaxError as error:
@@ -55,6 +66,16 @@ def parse_action(content: str) -> AutoGLMAction:
         raise ValueError(f"不支持的 AutoGLM 动作：{name or '空动作'}")
     _validate_coordinates(name, arguments)
     return AutoGLMAction(name, arguments)
+
+
+def _parse_finish_action(action_text: str) -> AutoGLMAction:
+    prefix = "finish(message="
+    if not action_text.startswith(prefix) or not action_text.endswith(")"):
+        raise ValueError("AutoGLM finish 动作格式必须是 finish(message=\"...\")")
+    raw_message = action_text[len(prefix) : -1].strip()
+    if len(raw_message) >= 2 and raw_message[0] in {"'", '"'} and raw_message[-1] == raw_message[0]:
+        raw_message = raw_message[1:-1]
+    return AutoGLMAction("finish", {"message": raw_message}, finished=True)
 
 
 def _extract_action_text(content: str) -> str:

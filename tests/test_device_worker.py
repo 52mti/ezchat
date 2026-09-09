@@ -256,3 +256,56 @@ def test_worker_exception_is_isolated_to_that_device(tmp_path, monkeypatch):
     assert any(event.device_ip == "192.168.1.108" and event.message == "app_error" for event in emitted)
     assert any(event.device_ip == "192.168.1.109" and event.message == "tick" for event in emitted)
     assert good_worker.app.count > 0
+
+
+def test_worker_writes_error_incident_after_recovery(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(device_worker_module, "get_registered_apps", lambda: {"dummy": DummyApp})
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    worker = DeviceWorker(
+        {"ip": "192.168.1.108", "selected_app": "dummy"},
+        app_config={"poll_interval": 1},
+        events=queue.Queue(),
+        config_manager=manager,
+        robot=object(),
+    )
+    worker.app_config["_runtime"].update(
+        {
+            "current_capture_path": "photo/captures/current.jpg",
+            "related_capture_paths": ["photo/captures/current.jpg"],
+            "last_error_capture_path": "photo/errors/error.jpg",
+            "template_paths": ["apps/xinyu/templates/screens/screen_聊天列表.jpg"],
+            "last_template_match_key": "screen.chat_list",
+        }
+    )
+
+    worker._emit("info", "before_1")
+    worker._emit("info", "before_2")
+    worker._emit("warning", "first_error_log", {"detail": "boom"})
+    worker._track_error_window(
+        {
+            "error_count": 1,
+            "is_circuit_open": False,
+            "last_error": "boom",
+            "current_step": "list_ocr_scan",
+            "current_step_label": "列表 OCR 扫描",
+        }
+    )
+    worker._emit("info", "between_errors")
+    worker._track_error_window(
+        {
+            "error_count": 0,
+            "is_circuit_open": False,
+            "last_error": "",
+            "current_step": "idle",
+            "current_step_label": "空闲",
+        }
+    )
+
+    files = list((tmp_path / "runtime" / "error_incidents").rglob("*.json"))
+    assert len(files) == 1
+    payload = files[0].read_text(encoding="utf-8")
+    assert "photo/errors/error.jpg" in payload
+    assert "photo/captures/current.jpg" in payload
+    assert "before_1" in payload
+    assert "between_errors" in payload

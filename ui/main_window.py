@@ -90,7 +90,7 @@ from apps.visual_assets import (
     template_variant_paths,
     template_path,
 )
-from vision import match
+from vision import get_ocr_queue_status, match, run_ocr_mode
 from lgb.lgb import RobotInterface, scan_devices
 from services import (
     ChatHistoryStore,
@@ -105,6 +105,8 @@ from services import (
     resolve_release_decision,
 )
 from services.persona import resolve_persona
+from services.coordinate_cache import load_latest_into_runtime
+from services.vision_usage import reset as reset_vision_usage
 from ui.chat_history_window import ChatHistoryDialog
 from vision.screen import ensure_portrait_image
 from workers import DeviceWorker, WorkerEvent
@@ -171,6 +173,26 @@ class TemplatePreviewThread(QThread):
     def run(self) -> None:
         try:
             self.completed.emit(self.callback(self.image))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class OcrPreviewThread(QThread):
+    """在后台运行设备设置中的 OCR 测试，避免识别阻塞设置窗口。"""
+
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, image: Image.Image, config: dict[str, Any], mode: str, region: Any, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.image = image.copy()
+        self.config = copy.deepcopy(config)
+        self.mode = mode
+        self.region = copy.deepcopy(region)
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(run_ocr_mode(self.image, self.config, self.mode, region=self.region))
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -570,6 +592,7 @@ class MainWindow(QMainWindow):
         self._pending_update_package: ResolvedUpdatePackage | None = None
         self.local_tts_server = LocalTtsServer()
         self._tts_bind_lock = threading.Lock()
+        self._tts_bind_in_progress: set[str] = set()
         self.setWindowTitle("机械臂视觉控制系统")
         self.resize(1180, 720)
         self.setStyleSheet(APP_STYLESHEET)
@@ -623,6 +646,10 @@ class MainWindow(QMainWindow):
         self.check_update_button = self._button("检查更新")
         self.check_update_button.clicked.connect(lambda: self._start_release_check(manual=True))
         top_bar.addWidget(self.check_update_button)
+        self.ocr_queue_label = QLabel("OCR等待：0")
+        self.ocr_queue_label.setObjectName("OcrQueueLabel")
+        self.ocr_queue_label.setToolTip("当前等待 OCR 并发槽位的任务数量")
+        top_bar.addWidget(self.ocr_queue_label)
         top_bar.addStretch(1)
         layout.addWidget(top_panel)
 
@@ -705,7 +732,6 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._drain_events)
         self.timer.start(100)
-        QTimer.singleShot(500, self._start_and_bind_local_tts)
         QTimer.singleShot(800, lambda: self._start_release_check(manual=False))
 
     def _button(self, text: str, variant: str = "default") -> QPushButton:
@@ -991,6 +1017,8 @@ Add-Type -AssemblyName System.Windows.Forms
 $PreservePrefixes = @(
     'config.json',
     'outbox.json',
+    'runtime/',
+    'models/',
     'runtime/install_state.json',
     'runtime/logs/',
     'runtime/errors/',
@@ -1022,9 +1050,31 @@ function Normalize-Relative([string]$relative) {
     return ($relative.Replace('\\', '/')).TrimStart('/')
 }
 
+function Is-AppConfig([string]$relative) {
+    $parts = (Normalize-Relative $relative).Split('/')
+    return $parts.Count -eq 3 -and $parts[0] -eq 'apps' -and $parts[2] -eq 'config.json' -and [bool]$parts[1]
+}
+
+function Is-CustomerTemplate([string]$relative) {
+    $normalized = Normalize-Relative $relative
+    $parts = $normalized.Split('/')
+    if ($parts.Count -lt 4 -or $parts[0] -ne 'apps' -or $parts[2] -ne 'templates') {
+        return $false
+    }
+    foreach ($part in $parts[3..($parts.Count - 1)]) {
+        if ($part.Contains('__customer_')) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Is-Preserved([string]$relative) {
     $normalized = Normalize-Relative $relative
     if ($PreservedLaunchers -contains $normalized) {
+        return $true
+    }
+    if ((Is-AppConfig $normalized) -or (Is-CustomerTemplate $normalized)) {
         return $true
     }
     foreach ($prefix in $PreservePrefixes) {
@@ -1034,6 +1084,48 @@ function Is-Preserved([string]$relative) {
         }
     }
     return $false
+}
+
+function Read-JsonObject([string]$path) {
+    try {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            return $null
+        }
+        return (Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json)
+    } catch {
+        return $null
+    }
+}
+
+function Merge-JsonObject($base, $override) {
+    if ($null -eq $base) { return $override }
+    if ($null -eq $override) { return $base }
+    $result = [ordered]@{}
+    foreach ($property in $base.PSObject.Properties) {
+        $result[$property.Name] = $property.Value
+    }
+    foreach ($property in $override.PSObject.Properties) {
+        $existing = $result[$property.Name]
+        if ($existing -is [pscustomobject] -and $property.Value -is [pscustomobject]) {
+            $result[$property.Name] = Merge-JsonObject $existing $property.Value
+        } else {
+            $result[$property.Name] = $property.Value
+        }
+    }
+    return [pscustomobject]$result
+}
+
+function Copy-UpdateFile([string]$sourcePath, [string]$targetPath, [string]$relative) {
+    if (Is-AppConfig $relative -and (Test-Path -LiteralPath $targetPath -PathType Leaf)) {
+        $updateConfig = Read-JsonObject $sourcePath
+        $localConfig = Read-JsonObject $targetPath
+        if ($null -ne $updateConfig -and $null -ne $localConfig) {
+            $merged = Merge-JsonObject $updateConfig $localConfig
+            $merged | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $targetPath -Encoding UTF8
+            return
+        }
+    }
+    Copy-Item -LiteralPath $sourcePath -Destination $targetPath -Force
 }
 
 function Wait-ForProcessExit([int]$processId, [int]$timeoutSeconds) {
@@ -1134,7 +1226,7 @@ function Copy-UpdateTree([string]$sourceRoot, [string]$targetRoot) {
             }
             continue
         }
-        Copy-Item -LiteralPath $item.FullName -Destination $targetPath -Force
+        Copy-UpdateFile -sourcePath $item.FullName -targetPath $targetPath -relative $relative
     }
 }
 
@@ -1158,6 +1250,20 @@ try {
     $newPaths = Read-ManifestPaths -rootPath $extractedRoot
     Remove-ObsoleteFiles -targetRoot $PackageRoot -oldPaths $existingPaths -newPaths $newPaths
     Copy-UpdateTree -sourceRoot $extractedRoot -targetRoot $PackageRoot
+
+    $sourceManifest = Join-Path $extractedRoot 'runtime_manifest.json'
+    $targetManifest = Join-Path $PackageRoot 'runtime_manifest.json'
+    if (-not (Test-Path -LiteralPath $sourceManifest -PathType Leaf)) {
+        throw '更新包缺少 runtime_manifest.json。'
+    }
+    if (-not (Test-Path -LiteralPath $targetManifest -PathType Leaf)) {
+        throw '更新后缺少 runtime_manifest.json。'
+    }
+    $expectedVersion = ([string]((Get-Content -LiteralPath $sourceManifest -Raw -Encoding UTF8 | ConvertFrom-Json).appVersion)).Trim()
+    $actualVersion = ([string]((Get-Content -LiteralPath $targetManifest -Raw -Encoding UTF8 | ConvertFrom-Json).appVersion)).Trim()
+    if (-not $expectedVersion -or $actualVersion -ne $expectedVersion) {
+        throw ('更新版本校验失败：期望 ' + $expectedVersion + '，实际 ' + $actualVersion + '。')
+    }
 
     Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -1499,6 +1605,8 @@ try {
         selected_app = self._selected_app_for_row(row)
         device["selected_app"] = selected_app
         self.config_manager.update_device(device_ip, {"selected_app": selected_app})
+        # 仅在实际启动当前设备时，重新写入该设备后台的本地 TTS 地址。
+        self._start_and_bind_local_tts([device_ip])
         worker = DeviceWorker(device, events=self.events, config_manager=self.config_manager)
         self.workers[device_ip] = worker
         worker.start()
@@ -1577,7 +1685,6 @@ try {
             return
         self.device_ip_input.clear()
         self._load_devices()
-        self._start_and_bind_local_tts([device_ip])
 
     def _scan_devices(self) -> None:
         self.scan_device_button.setEnabled(False)
@@ -1604,22 +1711,25 @@ try {
             ):
                 added += 1
         self._load_devices()
-        self._start_and_bind_local_tts(found)
         QMessageBox.information(self, "扫描设备", f"发现 {len(found)} 台，新增 {added} 台")
 
     def _start_and_bind_local_tts(self, device_ips: list[str] | None = None) -> None:
-        """后台启动本地 TTS，并将其 LAN 地址写入设备后台。"""
-        if not self._tts_bind_lock.acquire(blocking=False):
+        """后台启动本地 TTS；只有显式传入的设备 IP 会被重新绑定。"""
+        start_only = device_ips is None
+        targets = list(dict.fromkeys(str(ip).strip() for ip in (device_ips or []) if str(ip).strip()))
+        with self._tts_bind_lock:
+            new_targets = [ip for ip in targets if ip not in self._tts_bind_in_progress]
+            self._tts_bind_in_progress.update(new_targets)
+        if not new_targets and not start_only:
             return
-        if device_ips is None:
-            device_ips = [str(device.get("ip", "") or "") for device in self.config_manager.devices() if isinstance(device, dict)]
-        targets = list(dict.fromkeys(ip.strip() for ip in device_ips if str(ip).strip()))
 
         def bind() -> None:
             try:
-                results = self.local_tts_server.bind_devices(targets)
-                if not targets:
+                if start_only:
+                    self.local_tts_server.start()
                     self.events.put(WorkerEvent("本地TTS", "info", "本地 TTS 服务已启动"))
+                    return
+                results = self.local_tts_server.bind_devices(new_targets)
                 for device_ip, tts_url, error in results:
                     if error:
                         self.events.put(WorkerEvent(device_ip, "warning", f"本地 TTS 绑定失败：{error}"))
@@ -1628,7 +1738,8 @@ try {
             except Exception as exc:
                 self.events.put(WorkerEvent("本地TTS", "warning", f"本地 TTS 服务启动失败：{exc}"))
             finally:
-                self._tts_bind_lock.release()
+                with self._tts_bind_lock:
+                    self._tts_bind_in_progress.difference_update(new_targets)
 
         threading.Thread(target=bind, name="local-tts-bind", daemon=True).start()
 
@@ -1694,6 +1805,7 @@ try {
             device_ip=device_ip,
             app_name=app_name,
             template_root=template_root,
+            on_reset_visual_recognition=lambda: self._reset_visual_recognition(device_ip, app_name),
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1730,6 +1842,24 @@ try {
         self.config_manager.update_device_runtime(device_ip, runtime_updates)
         self.config_manager.update_device_app_overrides(device_ip, app_name, device_app_updates)
         QMessageBox.information(self, "配置", f"{device_ip} / {app_name} 配置已保存")
+
+    def _reset_visual_recognition(self, device_ip: str, app_name: str) -> None:
+        answer = QMessageBox.question(
+            self,
+            "重置视觉识别",
+            f"确认重置 {device_ip} / {app_name} 的视觉识别调用次数和规则学习状态吗？\n"
+            "重置后会重新允许视觉识别启动。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        reset_vision_usage({"_runtime": {"device_ip": device_ip, "app_name": app_name}})
+        self._append_log_line(
+            device_ip,
+            f"[{time.strftime('%H:%M:%S')}] [info] {device_ip}: {app_name} 视觉识别已重置",
+        )
+        QMessageBox.information(self, "重置视觉识别", f"{device_ip} / {app_name} 已重置，可重新启动视觉识别。")
 
     def _edit_device_settings(self, row: int) -> None:
         device = self._device_for_row(row)
@@ -2057,6 +2187,15 @@ try {
                 self._append_log_line("", f"[{time.strftime('%H:%M:%S')}] [error] UI: 无干预时长刷新失败：{exc}")
 
         self._drain_update_events()
+        self._refresh_ocr_queue_count()
+
+    def _refresh_ocr_queue_count(self) -> None:
+        try:
+            status = get_ocr_queue_status()
+            waiting = max(0, int(status.get("waiting", 0) or 0)) if isinstance(status, dict) else 0
+        except Exception:
+            waiting = 0
+        self.ocr_queue_label.setText(f"OCR等待：{waiting}")
 
     def _drain_update_events(self) -> None:
         processed = 0
@@ -2200,6 +2339,7 @@ class _LegacyAppConfigDialog(QDialog):
         device_ip: str,
         app_name: str,
         template_root: Path,
+        on_reset_visual_recognition: Callable[[], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -2207,6 +2347,7 @@ class _LegacyAppConfigDialog(QDialog):
         self.device_ip = device_ip
         self.app_name = app_name
         self.template_root = template_root
+        self._on_reset_visual_recognition = on_reset_visual_recognition
         self.setWindowTitle(f"App 配置 - {device_ip} / {app_name}")
         self.resize(840, 620)
         root = QVBoxLayout(self)
@@ -2571,6 +2712,7 @@ class PopupCropLabel(QWidget):
         self.origin = QPoint()
         self.selection = QRect()
         self.match_points: list[tuple[float, float]] = []
+        self.region_overlays: list[tuple[str, tuple[float, float, float, float], QColor]] = []
         self.on_point_selected: Any | None = None
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setMouseTracking(True)
@@ -2595,6 +2737,10 @@ class PopupCropLabel(QWidget):
             (max(0.0, min(1.0, float(x))), max(0.0, min(1.0, float(y))))
             for x, y in points
         ]
+        self.update()
+
+    def set_region_overlays(self, regions: list[tuple[str, tuple[float, float, float, float], QColor]]) -> None:
+        self.region_overlays = regions
         self.update()
 
     def _display_point_to_source_ratio(self, point: QPoint) -> tuple[float, float]:
@@ -2629,6 +2775,18 @@ class PopupCropLabel(QWidget):
     def paintEvent(self, event: Any) -> None:
         painter = QPainter(self)
         painter.drawPixmap(0, 0, self.display_pixmap)
+        for label, (left, top, width, height), color in self.region_overlays:
+            rect = QRect(
+                int(round(left * self.display_pixmap.width())),
+                int(round(top * self.display_pixmap.height())),
+                int(round(width * self.display_pixmap.width())),
+                int(round(height * self.display_pixmap.height())),
+            )
+            painter.setPen(QPen(color, 2, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(rect)
+            painter.setPen(QPen(color, 1))
+            painter.drawText(rect.adjusted(3, 15, -3, -3), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, label)
         painter.setPen(QPen(QColor("#dc2626"), 3))
         for x_ratio, y_ratio in self.match_points:
             x = int(round(x_ratio * self.display_pixmap.width()))
@@ -3467,6 +3625,7 @@ class AppConfigDialog(QDialog):
         device_ip: str,
         app_name: str,
         template_root: Path,
+        on_reset_visual_recognition: Callable[[], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -3474,6 +3633,7 @@ class AppConfigDialog(QDialog):
         self.device_ip = device_ip
         self.app_name = app_name
         self.template_root = template_root
+        self._on_reset_visual_recognition = on_reset_visual_recognition
         self.setWindowTitle(f"App 配置 - {device_ip} / {app_name}")
         self.resize(860, 660)
 
@@ -3576,6 +3736,11 @@ class AppConfigDialog(QDialog):
         self.online_photo_send_count.setToolTip("没有消息进入空闲状态时，主动给多少位在线用户发送照片。0 表示关闭主动发图。")
         form.addRow("每次空闲主动发图人数（0关闭）", self.online_photo_send_count)
 
+        self.reset_visual_recognition_button = QPushButton("重置视觉识别")
+        self.reset_visual_recognition_button.setToolTip("清空当前设备当前 App 的视觉调用额度和连续无新增规则计数。")
+        self.reset_visual_recognition_button.clicked.connect(self._reset_visual_recognition)
+        panel_root.addWidget(self.reset_visual_recognition_button, 0, Qt.AlignmentFlag.AlignLeft)
+
         self.ocr_toggle_button = QPushButton("显示OCR设置")
         self.ocr_toggle_button.clicked.connect(self._toggle_ocr_tab)
         panel_root.addWidget(self.ocr_toggle_button, 0, Qt.AlignmentFlag.AlignLeft)
@@ -3583,6 +3748,10 @@ class AppConfigDialog(QDialog):
         page_root.addWidget(panel)
         page_root.addStretch(1)
         self.tabs.addTab(page, "运行设置")
+
+    def _reset_visual_recognition(self) -> None:
+        if self._on_reset_visual_recognition is not None:
+            self._on_reset_visual_recognition()
 
     def _build_ocr_tab(self, overrides: dict[str, Any]) -> None:
         page = QWidget()
@@ -4039,6 +4208,7 @@ class DeviceSettingsDialogInteractive(QDialog):
         self.test_target_combo: QComboBox | None = None
         self._screenshot_thread: DeviceScreenshotThread | None = None
         self._template_preview_thread: TemplatePreviewThread | None = None
+        self._ocr_preview_thread: OcrPreviewThread | None = None
         self.setWindowTitle(f"设备设置 - {device_ip} / {app_name}")
         self.resize(1180, 760)
 
@@ -4131,6 +4301,26 @@ class DeviceSettingsDialogInteractive(QDialog):
         for column in range(4):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents if column != 2 else QHeaderView.ResizeMode.Stretch)
         control_layout.addWidget(self.template_match_table)
+
+        ocr_test_row = QHBoxLayout()
+        ocr_test_row.setContentsMargins(0, 0, 0, 0)
+        ocr_test_row.setSpacing(8)
+        self.test_list_ocr_button = QPushButton("测试小范围list")
+        self.test_list_ocr_button.clicked.connect(lambda: self._run_ocr_preview("list"))
+        self.test_dialogue_ocr_button = QPushButton("测试dialogue")
+        self.test_dialogue_ocr_button.clicked.connect(lambda: self._run_ocr_preview("dialogue"))
+        ocr_test_row.addWidget(self.test_list_ocr_button)
+        ocr_test_row.addWidget(self.test_dialogue_ocr_button)
+        control_layout.addLayout(ocr_test_row)
+        self.ocr_preview_summary = QLabel("OCR 测试：请先刷新截图。虚线框显示当前 App 已配置和运行缓存中的范围。")
+        self.ocr_preview_summary.setObjectName("HelperLabel")
+        self.ocr_preview_summary.setWordWrap(True)
+        control_layout.addWidget(self.ocr_preview_summary)
+        self.ocr_preview_output = QPlainTextEdit()
+        self.ocr_preview_output.setReadOnly(True)
+        self.ocr_preview_output.setMaximumHeight(180)
+        self.ocr_preview_output.setPlaceholderText("识别结果会显示在这里。")
+        control_layout.addWidget(self.ocr_preview_output)
 
         field_specs = self._field_specs()
         if field_specs:
@@ -4264,7 +4454,113 @@ class DeviceSettingsDialogInteractive(QDialog):
         self.selected_point = None
         self.point_x_label.setText("--")
         self.point_y_label.setText("--")
+        self._show_ocr_region_overlays()
         self._update_click_labels()
+
+    @staticmethod
+    def _valid_region(value: Any) -> tuple[float, float, float, float] | None:
+        if not isinstance(value, (list, tuple)) or len(value) != 4:
+            return None
+        try:
+            left, top, width, height = (float(part) for part in value)
+        except (TypeError, ValueError):
+            return None
+        if width <= 0 or height <= 0:
+            return None
+        return (
+            max(0.0, min(1.0, left)),
+            max(0.0, min(1.0, top)),
+            max(0.0, min(1.0 - left, width)),
+            max(0.0, min(1.0 - top, height)),
+        )
+
+    def _ocr_preview_config(self) -> dict[str, Any]:
+        config = _deep_merge(_app_default_config(self.app_name), self.overrides)
+        config["_runtime"] = {"device_ip": self.device_ip, "app_name": self.app_name}
+        load_latest_into_runtime(config)
+        return config
+
+    def _ocr_test_region(self, mode: str, config: dict[str, Any]) -> Any:
+        regions = config.get("ocr", {}).get("regions", {}) if isinstance(config.get("ocr"), dict) else {}
+        runtime = config.get("_runtime_cache", {}) if isinstance(config.get("_runtime_cache"), dict) else {}
+        cached = runtime.get("ocr_regions", {}) if isinstance(runtime.get("ocr_regions"), dict) else {}
+        if not isinstance(regions, dict):
+            return None
+        if mode == "list":
+            return cached.get("list_compact") or regions.get("message_list")
+        return cached.get("dialogue_message") or cached.get("chat_area_dynamic") or regions.get("chat_area")
+
+    def _show_ocr_region_overlays(self) -> None:
+        config = self._ocr_preview_config()
+        regions = config.get("ocr", {}).get("regions", {}) if isinstance(config.get("ocr"), dict) else {}
+        runtime = config.get("_runtime_cache", {}) if isinstance(config.get("_runtime_cache"), dict) else {}
+        cached = runtime.get("ocr_regions", {}) if isinstance(runtime.get("ocr_regions"), dict) else {}
+        candidates = [
+            ("list 配置范围", regions.get("message_list") if isinstance(regions, dict) else None, QColor("#2563eb")),
+            ("dialogue 配置范围", regions.get("chat_area") if isinstance(regions, dict) else None, QColor("#16a34a")),
+            ("list 缓存范围", cached.get("list_compact"), QColor("#9333ea")),
+            ("dialogue 缓存范围", cached.get("dialogue_message") or cached.get("chat_area_dynamic"), QColor("#ea580c")),
+        ]
+        overlays = [
+            (label, region, color)
+            for label, raw_region, color in candidates
+            if (region := self._valid_region(raw_region)) is not None
+        ]
+        self.crop_label.set_region_overlays(overlays)
+
+    def _run_ocr_preview(self, mode: str) -> None:
+        if self.current_screenshot is None:
+            QMessageBox.warning(self, "未刷新截图", "请先刷新截图，再进行 OCR 测试。")
+            return
+        if self._ocr_preview_thread is not None and self._ocr_preview_thread.isRunning():
+            return
+        config = self._ocr_preview_config()
+        region = self._ocr_test_region(mode, config)
+        region_label = "消息列表范围" if mode == "list" else "聊天内容范围"
+        if self._valid_region(region) is None:
+            QMessageBox.warning(self, "未设置范围", f"当前 App 未设置{region_label}，无法进行小范围 OCR 测试。")
+            return
+        self.test_list_ocr_button.setEnabled(False)
+        self.test_dialogue_ocr_button.setEnabled(False)
+        source = "运行缓存" if (
+            (mode == "list" and isinstance(config.get("_runtime_cache"), dict) and isinstance(config["_runtime_cache"].get("ocr_regions"), dict) and config["_runtime_cache"]["ocr_regions"].get("list_compact"))
+            or (mode == "dialogue" and isinstance(config.get("_runtime_cache"), dict) and isinstance(config["_runtime_cache"].get("ocr_regions"), dict) and (config["_runtime_cache"]["ocr_regions"].get("dialogue_message") or config["_runtime_cache"]["ocr_regions"].get("chat_area_dynamic")))
+        ) else "App配置"
+        self._ocr_preview_region_text = ", ".join(f"{float(value):.3f}" for value in region)
+        self.ocr_preview_summary.setText(
+            f"正在执行 {mode} OCR（范围来源：{source}，区域=({self._ocr_preview_region_text})），请稍候..."
+        )
+        self.ocr_preview_output.clear()
+        thread = OcrPreviewThread(self.current_screenshot, config, mode, region, self)
+        self._ocr_preview_thread = thread
+        thread.completed.connect(self._apply_ocr_preview)
+        thread.failed.connect(self._on_ocr_preview_failed)
+        thread.finished.connect(self._finish_ocr_preview)
+        thread.start()
+
+    def _apply_ocr_preview(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            self._on_ocr_preview_failed("OCR 返回结果无效")
+            return
+        mode = str(payload.get("mode", "OCR"))
+        result = payload.get("result", {})
+        item_count = len(payload.get("ocr_items", [])) if isinstance(payload.get("ocr_items"), list) else 0
+        region_text = getattr(self, "_ocr_preview_region_text", "-")
+        self.ocr_preview_summary.setText(
+            f"{mode} 小范围 OCR 完成：识别到 {item_count} 个文字块，实际区域=({region_text})。"
+        )
+        self.ocr_preview_output.setPlainText(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+
+    def _on_ocr_preview_failed(self, message: str) -> None:
+        self.ocr_preview_summary.setText(f"OCR 测试失败：{message}")
+
+    def _finish_ocr_preview(self) -> None:
+        thread = self._ocr_preview_thread
+        self._ocr_preview_thread = None
+        self.test_list_ocr_button.setEnabled(True)
+        self.test_dialogue_ocr_button.setEnabled(True)
+        if thread is not None:
+            thread.deleteLater()
 
     def _collect_saved_template_matches(self, image: Image.Image) -> tuple[list[tuple[str, str, str, str]], list[tuple[float, float]]]:
         """检测当前设备当前 App 的模板，只展示结果，不执行点击。"""

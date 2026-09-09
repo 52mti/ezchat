@@ -274,6 +274,48 @@ def test_dialogue_result_returns_excluded_reasons():
     assert stats["filtered_total"] >= 2
 
 
+def test_xinyu_line_excluded_keywords_use_stable_substrings():
+    rules = copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"])
+    rules["basic_filter"].update({
+        "enable_edge_spanning_filter": False,
+        "enable_max_width_filter": False,
+        "enable_non_cjk_non_emoji_filter": False,
+        "enable_right_narrow_non_cjk_filter": False,
+    })
+    items = []
+    for index, text in enumerate((
+        "亲密度220",
+        "家乡:河北石家庄",
+        "身高:170CM家乡:河北石家庄更多>",
+    )):
+        top = 120 + index * 70
+        items.append({
+            "text": text,
+            "raw_text": text,
+            "confidence": 0.99,
+            "min_x": 30,
+            "max_x": 400,
+            "min_y": top,
+            "max_y": top + 32,
+            "center_x": 215,
+            "center_y": top + 16,
+            "width": 370,
+            "height": 32,
+            "background_saturation": 0.0,
+        })
+
+    result = build_dialogue_result(items, (500, 600), rules)
+
+    assert result["dialogues"] == []
+    excluded = result["debug"]["excluded"]
+    matched = {
+        item.get("matched_keyword")
+        for item in excluded
+        if item.get("reason") == "line_excluded_keyword"
+    }
+    assert matched >= {"亲密度", "家乡"}
+
+
 def test_dialogue_rules_filter_time_and_merge_sender_lines():
     items = [
         {
@@ -328,6 +370,33 @@ def test_dialogue_rules_filter_time_and_merge_sender_lines():
 def test_looks_like_time_text_accepts_relative_day_with_clock():
     assert looks_like_time_text("昨天05:08") is True
     assert looks_like_time_text("前天 12:30") is True
+    assert looks_like_time_text("半夜12:02") is True
+    assert looks_like_time_text("晚上 11:45") is True
+
+
+def test_dialogue_filters_time_with_period_prefix_before_sender_detection():
+    items = [
+        {
+            "text": "半夜12:02",
+            "raw_text": "半夜12:02",
+            "confidence": 0.99,
+            "min_x": 120,
+            "max_x": 280,
+            "min_y": 180,
+            "max_y": 220,
+            "center_x": 200,
+            "center_y": 200,
+            "width": 160,
+            "height": 40,
+            "background_saturation": 0.0,
+            "background_hue": None,
+            "background_value": 0.9,
+        },
+    ]
+
+    result = build_dialogue_result(items, (500, 800), _dialogue_rules(name_gap=80))
+
+    assert result["dialogues"] == []
 
 
 def test_xinyu_dialogue_rules_filter_prompt_keywords_before_sender_detection():
@@ -408,7 +477,8 @@ def test_xinyu_dialogue_rules_filter_prompt_keywords_before_sender_detection():
 
     result = build_dialogue_result(items, (562, 1254), XINYU_DIALOGUE_OCR_MODE["rules"])
 
-    assert result["dialogues"] == [{"sender": "sender2", "content": "你会把喜欢的人设置成聊天置顶吗？"}]
+    # 心遇规则中“家乡”是系统资料/推荐话术的稳定片段，命中后整行过滤。
+    assert result["dialogues"] == []
 
 
 def test_dialogue_name_gap_ratio_scales_with_image_height():
@@ -651,3 +721,62 @@ def test_huanyou_dialogue_rules_do_not_merge_separate_left_bubbles_with_large_ga
         {"sender": "sender1", "content": "你好"},
         {"sender": "sender1", "content": "看你也是个值得托付的人，我想把爱交给你"},
     ]
+
+
+def test_huanyou_dialogue_sender1_color_override_does_not_depend_on_position():
+    def item(text: str, min_x: int, max_x: int) -> dict:
+        return {
+            "text": text,
+            "raw_text": text,
+            "confidence": 0.99,
+            "min_x": min_x,
+            "max_x": max_x,
+            "min_y": 464,
+            "max_y": 494,
+            "center_x": (min_x + max_x) / 2,
+            "center_y": 479,
+            "width": max_x - min_x,
+            "height": 30,
+            "background_saturation": 0.6797,
+            "background_hue": 111.0,
+            "background_value": 0.5843,
+            "background_blue_green_delta": 73.0,
+            "background_blue_red_ratio": 3.1042,
+        }
+
+    result = build_dialogue_result(
+        [
+            item("你多大了呀", 146, 270),
+            item("那里人呢", 420, 544),
+        ],
+        (681, 1222),
+        HUANYOU_DIALOGUE_OCR_MODE["rules"],
+    )
+
+    assert result["dialogues"] == [
+        {"sender": "sender1", "content": "你多大了呀"},
+        {"sender": "sender1", "content": "那里人呢"},
+    ]
+
+
+def test_xinyu_dialogue_strong_right_position_overrides_ambiguous_color():
+    item = {
+        "text": "好好色",
+        "raw_text": "好好色",
+        "confidence": 0.99,
+        "min_x": 400,
+        "max_x": 478,
+        "min_y": 216,
+        "max_y": 248,
+        "center_x": 439,
+        "center_y": 232,
+        "width": 78,
+        "height": 32,
+        "background_saturation": 0.16,
+        "background_hue": 172,
+        "background_value": 0.42,
+        "background_blue_green_delta": 21,
+        "background_blue_red_ratio": 0.52,
+    }
+    result = build_dialogue_result([item], (681, 1222), XINYU_DIALOGUE_OCR_MODE["rules"])
+    assert result["dialogues"] == [{"sender": "sender2", "content": "好好色"}]

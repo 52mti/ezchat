@@ -43,7 +43,7 @@ LANZOU_PASSWORD_ENV = "LANZOU_PASSWORD"
 LANZOU_UPDATE_FOLDER_ID_ENV = "LANZOU_UPDATE_FOLDER_ID"
 LANZOU_UPDATE_FOLDER_NAME_ENV = "LANZOU_UPDATE_FOLDER_NAME"
 LOCAL_ENV_DIR_NAME = ".env"
-LOCAL_ENV_FILE_NAMES = (".env", ".emv")
+LOCAL_ENV_FILE_NAMES = (".env",)
 LOCAL_ENV_DIR_PATTERNS = ("*.env", "*.txt")
 
 INCLUDE_PATHS = [
@@ -69,6 +69,8 @@ INCLUDE_PATHS = [
 BUNDLED_DATA_FILES = [
     "runtime/greetings/pingtai.txt",
 ]
+PIPER_SOURCE_ASSETS_DIR = "tts/piper"
+PIPER_RUNTIME_ASSETS_DIR = "runtime/tts/piper"
 
 RUNTIME_SKELETON_DIRS = [
     "runtime/app",
@@ -897,6 +899,7 @@ def _archive_excludes(
         or _relative_matches_prefix(relative, "runtime/ocr_cpu")
         or _relative_matches_prefix(relative, "runtime/ocr_nvidia")
         or _relative_matches_prefix(relative, "runtime/ocr_directml")
+        or _relative_matches_prefix(relative, "runtime/tts/piper")
         or _relative_matches_prefix(relative, "models/ocr")
     ):
         return True
@@ -1055,6 +1058,11 @@ def _copy_bundled_data(root: Path, package_root: Path) -> None:
         source = root / relative
         if source.is_file():
             _copy_item(source, package_root / relative)
+    # Piper 模型首次可随更新包下发；安装后由更新器保留在 runtime/tts/piper，
+    # 后续普通更新不再携带模型也不会将客户本地模型删除。
+    piper_source = root / PIPER_SOURCE_ASSETS_DIR
+    if piper_source.is_dir():
+        _copy_item(piper_source, package_root / PIPER_RUNTIME_ASSETS_DIR)
 
 
 def _run_build_step(command: list[str], *, cwd: Path) -> None:
@@ -1696,6 +1704,17 @@ def _freeze_executables(root: Path, package_root: Path, *, rebuild: bool) -> Non
             for relative in PROTECTED_SOURCE_PATHS:
                 source = root / relative
                 files = [source] if source.is_file() else sorted(source.rglob("*.py")) if source.is_dir() else []
+                if relative == "lgb" and source.is_dir() and not (source / "__init__.py").is_file():
+                    # lgb is a read-only dependency and has no package marker.
+                    # Add the marker only to the protected bytecode archive so
+                    # imports such as ``from lgb.lgb import RobotInterface``
+                    # work after release Python sources are removed.
+                    init_source = temporary / "lgb_package_init.py"
+                    init_source.write_text("", encoding="utf-8")
+                    init_target = temporary / "lgb" / "__init__.pyc"
+                    init_target.parent.mkdir(parents=True, exist_ok=True)
+                    py_compile.compile(str(init_source), cfile=str(init_target), doraise=True)
+                    output.write(init_target, "lgb/__init__.pyc")
                 for file_path in files:
                     target = temporary / file_path.relative_to(root).with_suffix(".pyc")
                     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1731,8 +1750,14 @@ def _build_ocr_bridge_bytecode(root: Path, package_root: Path) -> None:
 
 
 def _remove_packaged_python_sources(package_root: Path) -> None:
-    """Release directories retain templates/configuration only; code lives in executables."""
+    """Release directories retain templates/configuration only; code lives in executables.
+
+    ``update_apply.py`` 是唯一例外：旧版客户 UI 会直接执行这个源码文件。保留它
+    让旧 UI 能先完成一次更新，之后再切换到新版的 ``update_apply.pyc``。
+    """
     for relative in PROTECTED_SOURCE_PATHS:
+        if relative == "update_apply.py":
+            continue
         target = package_root / relative
         if target.is_file() and target.suffix == ".py":
             target.unlink(missing_ok=True)

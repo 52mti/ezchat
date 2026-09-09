@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from services.ai_client import AIReply
+from services.chat_history_store import ChatHistoryStore
 from services.config_manager import ConfigManager
 from services.memory_store import MemoryStore
 from services.message_processor import MessageProcessor
@@ -282,3 +283,64 @@ def test_message_processor_degrades_when_memory_store_fails(tmp_path):
     assert config.load_outbox()[0]["conversation_id"] == "cid"
     assert any(message == "memory lookup failed" for _, message, _ in logs)
     assert any(message == "memory update failed" for _, message, _ in logs)
+
+
+def test_message_processor_writes_chat_history_after_send(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "global": {"apikey": "key", "persona": {"name": "bot"}},
+                "devices": [{"ip": "1.1.1.1", "selected_app": "xinyu"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    config = ConfigManager(config_path, tmp_path / "outbox.json")
+    ai = FakeAI()
+    history = ChatHistoryStore(tmp_path / "history")
+    processor = MessageProcessor(
+        device={"ip": "1.1.1.1"},
+        app_name="xinyu",
+        config_manager=config,
+        ai_client=ai,  # type: ignore[arg-type]
+        memory_store=MemoryStore(tmp_path / "memory"),
+        chat_history_store=history,
+    )
+    message = {"contact": "张三", "content": "最近忙吗", "message_time": "12:00", "source": "dialogue"}
+
+    action = processor.prepare_reply(message)
+    processor.mark_sent(action, message)
+
+    contacts = history.list_contacts(device_ip="1.1.1.1", app_name="xinyu", persona=ai.last_persona)
+    messages = history.get_messages(
+        device_ip="1.1.1.1",
+        app_name="xinyu",
+        contact_name="张三",
+        persona=ai.last_persona,
+    )
+    assert [contact["contact_name"] for contact in contacts] == ["张三"]
+    assert [entry["direction"] for entry in messages] == ["incoming", "outgoing"]
+    assert messages[0]["content"] == "最近忙吗"
+    assert messages[1]["content"] == action.text
+
+
+def test_message_processor_does_not_write_greeting_history(tmp_path):
+    config = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    ai = FakeAI()
+    history = ChatHistoryStore(tmp_path / "history")
+    processor = MessageProcessor(
+        device={"ip": "1.1.1.1"},
+        app_name="xinyu",
+        config_manager=config,
+        ai_client=ai,  # type: ignore[arg-type]
+        memory_store=MemoryStore(tmp_path / "memory"),
+        chat_history_store=history,
+    )
+    message = {"contact": "张三", "content": "你好", "message_time": "12:00"}
+
+    action = processor.prepare_reply(message)
+    processor.mark_sent(action, message)
+
+    assert history.list_contacts(device_ip="1.1.1.1", app_name="xinyu", persona=ai.last_persona) == []

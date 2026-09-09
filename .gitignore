@@ -16,23 +16,24 @@ wheelhouse/
 
 config.json
 *_ocr_config.json
+!apps/xinyu/dialogue_ocr_config.json
 outbox.json
 .env
 .env/
 .emv
-runtime/logs/*
-!runtime/logs/.gitkeep
-runtime/errors/*
-!runtime/errors/.gitkeep
-runtime/memory/*
-!runtime/memory/.gitkeep
-runtime/greetings/*
-!runtime/greetings/.gitkeep
-runtime/install_state.json
-runtime/legacy_device_templates/
-runtime/templates/
+*.bak
+.tmp_*
+_tmp_*
+Public/
+
+# runtime/ 下的全部内容都是运行数据，不入库
+runtime/*
+!runtime/.gitkeep
+
+# TTS 引擎资产（wheels + onnx 语音模型，119MB），构建时随包分发，不入库
+tts/piper/
+
 photo/
-_tmp_ui_check/
 192.*.jpg
 *.tmp
 

@@ -39,7 +39,15 @@ class XinyuApp(BaseApp):
     ) -> None:
         merged_config = _deep_merge(DEFAULT_CONFIG, config or {})
         steps._disable_dialogue_region_filter(merged_config)
-        super().__init__(robot, merged_config)
+        # Keep the worker-owned object so App settings hot refreshes (including
+        # an expanded send-button region) are visible to this running app.
+        if isinstance(config, dict):
+            config.clear()
+            config.update(merged_config)
+            active_config = config
+        else:
+            active_config = merged_config
+        super().__init__(robot, active_config)
         self.reply_provider = reply_provider or (lambda message: "")
         self.sent_callback = sent_callback
         self.continuity_required_provider = continuity_required_provider
@@ -259,7 +267,7 @@ class XinyuApp(BaseApp):
             list_content = self._clean_content(target.get("content", ""))
             use_list_content = self._can_reply_from_list(list_content)
             greeting_reply = ""
-            if use_list_content and list_content == "你好":
+            if use_list_content and list_content in {"你好", "对方发来礼物", "对方发来搭训礼物", "对方发来搭讪礼物", "他在等待来自你的问候，快聊聊~", "发布了新的动态"}:
                 reporter("greeting_reply_pick", "从 pingtai.txt 选择招呼语")
                 greeting_reply = self._pick_greeting_reply()
 
@@ -283,10 +291,46 @@ class XinyuApp(BaseApp):
 
             if use_list_content:
                 message = steps.build_list_message(target, list_content)
+                used_dialogue_content = False
+                # 列表通常只显示最后一条短消息；除“你好”快速路径外，
+                # 补读聊天详情以合并末尾连续的 sender1 消息。
+                if list_content not in {"你好", "对方发来礼物", "对方发来搭训礼物", "对方发来搭讪礼物", "他在等待来自你的问候，快聊聊~", "发布了新的动态", "对方发来搭礼物", "发布了新的动态"}:
+                    try:
+                        dialogue_message = steps.read_message(
+                            self.robot,
+                            self.config,
+                            target,
+                            image=chat_image,
+                            reporter=reporter,
+                        )
+                    except Exception as exc:
+                        dialogue_message = None
+                        self.emit_runtime_log(
+                            "warning",
+                            "列表内容对应的聊天详情 OCR 失败，继续使用列表内容",
+                            {"name": target_name, "error": str(exc)},
+                        )
+                    dialogue_content = (
+                        self._clean_content(dialogue_message.get("content", ""))
+                        if isinstance(dialogue_message, dict)
+                        else ""
+                    )
+                    if dialogue_content:
+                        message = dialogue_message
+                        used_dialogue_content = True
+                        reporter(
+                            "dialogue_content_merge",
+                            "列表内容补充聊天详情",
+                            log_label=f"列表内容补充聊天详情：{dialogue_content}",
+                        )
                 reporter(
                     "direct_content_reply",
-                    "使用列表内容作为对话输入",
-                    log_label=f"使用列表内容作为对话输入：{message.get('content', '')}",
+                    "使用聊天详情合并内容作为对话输入" if used_dialogue_content else "使用列表内容作为对话输入",
+                    log_label=(
+                        f"使用聊天详情合并内容作为对话输入：{message.get('content', '')}"
+                        if used_dialogue_content
+                        else f"使用列表内容作为对话输入：{message.get('content', '')}"
+                    ),
                 )
             else:
                 message = steps.read_message(self.robot, self.config, target, image=chat_image, reporter=reporter)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import time
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
@@ -21,6 +22,7 @@ _DEFAULT_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/126.0.0.0 Safari/537.36"
     ),
+    "Accept-Language": "zh-CN,zh;q=0.9",
 }
 _AJAX_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
@@ -156,7 +158,12 @@ def resolve_lanzou_update_package(
     path = str(payload.get("url", "") or "").strip()
     if not domain or not path:
         raise UpdateSourceError("Lanzou update ajax payload did not contain a usable download URL.")
-    download_url = f"{domain}/file/{path.lstrip('/')}"
+    download_url = _resolve_binary_download_url(
+        http,
+        fake_download_url=f"{domain}/file/{path.lstrip('/')}",
+        referer=entry.detail_url,
+        timeout_seconds=timeout_seconds,
+    )
 
     return ResolvedUpdatePackage(
         share_url=share_url,
@@ -175,8 +182,14 @@ def _get_with_acw(
     *,
     timeout_seconds: int,
     referer: str | None = None,
+    allow_redirects: bool = True,
 ) -> requests.Response:
-    response = session.get(url, headers=_request_headers(referer), timeout=timeout_seconds)
+    response = session.get(
+        url,
+        headers=_request_headers(referer),
+        timeout=timeout_seconds,
+        allow_redirects=allow_redirects,
+    )
     _raise_for_status(response)
     challenge = _ACW_ARG1_RE.search(response.text)
     if challenge:
@@ -184,9 +197,63 @@ def _get_with_acw(
         if not host:
             raise UpdateSourceError(f"Could not determine host for Lanzou challenge URL: {url}")
         session.cookies.set("acw_sc__v2", _solve_acw_sc_v2(challenge.group(1)), domain=host, path="/")
-        response = session.get(url, headers=_request_headers(referer), timeout=timeout_seconds)
+        response = session.get(
+            url,
+            headers=_request_headers(referer),
+            timeout=timeout_seconds,
+            allow_redirects=allow_redirects,
+        )
         _raise_for_status(response)
     return response
+
+
+def _resolve_binary_download_url(
+    session: requests.Session,
+    *,
+    fake_download_url: str,
+    referer: str,
+    timeout_seconds: int,
+) -> str:
+    download_page = _get_with_acw(
+        session,
+        fake_download_url,
+        timeout_seconds=timeout_seconds,
+        referer=referer,
+        allow_redirects=False,
+    )
+    location = str(download_page.headers.get("Location", "") or "").strip()
+    if location:
+        return urljoin(download_page.url, location)
+
+    html_text = download_page.text
+    if "网络异常" not in html_text:
+        raise UpdateSourceError("Lanzou download page did not redirect to a binary file.")
+
+    token_match = re.search(r"'file':'([^']+)'", html_text)
+    sign_match = re.search(r"'sign':'([^']+)'", html_text)
+    if not token_match or not sign_match:
+        raise UpdateSourceError("Lanzou verification page did not contain a usable download token.")
+
+    time.sleep(2.1)
+    ajax_response = session.post(
+        urljoin(download_page.url, "ajax.php"),
+        data={"file": token_match.group(1), "el": "2", "sign": sign_match.group(1)},
+        headers=_request_headers(download_page.url, ajax=True),
+        timeout=timeout_seconds,
+    )
+    _raise_for_status(ajax_response)
+    try:
+        payload = ajax_response.json()
+    except json.JSONDecodeError as exc:
+        raise UpdateSourceError("Lanzou verification ajax response was not valid JSON.") from exc
+
+    if str(payload.get("zt", "")) != "1":
+        raise UpdateSourceError(f"Lanzou verification ajax returned non-success payload: {payload!r}")
+
+    verified_url = str(payload.get("url", "") or "").strip()
+    if not verified_url or verified_url == "?SignError":
+        raise UpdateSourceError("Lanzou verification did not return a usable binary download URL.")
+    return urljoin(download_page.url, verified_url)
 
 
 def _raise_for_status(response: requests.Response) -> None:
@@ -349,22 +416,23 @@ def _extract_frame_url(detail_html: str, detail_url: str) -> str:
 
 
 def _build_frame_ajax_request(frame_html: str, frame_url: str) -> tuple[str, dict[str, str]]:
-    file_match = re.search(r"/ajaxm\.php\?file=(\d+)", frame_html)
+    # 蓝奏云新页面使用 ajaxfile.php，旧页面仍使用 ajaxm.php。
+    file_match = re.search(r"/(ajaxm|ajaxfile)\.php\?file=(\d+)", frame_html)
     ajaxdata = _extract_js_string(frame_html, "ajaxdata")
     wp_sign = _extract_js_string(frame_html, "wp_sign")
     if not file_match:
         raise UpdateSourceError("Could not find the Lanzou frame ajax endpoint.")
-    file_id = file_match.group(1)
-    ajax_url = urljoin(frame_url, f"/ajaxm.php?file={file_id}")
+    endpoint, file_id = file_match.groups()
+    ajax_url = urljoin(frame_url, f"/{endpoint}.php?file={file_id}")
+    kdns_match = re.search(r"var\s+kdns\s*=\s*([01])", frame_html)
     payload = {
         "action": "downprocess",
         "websignkey": ajaxdata,
         "signs": ajaxdata,
         "sign": wp_sign,
         "websign": "",
-        # The page loads kdns.js before issuing the ajax request, so the
-        # browser-side runtime normally keeps `kdns = 1`.
-        "kd": "1",
+        # 新页面会显式设置 kdns；旧页面没有时沿用原来的默认值。
+        "kd": kdns_match.group(1) if kdns_match else "1",
         "ves": "1",
     }
     return ajax_url, payload

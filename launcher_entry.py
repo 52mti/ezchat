@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from runtime_layout import (
@@ -34,6 +35,11 @@ def _runtime_python(root: Path) -> Path:
 
 def _runtime_python_fallback(root: Path) -> Path:
     return runtime_python(root, "app", gui=False)
+
+
+def _is_valid_runtime_python(path: Path) -> bool:
+    """Reject malformed layouts such as runtime/app/pythonw/.exe."""
+    return path.is_file() and path.name.lower() in {"python.exe", "pythonw.exe"}
 
 
 def _runtime_state_path(root: Path) -> Path:
@@ -148,38 +154,15 @@ def _write_launcher_error(root: Path, name: str, details: str) -> None:
         pass
 
 
-def _run_source_main() -> int:
-    module = importlib.import_module("main")
-    return int(module.main())
-
-
-def _bootstrap_script(root: Path) -> str:
-    return (
-        "import sys, traceback\n"
-        "from pathlib import Path\n"
-        f"root = Path({str(root)!r})\n"
-        "sys.path.insert(0, str(root))\n"
-        "try:\n"
-        "    from main import main as _entry\n"
-        "    raise SystemExit(int(_entry()))\n"
-        "except SystemExit:\n"
-        "    raise\n"
-        "except Exception:\n"
-        "    error_dir = root / 'runtime' / 'errors'\n"
-        "    error_dir.mkdir(parents=True, exist_ok=True)\n"
-        "    (error_dir / 'launcher_bootstrap_error.txt').write_text(traceback.format_exc(), encoding='utf-8')\n"
-        "    raise\n"
-    )
-
-
 def _spawn_packaged_app(root: Path) -> int:
     state = _load_runtime_state(root)
     if not state:
         _write_launcher_error(root, "launcher_start_error.txt", "missing runtime install state")
         return 1
-    target_python = _runtime_python(root) if _runtime_python(root).is_file() else _runtime_python_fallback(root)
-    if not target_python.is_file():
-        _write_launcher_error(root, "launcher_start_error.txt", "missing runtime python")
+    app_entry = root / "app_core_entry.pyc"
+    app_modules = root / "app_modules.zip"
+    if not app_entry.is_file() or not app_modules.is_file():
+        _write_launcher_error(root, "launcher_start_error.txt", "missing protected application bytecode")
         return 1
 
     cache_home = _cache_home_from_state(root, state)
@@ -190,14 +173,44 @@ def _spawn_packaged_app(root: Path) -> int:
     env["PADDLEX_HOME"] = str(cache_home)
     env.pop("PYTHONPATH", None)
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    command = [str(target_python), "-s", "-u", "-c", _bootstrap_script(root)]
-    process = subprocess.Popen(command, cwd=root, env=env, creationflags=creationflags)
+    env["JIXIEBI_PACKAGE_ROOT"] = str(root)
+    # 仅发布启动器设置此标识。开发时直接运行 main.py 不应触发客户更新检查。
+    env["JIXIEBI_PACKAGED_LAUNCH"] = "1"
+    gui_python = _runtime_python(root)
+    console_python = _runtime_python_fallback(root)
+    # Some customer machines lose pythonw.exe during an interrupted update.
+    # Always use a real file and fall back to python.exe instead of spawning a
+    # path that only exists as the preferred candidate name.
+    target_python = gui_python if _is_valid_runtime_python(gui_python) else console_python
+    if not _is_valid_runtime_python(target_python):
+        _write_launcher_error(root, "launcher_start_error.txt", "missing runtime python")
+        return 1
+    command = [str(target_python), "-s", "-u", str(app_entry)]
+    error_log = root / "runtime" / "errors" / "application_stderr.log"
+    error_log.parent.mkdir(parents=True, exist_ok=True)
+    with error_log.open("a", encoding="utf-8", errors="replace") as error_handle:
+        error_handle.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        error_handle.write(f"python={target_python}\ncommand={command!r}\n")
+        error_handle.flush()
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=root,
+                env=env,
+                creationflags=creationflags,
+                stdout=error_handle,
+                stderr=error_handle,
+            )
+        except TypeError:
+            # Keep compatibility with lightweight test doubles and old hosts.
+            process = subprocess.Popen(command, cwd=root, env=env, creationflags=creationflags)
     exit_code = int(process.wait())
     if exit_code != 0:
         _write_launcher_error(
             root,
             "launcher_exit_status.txt",
-            f"exit_code={exit_code}\npython={target_python}\ncommand={command!r}\n",
+            f"exit_code={exit_code}\npython={target_python}\ncommand={command!r}\n"
+            f"stderr_log={error_log}\n",
         )
     return exit_code
 
@@ -210,7 +223,7 @@ def main() -> int:
             _show_missing_runtime_message()
             return 1
         return _spawn_packaged_app(root)
-    return _run_source_main()
+    return int(importlib.import_module("main").main())
 
 
 if __name__ == "__main__":

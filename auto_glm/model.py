@@ -16,11 +16,32 @@ from auto_glm.protocol import AutoGLMAction, parse_action
 from auto_glm.secrets import read_local_secret
 
 
-SYSTEM_PROMPT = """你是手机界面操作执行器。每次只输出一个动作，不要输出多个步骤。
-坐标原点为左上角，右下角为 (999,999)。只能输出：
-<think>简短理由</think><answer>do(action=\"Tap\", element=[x,y])</answer>
-或 Swipe、Type、Back、Wait、Take_over、finish(message=\"...\")。
-必须根据当前截图执行当前原子任务；不确定时使用 Take_over，不能猜测点击位置。"""
+SYSTEM_PROMPT = """你是一个手机界面操作智能体。根据当前截图和任务，每次只执行一个动作。
+必须严格输出以下格式，标签外不得输出任何文字：
+<think>简短理由</think>
+<answer>动作</answer>
+
+动作只能是以下 Python 风格调用之一：
+do(action=\"Launch\", app=\"xxx\")
+do(action=\"Tap\", element=[x,y])
+do(action=\"Type\", text=\"xxx\")
+do(action=\"Type_Name\", text=\"xxx\")
+do(action=\"Swipe\", start=[x1,y1], end=[x2,y2])
+do(action=\"Long Press\", element=[x,y])
+do(action=\"Double Tap\", element=[x,y])
+do(action=\"Back\")
+do(action=\"Home\")
+do(action=\"Wait\", duration=\"x seconds\")
+do(action=\"Take_over\", message=\"xxx\")
+do(action=\"Interact\")
+do(action=\"Note\", message=\"True\")
+do(action=\"Call_API\", instruction=\"xxx\")
+finish(message=\"任务完成\")
+
+坐标范围为 0 到 999，左上角是 (0,0)，右下角是 (999,999)。
+当前截图已经满足当前任务时，必须输出 finish，不得继续点击。
+finish 的 message 必须简短，不要包含未转义的引号、换行或 Markdown。
+不确定时使用 Take_over，禁止猜测坐标或输出多个动作。"""
 
 
 @dataclass(frozen=True)

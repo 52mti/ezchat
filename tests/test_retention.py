@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timedelta
 
 from services.retention import cleanup_old_error_captures
-from services.runtime_logging import cleanup_old_logs, setup_runtime_logging
+from services.runtime_logging import cleanup_old_logs, setup_runtime_logging, write_error_incident
 
 
 def test_cleanup_old_logs_removes_expired_files(tmp_path):
@@ -48,3 +48,31 @@ def test_cleanup_old_error_captures_keeps_latest_files(tmp_path):
     remaining = list(error_dir.glob("*.jpg"))
     assert removed == 2
     assert len(remaining) == 3
+
+
+def test_write_error_incident_writes_json_and_log(tmp_path):
+    json_path, log_path = write_error_incident(
+        {
+            "incident_id": "demo_001",
+            "device_ip": "192.168.1.108",
+            "app_name": "xinyu",
+            "started_at": "2026-06-09T12:00:00",
+            "ended_at": "2026-06-09T12:00:10",
+            "status": "recovered",
+            "error_count_peak": 1,
+            "circuit_open": False,
+            "ocr_backend": "GPU",
+            "error_screenshot": "photo/errors/demo.jpg",
+            "current_capture_path": "photo/captures/demo.jpg",
+            "related_capture_paths": ["photo/captures/demo.jpg"],
+            "template_paths": ["apps/xinyu/templates/screens/screen_聊天列表.jpg"],
+            "pre_error_logs": [{"time": "2026-06-09 12:00:00", "level": "info", "message": "before", "payload": {}}],
+            "timeline_logs": [{"time": "2026-06-09 12:00:01", "level": "warning", "message": "during", "payload": {}}],
+            "errors": [{"time": "2026-06-09 12:00:01", "error_count": 1, "threshold": 5, "step_label": "列表 OCR 扫描", "error": "boom"}],
+        },
+        tmp_path / "incidents",
+    )
+
+    assert json_path.is_file()
+    assert log_path.is_file()
+    assert "demo_001" in log_path.read_text(encoding="utf-8")

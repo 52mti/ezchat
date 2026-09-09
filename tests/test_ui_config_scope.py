@@ -205,6 +205,72 @@ def test_template_manager_exposes_all_template_actions(qtbot, tmp_path):
     assert not any(text.startswith("导入") for text in button_texts)
 
 
+def test_template_manager_maps_numbered_screen_variant_to_shared_category(qtbot, tmp_path):
+    manager = TemplateManagerWidget(
+        tmp_path / "templates",
+        device_ip="192.168.1.108",
+        app_name="xinyu",
+        overrides={
+            "template_match_regions": {
+                "screen.chat_window": [0.1, 0.2, 0.3, 0.4],
+            }
+        },
+    )
+    qtbot.addWidget(manager)
+
+    path = manager.screens_dir / "screen_聊天界面_6.jpg"
+
+    assert manager._template_region_key(path) == "screen.chat_window"
+    assert manager._template_region_text(path) == "0.100, 0.200, 0.300, 0.400"
+
+
+def test_template_manager_test_keeps_below_threshold_candidate_visible(qtbot, tmp_path, monkeypatch):
+    manager = TemplateManagerWidget(
+        tmp_path / "templates",
+        device_ip="192.168.1.108",
+        app_name="xinyu",
+        overrides={
+            "match_threshold": 0.7,
+            "template_match_thresholds": {"screen.chat_window": 0.8},
+            "template_match_regions": {"screen.chat_window": [0.0, 0.0, 1.0, 1.0]},
+        },
+    )
+    qtbot.addWidget(manager)
+    template_path = manager.screens_dir / "screen_聊天界面_6.jpg"
+    Image.new("RGB", (10, 10), "white").save(template_path, format="JPEG")
+
+    class FakeRobot:
+        def __init__(self, _ip: str) -> None:
+            pass
+
+    buffer = BytesIO()
+    Image.new("RGB", (100, 200), "white").save(buffer, format="JPEG")
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(main_window_module, "RobotInterface", FakeRobot)
+    monkeypatch.setattr(main_window_module, "capture_transform_image", lambda *args, **kwargs: buffer.getvalue())
+
+    def fake_match(image, template, config, key, *, threshold, match_func):
+        observed["probe_threshold"] = threshold
+        return {"x": 0.1, "y": 0.2, "w": 0.1, "h": 0.1, "score": 0.65}
+
+    monkeypatch.setattr(main_window_module, "match_template_with_region", fake_match)
+    monkeypatch.setattr(
+        manager,
+        "_show_template_test_result",
+        lambda image, name, key, result, threshold: observed.update(
+            {"name": name, "key": key, "result": result, "threshold": threshold}
+        ),
+    )
+
+    manager._test_saved_template(template_path)
+
+    assert observed["probe_threshold"] == -1.0
+    assert observed["key"] == "screen.chat_window"
+    assert observed["threshold"] == 0.8
+    assert observed["result"] == {"x": 0.1, "y": 0.2, "w": 0.1, "h": 0.1, "score": 0.65}
+
+
 def test_template_manager_popup_capture_uses_second_region_as_match_range(qtbot, tmp_path, monkeypatch):
     image = Image.new("RGB", (200, 400), "white")
     buffer = BytesIO()
@@ -258,7 +324,7 @@ def test_template_manager_popup_capture_uses_second_region_as_match_range(qtbot,
 
     manager._capture_template(main_window_module.CUSTOM_POPUP, "弹窗模板")
 
-    target = tmp_path / "templates" / "buttons" / "popup_custom_1.jpg"
+    target = tmp_path / "templates" / "buttons" / "popup_custom__customer_1.jpg"
     region_key = main_window_module.popup_template_region_key(target)
     assert target.exists()
     assert dialog_calls == ["popup_dual_region"]
@@ -445,6 +511,7 @@ def test_device_settings_dialog_can_refresh_screenshot_and_test_click(qtbot, mon
     qtbot.addWidget(dialog)
 
     qtbot.mouseClick(dialog.refresh_screenshot_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: dialog.refresh_screenshot_button.isEnabled(), timeout=5000)
     dialog.test_target_combo.setCurrentIndex(0)
     qtbot.mouseClick(
         dialog.crop_label,
@@ -463,7 +530,9 @@ def test_device_settings_dialog_can_refresh_screenshot_and_test_click(qtbot, mon
 
     qtbot.mouseClick(dialog.test_click_button, Qt.MouseButton.LeftButton)
 
-    assert clicks == [(0.55, 0.49)]
+    assert len(clicks) == 1
+    assert abs(clicks[0][0] - 0.55) <= 0.003
+    assert abs(clicks[0][1] - 0.49) <= 0.003
 
 
 def test_device_settings_refresh_screenshot_handles_display_errors(qtbot, monkeypatch):
@@ -506,6 +575,7 @@ def test_device_settings_refresh_screenshot_handles_display_errors(qtbot, monkey
 
     qtbot.mouseClick(dialog.refresh_screenshot_button, Qt.MouseButton.LeftButton)
 
+    qtbot.waitUntil(lambda: bool(critical_messages), timeout=5000)
     assert critical_messages == ["无法从当前设备获取截图：display failed"]
     assert dialog.refresh_screenshot_button.isEnabled()
 

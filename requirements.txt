@@ -6,6 +6,9 @@ requests
 paddleocr==3.4.0
 paddlex[ocr-core]==3.4.3
 pywin32; platform_system == "Windows"
+piper-tts==1.7.0
+fastapi
+uvicorn
 
 # Full-package OCR runtimes are assembled during build:
 # - Common OCR packages: paddleocr + paddlex[ocr-core]

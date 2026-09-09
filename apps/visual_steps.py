@@ -7,7 +7,7 @@ from apps.coordinates import click_image_point
 from apps.photo_capture import capture_transform_image
 from apps.reporting import Reporter, format_point, report_step
 from apps.step_timing import exclude_ocr_wait_from_step_timeout
-from apps.utils import tts_input
+from apps.utils import play_prepared_tts_input, prepare_tts_input
 from vision import match, run_ocr_mode
 
 from .visual_assets import (
@@ -19,9 +19,11 @@ from .visual_assets import (
     SEND_BUTTON,
     VOICE_INPUT_BUTTON,
     back_button_template_paths,
+    format_template_match_diagnostic,
     popup_template_region_key,
     popup_template_paths,
     region_rule,
+    match_template_candidates_with_region,
     match_template_with_region,
     template_path,
 )
@@ -88,18 +90,22 @@ def _template_center(image: Any, config: dict[str, Any], key: str) -> tuple[floa
             templates.append(template)
     if not templates:
         return None
-    for template in templates:
-        result = match_template_with_region(
-            image,
-            template,
-            config,
-            key,
-            threshold=_threshold(config),
-            match_func=match,
-        )
-        if result:
-            return result["x"] + result["w"] / 2, result["y"] + result["h"] / 2
+    result = match_template_candidates_with_region(
+        image,
+        templates,
+        config,
+        key,
+        threshold=_threshold(config),
+        match_func=match,
+        single_match_func=match_template_with_region,
+    )
+    if result:
+        return result["x"] + result["w"] / 2, result["y"] + result["h"] / 2
     return None
+
+
+def _template_failure_detail(config: dict[str, Any], key: str) -> str:
+    return format_template_match_diagnostic(config, key)
 
 
 def is_screen(image: Any, config: dict[str, Any], key: str) -> bool:
@@ -209,7 +215,7 @@ def read_message(
     _report(reporter, "dialogue_ocr_read", "对话 OCR 读取")
     image = capture_after_popups(robot, cfg, reporter=reporter)
     if template_path(cfg, CHAT_WINDOW_SCREEN) is not None and not is_screen(image, cfg, CHAT_WINDOW_SCREEN):
-        raise StepUnavailable("chat window screen template did not match")
+        raise StepUnavailable(f"chat window screen template did not match：{_template_failure_detail(cfg, CHAT_WINDOW_SCREEN)}")
     ocr_result = _run_ocr_mode(image, cfg, "dialogue", region=_region(cfg, CHAT_AREA_REGION))
     items = ocr_result["ocr_items"]
     if not items:
@@ -228,16 +234,19 @@ def input_reply(
     reporter: Reporter | None = None,
 ) -> None:
     cfg = config or {}
+    _report(reporter, "tts_prepare", "合成 TTS 音频", log_label="TTS 音频合成中，完成后再点击麦克风")
+    prepared_chunks = prepare_tts_input(robot, text)
+    _report(reporter, "tts_prepared", "TTS 音频已就绪", log_label="TTS 音频已就绪，准备点击麦克风播放")
     image = capture_after_popups(robot, cfg, reporter=reporter)
     pos = _template_center(image, cfg, VOICE_INPUT_BUTTON)
     if pos is None:
         if template_path(cfg, VOICE_INPUT_BUTTON) is None:
             raise StepUnavailable("voice input template is missing")
-        raise StepUnavailable("voice input button was not found")
+        raise StepUnavailable(f"voice input button was not found：{_template_failure_detail(cfg, VOICE_INPUT_BUTTON)}")
     _report(reporter, "voice_input_click", "点击语音输入", log_label=f"点击语音输入：{format_point(*pos)}")
     click_image_point(robot, *pos)
     _report(reporter, "tts_playback", "播放 TTS 回复")
-    tts_input(robot, text)
+    play_prepared_tts_input(robot, prepared_chunks)
 
 
 def send_reply(robot: Any, config: dict[str, Any] | None = None, reporter: Reporter | None = None) -> None:
@@ -247,7 +256,7 @@ def send_reply(robot: Any, config: dict[str, Any] | None = None, reporter: Repor
     if pos is None:
         if template_path(cfg, SEND_BUTTON) is None:
             raise StepUnavailable("send button template is missing")
-        raise StepUnavailable("send button was not found")
+        raise StepUnavailable(f"send button was not found：{_template_failure_detail(cfg, SEND_BUTTON)}")
     _report(reporter, "send_button_click", "点击发送按钮", log_label=f"点击发送按钮：{format_point(*pos)}")
     click_image_point(robot, *pos)
 

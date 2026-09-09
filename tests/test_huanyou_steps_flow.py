@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from apps.huanyou import app as huanyou_app
 
@@ -48,6 +49,107 @@ def test_huanyou_chat_window_screen_uses_lower_match_threshold(monkeypatch, tmp_
 
     assert thresholds[huanyou_app.steps.CHAT_WINDOW_SCREEN] == 0.7
     assert thresholds[huanyou_app.steps.CHAT_LIST_SCREEN] == 0.85
+
+
+def test_huanyou_chat_list_title_ocr_confirms_list_without_template(monkeypatch):
+    reports: list[tuple[str, str]] = []
+    config = {
+        "enable_bottom_message_recovery": False,
+        "template_match_regions": {huanyou_app.steps.CHAT_LIST_SCREEN: [0.0, 0.0, 1.0, 0.12]},
+    }
+
+    monkeypatch.setattr(huanyou_app.steps, "_matches_screen", lambda image, config, key: False)
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "_run_ocr_mode",
+        lambda image, config, mode, region=None: {
+            "ocr_items": [{"text": "消息关系", "x": 0.45, "y": 0.05, "w": 0.1, "h": 0.03}],
+            "result": {},
+        },
+    )
+
+    matched = huanyou_app.steps._matches_chat_list_screen(
+        b"image",
+        config,
+        reporter=lambda key, label, log_label=None: reports.append((key, label)),
+    )
+
+    assert matched is True
+    assert ("chat_list_title_ocr", "识别到消息关系，判定聊天列表") in reports
+
+
+def test_huanyou_chat_list_title_ocr_confirms_split_message_relation_without_template(monkeypatch):
+    reports: list[tuple[str, str]] = []
+    config = {
+        "enable_bottom_message_recovery": False,
+        "template_match_regions": {huanyou_app.steps.CHAT_LIST_SCREEN: [0.0, 0.0, 1.0, 0.12]},
+    }
+
+    monkeypatch.setattr(huanyou_app.steps, "_matches_screen", lambda image, config, key: False)
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "_run_ocr_mode",
+        lambda image, config, mode, region=None: {
+            "ocr_items": [
+                {"text": "消息（5)", "x": 0.0, "y": 0.05, "w": 0.18, "h": 0.03},
+                {"text": "关系", "x": 0.225, "y": 0.06, "w": 0.10, "h": 0.025},
+            ],
+            "result": {},
+        },
+    )
+
+    matched = huanyou_app.steps._matches_chat_list_screen(
+        b"image",
+        config,
+        reporter=lambda key, label, log_label=None: reports.append((key, label)),
+    )
+
+    assert matched is True
+    assert ("chat_list_title_ocr", "识别到消息关系，判定聊天列表") in reports
+
+
+def test_huanyou_reuses_same_screenshot_ocr_and_template_detection(monkeypatch, tmp_path):
+    screens_dir = tmp_path / "screens"
+    buttons_dir = tmp_path / "buttons"
+    screens_dir.mkdir()
+    buttons_dir.mkdir()
+    (screens_dir / "screen_聊天列表.jpg").write_bytes(b"template")
+    config = {
+        "templates": {"screens": str(screens_dir), "buttons": str(buttons_dir)},
+        "ocr": {"runtime_enabled": True},
+        "ocr_modes": {
+            "list": {
+                "preprocess": {"mode": "original", "scale": 1},
+                "rules": {"min_confidence": 0.1, "min_box_height_ratio": 0.01},
+            }
+        },
+    }
+    image = Image.new("RGB", (120, 240), "white")
+    ocr_calls = 0
+    match_calls = 0
+
+    def fake_ocr(image, cfg, mode, region=None):
+        nonlocal ocr_calls
+        ocr_calls += 1
+        return {"result": {"message_list": [], "bottom_nav": []}, "ocr_items": []}
+
+    def fake_match_template_with_region(image, template, config, key, *, threshold, match_func):
+        nonlocal match_calls
+        match_calls += 1
+        return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+
+    monkeypatch.setattr(huanyou_app.steps, "run_ocr_mode", fake_ocr)
+    monkeypatch.setattr(huanyou_app.steps, "match_template_with_region", fake_match_template_with_region)
+
+    first = huanyou_app.steps._run_ocr_mode(image, config, "list", region=None)
+    second = huanyou_app.steps._run_ocr_mode(image, config, "list", region=None)
+    assert ocr_calls == 1
+    assert first.get("_cache_hit") is not True
+    assert second.get("_cache_hit") is True
+
+    assert huanyou_app.steps._matches_screen(image, config, huanyou_app.steps.CHAT_LIST_SCREEN)
+    assert huanyou_app.steps._matches_screen(image, config, huanyou_app.steps.CHAT_LIST_SCREEN)
+    assert match_calls == 1
 
 
 @pytest.fixture(autouse=True)
@@ -162,10 +264,11 @@ def test_huanyou_app_records_contact_send_count_after_successful_send(monkeypatc
     assert ("info", "huanyou_contact_send_count", {"contact": "alice", "count": 1}) in logs
 
 
-def test_huanyou_app_keeps_chat_when_next_name_is_unconfirmed(monkeypatch):
+def test_huanyou_app_retries_next_when_unconfirmed_name_is_same_contact(monkeypatch):
     robot = FakeRobot()
     read_targets: list[dict[str, object]] = []
     go_back_calls: list[int] = []
+    next_calls: list[int] = []
 
     monkeypatch.setattr(huanyou_app.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(huanyou_app.steps.time, "sleep", lambda seconds: None)
@@ -204,18 +307,22 @@ def test_huanyou_app_keeps_chat_when_next_name_is_unconfirmed(monkeypatch):
     monkeypatch.setattr(huanyou_app.steps, "read_message", fake_read_message)
     monkeypatch.setattr(huanyou_app.steps, "input_reply", lambda robot, text, config, reporter=None: None)
     monkeypatch.setattr(huanyou_app.steps, "send_reply", lambda robot, config, reporter=None: 1)
-    monkeypatch.setattr(
-        huanyou_app.steps,
-        "click_next_message_until_changed",
-        lambda robot, config, expected_name=None, image=None, reporter=None: (image or b"next_image", "", 1, None),
-    )
+    def fake_next_message(robot, config, expected_name=None, image=None, reporter=None):
+        next_calls.append(1)
+        if len(next_calls) == 1:
+            return image or b"next_image", "", 1, None
+        return image or b"next_image", "new-user", 1, (0.5, 0.06)
+
+    monkeypatch.setattr(huanyou_app.steps, "click_next_message_until_changed", fake_next_message)
+    monkeypatch.setattr(huanyou_app.steps, "read_chat_contact_name", lambda *args, **kwargs: "same-user")
     monkeypatch.setattr(huanyou_app.steps, "go_back", lambda robot, config, reporter=None, **kwargs: go_back_calls.append(1))
 
     app = huanyou_app.HuanyouApp(robot, {}, reply_provider=lambda message: "reply")
 
     app.run_once()
 
-    assert len(read_targets) == 2
+    assert [target.get("name") for target in read_targets] == ["same-user", "new-user"]
+    assert len(next_calls) == 2
     assert go_back_calls == []
     assert app.status.last_error == "stop after verifying continued chat"
     assert robot.clicks == [(0.2, 0.3), (0.5, 0.3)]
@@ -288,6 +395,7 @@ def test_huanyou_app_empty_target_enters_idle_wait_without_keep_awake(monkeypatc
     calls: list[str] = []
 
     monkeypatch.setattr(huanyou_app.steps, "find_unread_target", lambda robot, config, reporter=None: None)
+    monkeypatch.setattr(huanyou_app.steps, "ensure_list_screen", lambda robot, config, reporter=None, **kwargs: b"list")
     monkeypatch.setattr(
         huanyou_app.steps,
         "read_my_points",
@@ -319,6 +427,7 @@ def test_huanyou_app_checks_and_caches_back_button_on_first_run(monkeypatch):
     )
     monkeypatch.setattr(huanyou_app.steps, "find_unread_target", lambda robot, config, reporter=None: calls.append("find") or None)
     monkeypatch.setattr(huanyou_app.steps, "rescan_unread_target", lambda robot, config, reporter=None: calls.append("rescan") or None)
+    monkeypatch.setattr(huanyou_app.steps, "ensure_list_screen", lambda robot, config, reporter=None, **kwargs: b"list")
     monkeypatch.setattr(huanyou_app.steps, "read_my_points", lambda robot, config, reporter=None: None)
     monkeypatch.setattr(huanyou_app.steps, "keep_screen_awake", lambda robot, config, reporter=None: False)
 
@@ -370,6 +479,7 @@ def test_huanyou_app_emits_round_metrics_for_empty_target(monkeypatch):
         return None
 
     monkeypatch.setattr(huanyou_app.steps, "find_unread_target", fake_find_unread_target)
+    monkeypatch.setattr(huanyou_app.steps, "ensure_list_screen", lambda robot, config, reporter=None, **kwargs: b"list")
     monkeypatch.setattr(huanyou_app.steps, "read_my_points", lambda robot, config, reporter=None: None)
     monkeypatch.setattr(huanyou_app.steps, "keep_screen_awake", lambda robot, config, reporter=None: False)
 
@@ -391,6 +501,7 @@ def test_huanyou_app_empty_target_runs_keep_awake_after_idle_interval(monkeypatc
     calls: list[str] = []
 
     monkeypatch.setattr(huanyou_app.steps, "find_unread_target", lambda robot, config, reporter=None: None)
+    monkeypatch.setattr(huanyou_app.steps, "ensure_list_screen", lambda robot, config, reporter=None, **kwargs: b"list")
     monkeypatch.setattr(
         huanyou_app.steps,
         "read_my_points",
@@ -408,6 +519,38 @@ def test_huanyou_app_empty_target_runs_keep_awake_after_idle_interval(monkeypatc
     app.run_once()
 
     assert calls == ["points", "keep_awake"]
+
+
+def test_huanyou_app_does_not_enter_keep_awake_when_list_not_confirmed(monkeypatch):
+    robot = FakeRobot()
+    calls: list[str] = []
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(huanyou_app.steps, "find_unread_target", lambda robot, config, reporter=None: None)
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "ensure_list_screen",
+        lambda robot, config, reporter=None, **kwargs: calls.append("ensure_list") or None,
+    )
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "read_my_points",
+        lambda robot, config, reporter=None: (_ for _ in ()).throw(AssertionError("points should not run")),
+    )
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "keep_screen_awake",
+        lambda robot, config, reporter=None: (_ for _ in ()).throw(AssertionError("keep awake should not run")),
+    )
+
+    app = huanyou_app.HuanyouApp(robot, {"keep_awake_interval_seconds": 30})
+    app.last_activity_at -= 31
+    app.set_status_callback(events.append)
+
+    app.run_once()
+
+    assert calls == ["ensure_list"]
+    assert any(event["current_step"] == "idle_list_recover_failed" for event in events)
 
 
 def test_huanyou_app_recaptures_before_new_greeting_after_retract(monkeypatch):
@@ -637,6 +780,7 @@ def test_play_voice_reply_reports_when_microphone_missing(monkeypatch):
 
     monkeypatch.setattr(huanyou_app.steps, "capture_after_popups", lambda *args, **kwargs: b"image")
     monkeypatch.setattr(huanyou_app.steps, "_template_center", lambda image, config, key, group: None)
+    monkeypatch.setattr(huanyou_app.steps, "prepare_tts_input", lambda robot, text: [text])
     monkeypatch.setattr(huanyou_app.steps.time, "monotonic", lambda: now[0])
 
     def fake_sleep(seconds: float) -> None:
@@ -738,6 +882,32 @@ def test_go_back_clicks_twice_when_requested(monkeypatch):
     assert robot.clicks == [(0.3, 0.4), (0.3, 0.4)]
 
 
+def test_go_back_force_click_ignores_initial_list_match(monkeypatch):
+    robot = FakeRobot()
+
+    monkeypatch.setattr(huanyou_app.steps.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(huanyou_app.steps, "ensure_send_cleared", lambda robot, config, reporter=None: 0)
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "capture_after_popups",
+        lambda robot, config, label="screen", max_dismiss=2, reporter=None: label,
+    )
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "_matches_screen",
+        lambda image, config, key: image in {"go_back", "after_go_back"},
+    )
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "_template_center_with_path",
+        lambda image, config, key, group: (0.742, 0.97, Path("cached_back")),
+    )
+
+    huanyou_app.steps.go_back(robot, {}, click_count=2, force_click=True)
+
+    assert robot.clicks == [(0.742, 0.97), (0.742, 0.97)]
+
+
 def test_click_next_message_until_changed_retries_same_contact(monkeypatch):
     robot = FakeRobot()
     confirmed_images = iter([b"same_image", b"next_image"])
@@ -803,7 +973,7 @@ def test_consume_new_greetings_stops_without_next_when_expected_name(monkeypatch
 def test_huanyou_keep_screen_awake_clicks_message_once(monkeypatch):
     robot = FakeRobot()
 
-    monkeypatch.setattr(huanyou_app.steps, "ensure_list_screen", lambda robot, config, reporter=None: b"list")
+    monkeypatch.setattr(huanyou_app.steps, "ensure_list_screen", lambda robot, config, reporter=None, **kwargs: b"list")
     monkeypatch.setattr(
         huanyou_app.steps,
         "_run_ocr_mode",
@@ -819,8 +989,25 @@ def test_huanyou_keep_screen_awake_clicks_message_once(monkeypatch):
     assert robot.clicks == [(0.6965, 0.936)]
 
 
+def test_huanyou_caches_bottom_my_from_message_when_my_missing():
+    config = {}
+    ocr_result = {
+        "result": {
+            "bottom_nav": [
+                {"name": "消息", "bounds": [0.663, 0.926, 0.73, 0.946]},
+            ]
+        }
+    }
+
+    huanyou_app.steps._cache_bottom_nav_from_ocr_result(config, ocr_result)
+
+    assert huanyou_app.steps._cached_bottom_nav_point(config, "消息") == pytest.approx((0.6965, 0.936))
+    assert huanyou_app.steps._cached_bottom_nav_point(config, "我的") == pytest.approx((0.8965, 0.936))
+
+
 def test_huanyou_app_skips_scroll_when_new_greeting_exists(monkeypatch):
     robot = FakeRobot()
+    go_back_calls: list[dict[str, object]] = []
 
     monkeypatch.setattr(
         huanyou_app.steps,
@@ -841,7 +1028,11 @@ def test_huanyou_app_skips_scroll_when_new_greeting_exists(monkeypatch):
         "consume_new_greetings",
         lambda robot, config, image=None, expected_name=None, reporter=None: (image or b"image", 1, True),
     )
-    monkeypatch.setattr(huanyou_app.steps, "go_back", lambda robot, config, reporter=None, **kwargs: None)
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "go_back",
+        lambda robot, config, reporter=None, **kwargs: go_back_calls.append(kwargs),
+    )
 
     app = huanyou_app.HuanyouApp(robot, {}, reply_provider=lambda message: "回复")
 
@@ -849,6 +1040,7 @@ def test_huanyou_app_skips_scroll_when_new_greeting_exists(monkeypatch):
 
     assert robot.clicks == [(0.2, 0.3)]
     assert robot.swipes == []
+    assert go_back_calls == [{"force_click": True}]
 
 
 def test_huanyou_app_reads_new_contact_after_consuming_greeting_and_switching(monkeypatch):
@@ -1354,6 +1546,37 @@ def test_huanyou_ensure_list_screen_clicks_back_on_unknown_screen(monkeypatch):
     assert back_calls == [b"unknown"]
 
 
+def test_huanyou_ensure_list_screen_can_skip_unknown_back(monkeypatch):
+    robot = FakeRobot()
+    back_calls: list[bytes] = []
+    reports: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(huanyou_app.steps.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "capture_after_popups",
+        lambda robot, config, label="screen", max_dismiss=2, reporter=None: b"unknown",
+    )
+    monkeypatch.setattr(huanyou_app.steps, "_raise_if_abnormal_screen", lambda image, config: None)
+    monkeypatch.setattr(huanyou_app.steps, "_matches_screen", lambda image, config, key: False)
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "_click_back_once",
+        lambda robot, config, image=None, reporter=None: back_calls.append(image) or True,
+    )
+
+    image = huanyou_app.steps.ensure_list_screen(
+        robot,
+        {},
+        reporter=lambda key, label, log_label=None: reports.append((key, label)),
+        allow_unknown_back=False,
+    )
+
+    assert image is None
+    assert back_calls == []
+    assert ("unknown_screen_recover", "列表未确认，空闲复扫跳过返回") in reports
+
+
 def test_find_unread_target_rescans_after_bottom_nav_message_click(monkeypatch):
     robot = FakeRobot()
     ocr_calls: list[bytes] = []
@@ -1459,6 +1682,45 @@ def test_huanyou_read_my_points_uses_list_bottom_nav_positions(monkeypatch):
     assert robot.clicks == [(0.8955, 0.935), (0.6965, 0.936)]
 
 
+def test_huanyou_read_my_points_uses_cached_my_without_list_ocr(monkeypatch):
+    robot = FakeRobot()
+    seen_modes: list[tuple[object, str]] = []
+    config = {
+        "_runtime_cache": {
+            "screen_anchors": {
+                "bottom_my": (0.8965, 0.936),
+                "bottom_message": (0.6965, 0.936),
+            }
+        }
+    }
+
+    monkeypatch.setattr(huanyou_app.steps.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "ensure_list_screen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cached my should skip list screen check")),
+    )
+    monkeypatch.setattr(
+        huanyou_app.steps,
+        "capture_after_popups",
+        lambda robot, config, label="screen", max_dismiss=2, reporter=None: b"my_image"
+        if label == "my_screen"
+        else b"after_points",
+    )
+
+    def fake_run_ocr_mode(image, config, mode, region=None):
+        seen_modes.append((image, mode))
+        if image == b"my_image" and mode == "points":
+            return {"result": {"points": "124.15"}}
+        raise AssertionError(f"unexpected OCR call: {image!r} {mode}")
+
+    monkeypatch.setattr(huanyou_app.steps, "run_ocr_mode", fake_run_ocr_mode)
+
+    assert huanyou_app.steps.read_my_points(robot, config) == "124.15"
+    assert seen_modes == [(b"my_image", "points")]
+    assert robot.clicks == [(0.8965, 0.936), (0.6965, 0.936)]
+
+
 def test_huanyou_app_reads_points_once_per_idle_wait_and_reports_balance(monkeypatch):
     robot = FakeRobot()
     calls: list[str] = []
@@ -1466,6 +1728,7 @@ def test_huanyou_app_reads_points_once_per_idle_wait_and_reports_balance(monkeyp
 
     monkeypatch.setattr(huanyou_app.steps, "find_unread_target", lambda robot, config, reporter=None: None)
     monkeypatch.setattr(huanyou_app.steps, "rescan_unread_target", lambda robot, config, reporter=None: calls.append("rescan") or None)
+    monkeypatch.setattr(huanyou_app.steps, "ensure_list_screen", lambda robot, config, reporter=None, **kwargs: b"list")
     monkeypatch.setattr(huanyou_app.steps, "read_my_points", lambda robot, config, reporter=None: calls.append("points") or "124.15")
     monkeypatch.setattr(huanyou_app.steps, "keep_screen_awake", lambda robot, config, reporter=None: calls.append("keep_awake") or True)
 
@@ -1485,6 +1748,7 @@ def test_huanyou_idle_wait_uses_list_rescan_instead_of_full_list_confirm(monkeyp
 
     monkeypatch.setattr(huanyou_app.steps, "find_unread_target", lambda robot, config, reporter=None: calls.append("find") or None)
     monkeypatch.setattr(huanyou_app.steps, "rescan_unread_target", lambda robot, config, reporter=None: calls.append("rescan") or None)
+    monkeypatch.setattr(huanyou_app.steps, "ensure_list_screen", lambda robot, config, reporter=None, **kwargs: b"list")
     monkeypatch.setattr(huanyou_app.steps, "read_my_points", lambda robot, config, reporter=None: calls.append("points") or None)
     monkeypatch.setattr(huanyou_app.steps, "keep_screen_awake", lambda robot, config, reporter=None: calls.append("keep_awake") or True)
 
@@ -1503,7 +1767,7 @@ def test_rescan_unread_target_dismisses_popups_before_list_ocr(monkeypatch):
     monkeypatch.setattr(
         huanyou_app.steps,
         "ensure_list_screen",
-        lambda robot, config, reporter=None: calls.append("ensure_list_screen") or b"list_screen",
+        lambda robot, config, reporter=None, **kwargs: calls.append("ensure_list_screen") or b"list_screen",
     )
     monkeypatch.setattr(
         huanyou_app.steps,

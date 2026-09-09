@@ -315,6 +315,69 @@ def test_xinyu_dialogue_bubble_color_method_marks_wraparound_red_bubble_as_sende
     assert result["dialogues"] == [{"sender": "sender2", "content": "深红气泡"}]
 
 
+def test_xinyu_dialogue_bubble_color_method_keeps_low_saturation_pink_bubble_as_sender1():
+    item = {
+        "text": "浅粉气泡",
+        "raw_text": "浅粉气泡",
+        "confidence": 0.99,
+        "min_x": 20,
+        "max_x": 150,
+        "min_y": 100,
+        "max_y": 140,
+        "center_x": 85,
+        "center_y": 120,
+        "width": 130,
+        "height": 40,
+        "background_saturation": 0.40,
+        "background_hue": 177.0,
+        "background_value": 0.78,
+        "background_blue_green_delta": -8.0,
+        "background_blue_red_ratio": 0.92,
+    }
+
+    result = build_dialogue_result(
+        [item],
+        (200, 300),
+        copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"]),
+    )
+
+    assert result["dialogues"] == [{"sender": "sender1", "content": "浅粉气泡"}]
+
+
+def test_xinyu_dialogue_sender_fusion_records_color_position_conflict():
+    item = {
+        "text": "测试内容",
+        "raw_text": "测试内容",
+        "confidence": 0.99,
+        "min_x": 50,
+        "max_x": 120,
+        "min_y": 100,
+        "max_y": 140,
+        "center_x": 85,
+        "center_y": 120,
+        "width": 70,
+        "height": 40,
+        "background_saturation": 0.60,
+        "background_hue": 5.0,
+        "background_value": 0.78,
+        "background_blue_green_delta": -8.0,
+        "background_blue_red_ratio": 0.92,
+    }
+
+    result = build_dialogue_result(
+        [item],
+        (200, 300),
+        copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"]),
+    )
+
+    assert result["dialogues"] == [{"sender": "sender2", "content": "测试内容"}]
+    assert item["sender_color"] == "sender2"
+    assert item["sender_position"] == "sender1"
+    assert item["sender_conflict"] is True
+    assert item["sender_method"] == "color_position_fusion"
+    assert 0.0 < item["sender_confidence"] < 1.0
+
+
 def test_xinyu_dialogue_bubble_color_method_keeps_white_blue_bubble_as_sender1():
     item = {
         "text": "浅色气泡",

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +24,45 @@ class ReleaseManifestError(RuntimeError):
     pass
 
 
+def _package_files_are_consistent(root: Path) -> bool:
+    """检测更新是否只写入了版本清单、但程序文件没有完整替换。"""
+    manifest_path = root / "package_manifest.json"
+    if not manifest_path.is_file():
+        return True
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    files = payload.get("files", []) if isinstance(payload, dict) else []
+    if not isinstance(files, list):
+        return False
+    # 客户可以合法修改 config/templates，不能拿整个清单校验，否则每次更新后
+    # 都会被误判为损坏。只校验更新完整性所需的核心程序文件。
+    critical_paths = {"app_core_entry.pyc", "app_modules.zip", "update_apply.pyc"}
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        relative = str(item.get("path", "") or "").strip().replace("/", os.sep)
+        if relative.replace(os.sep, "/") not in critical_paths:
+            continue
+        expected = str(item.get("sha256", "") or "").strip().lower()
+        if not relative or not expected:
+            continue
+        path = root / relative
+        if not path.is_file():
+            return False
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return False
+        if digest.hexdigest().lower() != expected:
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class ReleaseManifest:
     app_version: str
@@ -32,6 +73,7 @@ class ReleaseManifest:
     update_file_name: str
     full_package_url: str
     release_notes: str
+    update_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -40,6 +82,7 @@ class LocalReleaseState:
     app_version: str
     runtime_version: str
     model_version: str
+    package_consistent: bool = True
 
 
 @dataclass(frozen=True)
@@ -52,6 +95,7 @@ class ReleaseDecision:
     update_file_name: str
     full_package_url: str
     release_notes: str
+    update_url: str = ""
 
 
 def fetch_release_manifest(
@@ -82,6 +126,7 @@ def fetch_release_manifest(
         raise ReleaseManifestError("Release manifest is missing runtime_version.")
 
     update_share_url = str(payload.get("update_share_url", "") or "").strip() or DEFAULT_UPDATE_SHARE_URL
+    update_url = str(payload.get("update_url", "") or "").strip()
     full_package_url = str(payload.get("full_package_url", "") or "").strip() or DEFAULT_FULL_PACKAGE_PAGE_URL
 
     return ReleaseManifest(
@@ -91,6 +136,7 @@ def fetch_release_manifest(
         requires_full_package=bool(payload.get("requires_full_package", False)),
         update_share_url=update_share_url,
         update_file_name=str(payload.get("update_file_name", "") or "").strip(),
+        update_url=update_url,
         full_package_url=full_package_url,
         release_notes=str(payload.get("release_notes", "") or "").strip(),
     )
@@ -125,6 +171,7 @@ def load_local_release_state(package_root: str | Path | None = None) -> LocalRel
         app_version=app_version,
         runtime_version=runtime_version,
         model_version=model_version,
+        package_consistent=_package_files_are_consistent(root),
     )
 
 
@@ -132,6 +179,18 @@ def evaluate_release_manifest(
     remote: ReleaseManifest,
     local: LocalReleaseState,
 ) -> ReleaseDecision:
+    if not local.package_consistent:
+        return ReleaseDecision(
+            action="incremental",
+            current_app_version=local.app_version,
+            target_app_version=remote.app_version,
+            reason="Local package files are incomplete; retry the customer update package.",
+            update_share_url=remote.update_share_url,
+            update_file_name=remote.update_file_name,
+            update_url=remote.update_url,
+            full_package_url=remote.full_package_url,
+            release_notes=remote.release_notes,
+        )
     if remote.app_version == local.app_version:
         return ReleaseDecision(
             action="none",
@@ -140,6 +199,7 @@ def evaluate_release_manifest(
             reason="Local app_version already matches the remote release manifest.",
             update_share_url=remote.update_share_url,
             update_file_name=remote.update_file_name,
+            update_url=remote.update_url,
             full_package_url=remote.full_package_url,
             release_notes=remote.release_notes,
         )
@@ -152,6 +212,7 @@ def evaluate_release_manifest(
             reason="Remote release manifest requires a full package upgrade.",
             update_share_url=remote.update_share_url,
             update_file_name=remote.update_file_name,
+            update_url=remote.update_url,
             full_package_url=remote.full_package_url,
             release_notes=remote.release_notes,
         )
@@ -164,6 +225,7 @@ def evaluate_release_manifest(
             reason="Runtime version changed and must be upgraded with the full package.",
             update_share_url=remote.update_share_url,
             update_file_name=remote.update_file_name,
+            update_url=remote.update_url,
             full_package_url=remote.full_package_url,
             release_notes=remote.release_notes,
         )
@@ -180,6 +242,7 @@ def evaluate_release_manifest(
             reason="Model version changed and must be upgraded with the full package.",
             update_share_url=remote.update_share_url,
             update_file_name=remote.update_file_name,
+            update_url=remote.update_url,
             full_package_url=remote.full_package_url,
             release_notes=remote.release_notes,
         )
@@ -192,6 +255,7 @@ def evaluate_release_manifest(
             reason="A different app_version is available and can be delivered through the update package.",
             update_share_url=remote.update_share_url,
             update_file_name=remote.update_file_name,
+            update_url=remote.update_url,
             full_package_url=remote.full_package_url,
             release_notes=remote.release_notes,
         )
@@ -203,6 +267,7 @@ def evaluate_release_manifest(
         reason="Local release state is already up to date.",
         update_share_url=remote.update_share_url,
         update_file_name=remote.update_file_name,
+        update_url=remote.update_url,
         full_package_url=remote.full_package_url,
         release_notes=remote.release_notes,
     )
@@ -218,4 +283,3 @@ def resolve_release_decision(
     remote = fetch_release_manifest(url=url, timeout_seconds=timeout_seconds, session=session)
     local = load_local_release_state(package_root)
     return evaluate_release_manifest(remote, local)
-

@@ -1984,7 +1984,7 @@ def test_xinyu_keep_screen_awake_clicks_message_bottom_nav(monkeypatch, tmp_path
     monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
 
     assert steps.keep_screen_awake(robot, config)
-    assert robot.clicks == [pytest.approx((0.7, 0.9))]
+    assert robot.clicks == [pytest.approx((0.7, 0.88))]
 
 
 def test_xinyu_keep_screen_awake_reuses_cached_message_bottom_nav(monkeypatch, tmp_path):
@@ -2058,6 +2058,26 @@ def test_xinyu_caches_all_five_bottom_navigation_positions(tmp_path):
     assert anchors["bottom_fate"] == pytest.approx((0.08, 0.88))
     assert anchors["bottom_feed"] == pytest.approx((0.28, 0.88))
     assert anchors["bottom_entertainment"] == pytest.approx((0.5, 0.88))
+    assert anchors["bottom_message"] == pytest.approx((0.68, 0.88))
+    assert anchors["bottom_my"] == pytest.approx((0.88, 0.88))
+
+
+def test_xinyu_infers_all_bottom_navigation_positions_from_one_ocr_item(tmp_path):
+    config = _config(tmp_path)
+    ocr_result = {
+        "result": {
+            "bottom_nav": [
+                {"name": "消息", "bounds": [0.62, 0.86, 0.74, 0.94]},
+            ]
+        }
+    }
+
+    steps._cache_bottom_nav_from_ocr_result(config, ocr_result)
+
+    anchors = config["_runtime_cache"]["screen_anchors"]
+    assert anchors["bottom_fate"] == pytest.approx((0.08, 0.88))
+    assert anchors["bottom_feed"] == pytest.approx((0.28, 0.88))
+    assert anchors["bottom_entertainment"] == pytest.approx((0.48, 0.88))
     assert anchors["bottom_message"] == pytest.approx((0.68, 0.88))
     assert anchors["bottom_my"] == pytest.approx((0.88, 0.88))
 

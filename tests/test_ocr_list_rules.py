@@ -547,6 +547,21 @@ def test_list_rules_keep_numeric_name_for_xinyu_layout():
     assert result["message_list"][0]["content"] == "浣犲ソ"
 
 
+def test_xinyu_list_rules_keep_thin_content_text():
+    rules = XINYU_LIST_OCR_MODE["rules"]
+    items = [
+        _item("薄荷 [25岁·石家庄]", 134, 308, 492, 565, confidence=0.96),
+        _item("下午0435", 448, 536, 508, 552, confidence=0.92),
+        _item("看看你的诚意", 135, 260, 583, 633, confidence=0.99),
+        _item("24G", 486, 536, 583, 633, confidence=0.80),
+    ]
+
+    result = build_list_result(items, (566, 2518), rules)
+
+    assert result["message_list"][0]["name"] == "薄荷"
+    assert result["message_list"][0]["content"] == "看看你的诚意"
+
+
 def test_list_rules_strip_configured_name_suffix_keywords():
     items = [
         _item("微笑的绿巨人", 128, 270, 740, 780),
@@ -788,3 +803,16 @@ def test_list_rules_accept_any_xinyu_bottom_tab_text():
     )
 
     assert [item["name"] for item in result["bottom_nav"]] == ["邂逅", "动态", "广场", "消息", "主页"]
+
+def test_xinyu_list_rules_reject_name_beyond_right_boundary():
+    rules = XINYU_LIST_OCR_MODE["rules"]
+    items = [
+        _item("rightName", 430, 460, 720, 760),
+        _item("validName", 120, 260, 820, 860),
+        _item("hello", 120, 190, 870, 905),
+    ]
+
+    result = build_list_result(items, (560, 1498), rules)
+
+    assert [row["name"] for row in result["message_list"]] == ["validName"]
+    assert result["message_list"][0]["content"] == "hello"

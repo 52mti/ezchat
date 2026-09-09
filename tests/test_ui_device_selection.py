@@ -22,6 +22,11 @@ def _window(qtbot, tmp_path, devices):
     return window
 
 
+def _show_logs(window: MainWindow) -> None:
+    window.log_toggle.setChecked(True)
+    window._toggle_logs()
+
+
 def test_device_table_has_checkbox_column_and_batch_selection(qtbot, tmp_path):
     window = _window(
         qtbot,
@@ -32,13 +37,16 @@ def test_device_table_has_checkbox_column_and_batch_selection(qtbot, tmp_path):
         ],
     )
 
-    assert window.table.columnCount() == 9
+    assert window.table.columnCount() == 10
     assert window.table.horizontalHeaderItem(0).text() == "\u9009\u62e9"
-    assert window.table.horizontalHeaderItem(5).text() == "\u5e73\u5747\u7528\u65f6"
-    assert window.table.horizontalHeaderItem(6).text() == "\u65e0\u5e72\u9884\u65f6\u957f"
-    assert window.table.horizontalHeaderItem(8).text() == "\u4f59\u989d"
-    assert window.table.horizontalHeader().sectionResizeMode(4) == QHeaderView.ResizeMode.Fixed
-    assert window.table.horizontalHeader().sectionResizeMode(6) == QHeaderView.ResizeMode.Fixed
+    assert window.table.horizontalHeaderItem(main_window_module.COL_AVG_REPLY_SECONDS).text() == "\u5e73\u5747\u7528\u65f6"
+    assert window.table.horizontalHeaderItem(main_window_module.COL_UNATTENDED_SECONDS).text() == "\u65e0\u5e72\u9884\u65f6\u957f"
+    assert window.table.horizontalHeaderItem(main_window_module.COL_BALANCE).text() == "\u4f59\u989d"
+    assert window.table.horizontalHeader().sectionResizeMode(main_window_module.COL_STATUS) == QHeaderView.ResizeMode.Fixed
+    assert window.table.horizontalHeader().sectionResizeMode(main_window_module.COL_UNATTENDED_SECONDS) == QHeaderView.ResizeMode.Fixed
+    button_texts = [button.text() for button in window.findChildren(main_window_module.QPushButton)]
+    assert "暂停选中" not in button_texts
+    assert "恢复选中" not in button_texts
     assert window._checked_rows() == []
 
     window._select_all_devices()
@@ -255,6 +263,28 @@ def test_device_context_menu_lists_app_and_device_settings_actions(qtbot, tmp_pa
     assert "卡密绑定" in seen
     assert "app设置" in seen
     assert "设备设置" in seen
+    assert "打开设备后台" in seen
+    assert "暂停" not in seen
+    assert "恢复" not in seen
+
+
+def test_open_device_backend_uses_current_device_ip(qtbot, tmp_path, monkeypatch):
+    window = _window(qtbot, tmp_path, [{"ip": "192.168.1.133", "selected_app": "wechat"}])
+    opened: list[str] = []
+    monkeypatch.setattr("ui.main_window.tempfile.gettempdir", lambda: str(tmp_path))
+
+    monkeypatch.setattr(
+        "ui.main_window.QDesktopServices.openUrl",
+        lambda url: opened.append(url.toString()) or True,
+    )
+
+    window._open_device_backend(0)
+
+    assert opened == [(tmp_path / "jixiebijiaoben_device_backend_192.168.1.133.html").as_uri()]
+    page = (tmp_path / "jixiebijiaoben_device_backend_192.168.1.133.html").read_text(encoding="utf-8")
+    assert 'action="http://192.168.1.133:8888/login"' in page
+    assert 'name="password" value="admin"' in page
+    assert "submit()" in page
 
 
 def test_status_event_shows_current_step_and_average_reply_time(qtbot, tmp_path):
@@ -277,15 +307,39 @@ def test_status_event_shows_current_step_and_average_reply_time(qtbot, tmp_path)
     )
     window._drain_events()
 
-    status_item = window.table.item(0, 4)
-    avg_item = window.table.item(0, 5)
+    status_item = window.table.item(0, main_window_module.COL_STATUS)
+    avg_item = window.table.item(0, main_window_module.COL_AVG_REPLY_SECONDS)
     assert status_item is not None
     assert avg_item is not None
     assert status_item.text() == "Dialogue OCR Read"
     assert avg_item.text() == "9.4\u79d2"
-    assert avg_item.data(256) == 3
-    assert status_item.data(256) == "running"
-    assert status_item.data(257) == "Dialogue OCR Read"
+
+
+def test_status_event_shows_phone_screen_health_in_device_status_column(qtbot, tmp_path):
+    window = _window(qtbot, tmp_path, [{"ip": "192.168.1.108", "selected_app": "xinyu"}])
+    window._set_row_status("192.168.1.108", "running")
+    window.events.put(
+        WorkerEvent(
+            "192.168.1.108",
+            "status",
+            "progress",
+            {
+                "current_step": "list_ocr_scan",
+                "phone_screen_health": "overexposed",
+                "phone_screen_health_metrics": {"mean_luma": 231.5, "dark_ratio": 0.0, "bright_ratio": 0.81},
+            },
+        )
+    )
+    window._drain_events()
+
+    item = window.table.item(0, main_window_module.COL_DEVICE_HEALTH)
+    assert item.text() == "\u5728\u7ebf \u00b7 \u753b\u9762\u8fc7\u66dd"
+    assert item.data(256) == "overexposed"
+
+    # 普通流程进度不携带健康度，不能覆盖已经确认的设备状态。
+    window.events.put(WorkerEvent("192.168.1.108", "status", "progress", {"current_step": "list_ocr_scan"}))
+    window._drain_events()
+    assert window.table.item(0, main_window_module.COL_DEVICE_HEALTH).data(256) == "overexposed"
 
 
 def test_bad_worker_event_does_not_block_other_device_status(qtbot, tmp_path, monkeypatch):
@@ -334,6 +388,8 @@ def test_bad_worker_event_does_not_block_other_device_status(qtbot, tmp_path, mo
         )
     )
 
+    _show_logs(window)
+    window._drain_events()
     window._drain_events()
 
     assert "bad row" in window.logs.toPlainText()
@@ -421,24 +477,24 @@ def test_unattended_duration_tracks_each_device(qtbot, tmp_path, monkeypatch):
         ],
     )
 
-    assert window.table.item(0, 6).text() == "--"
-    assert window.table.item(1, 6).text() == "--"
+    assert window.table.item(0, main_window_module.COL_UNATTENDED_SECONDS).text() == "--"
+    assert window.table.item(1, main_window_module.COL_UNATTENDED_SECONDS).text() == "--"
 
     window._start_unattended_timer("192.168.1.108")
     current_time[0] = 165.4
     window._refresh_unattended_durations()
 
-    assert window.table.item(0, 6).text() == "00:01:05"
-    assert window.table.item(1, 6).text() == "--"
+    assert window.table.item(0, main_window_module.COL_UNATTENDED_SECONDS).text() == "00:01:05"
+    assert window.table.item(1, main_window_module.COL_UNATTENDED_SECONDS).text() == "--"
 
     current_time[0] = 190.0
     window.events.put(WorkerEvent("192.168.1.108", "info", "stopped"))
     window._drain_events()
 
-    assert window.table.item(0, 6).text() == "00:01:30"
+    assert window.table.item(0, main_window_module.COL_UNATTENDED_SECONDS).text() == "00:01:30"
     current_time[0] = 230.0
     window._refresh_unattended_durations()
-    assert window.table.item(0, 6).text() == "00:01:30"
+    assert window.table.item(0, main_window_module.COL_UNATTENDED_SECONDS).text() == "00:01:30"
 
 
 def test_status_event_hides_coordinate_details(qtbot, tmp_path):
@@ -489,6 +545,7 @@ def test_runtime_step_log_keeps_coordinate_details(qtbot, tmp_path):
             {"step": "enter_chat", "detail": "进入聊天：无敌阿强 (0.123, 0.456)"},
         )
     )
+    _show_logs(window)
     window._drain_events()
 
     logs_text = window.logs.toPlainText()
@@ -562,6 +619,7 @@ def test_log_panel_shows_ocr_message_and_ai_reply_payload(qtbot, tmp_path):
             {"contact": "\u65e0\u654c\u963f\u5f3a", "reply_text": "\u6211\u4e5f\u60f3\u770b\uff0c\u4f60\u63a8\u8350\u54ea\u4e00\u573a\uff1f", "skip": False},
         )
     )
+    _show_logs(window)
     window._drain_events()
 
     logs_text = window.logs.toPlainText()
@@ -615,6 +673,7 @@ def test_log_panel_shows_huanyou_runtime_logs_in_chinese(qtbot, tmp_path):
             {"error_count": 4, "circuit_breaker_threshold": 5},
         )
     )
+    _show_logs(window)
     window._drain_events()
 
     logs_text = window.logs.toPlainText()
@@ -658,6 +717,7 @@ def test_log_panel_shows_xinyu_send_summary_in_chinese(qtbot, tmp_path):
             {"ocr_count": 2, "capture_count": 5, "dialogue_compact_fallback_count": 1, "seconds": 6.7},
         )
     )
+    _show_logs(window)
     window._drain_events()
 
     logs_text = window.logs.toPlainText()
@@ -695,6 +755,7 @@ def test_log_panel_filters_by_selected_device_ip(qtbot, tmp_path):
             {"step": "step_b", "detail": "设备109的日志"},
         )
     )
+    _show_logs(window)
     window._drain_events()
 
     all_logs = window.logs.toPlainText()

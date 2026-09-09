@@ -75,7 +75,7 @@ def test_preload_ocr_runtime_retries_auto_after_gpu_fallback(tmp_path, monkeypat
     assert captured["config"] == {"backend": "auto", "model_tier": "lite"}
 
 
-def test_main_preloads_runtime_before_run_app(monkeypatch):
+def test_main_starts_ui_without_waiting_for_ocr_preload(monkeypatch):
     calls: list[str] = []
 
     class FakeConfigManager:
@@ -87,10 +87,15 @@ def test_main_preloads_runtime_before_run_app(monkeypatch):
     monkeypatch.setattr(main, "cleanup_old_logs", lambda **kwargs: None)
     monkeypatch.setattr(main, "cleanup_old_error_captures", lambda **kwargs: None)
     monkeypatch.setattr(main, "_preload_ocr_runtime", lambda: calls.append("preload") or "cpu")
-    monkeypatch.setattr(main, "run_app", lambda argv: calls.append("run_app") or 0)
+    def fake_run_app(argv, *, on_ready=None):
+        calls.append("run_app")
+        assert callable(on_ready)
+        return 0
+
+    monkeypatch.setattr(main, "run_app", fake_run_app)
 
     assert main.main() == 0
-    assert calls == ["preload", "run_app"]
+    assert calls == ["run_app"]
 
 
 def test_main_continues_when_ocr_preload_fails(monkeypatch):
@@ -110,7 +115,23 @@ def test_main_continues_when_ocr_preload_fails(monkeypatch):
         raise RuntimeError("broken ocr")
 
     monkeypatch.setattr(main, "_preload_ocr_runtime", fail_preload)
-    monkeypatch.setattr(main, "run_app", lambda argv: calls.append("run_app") or 0)
+    def fake_run_app(argv, *, on_ready=None):
+        calls.append("run_app")
+        assert callable(on_ready)
+        return 0
+
+    monkeypatch.setattr(main, "run_app", fake_run_app)
 
     assert main.main() == 0
-    assert calls == ["preload", "run_app"]
+    assert calls == ["run_app"]
+
+
+def test_background_ocr_preload_isolated_from_startup(monkeypatch):
+    calls: list[str] = []
+
+    monkeypatch.setattr(main, "_preload_ocr_runtime", lambda: calls.append("preload") or "cpu")
+    thread = main._start_ocr_preload_in_background()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert calls == ["preload"]

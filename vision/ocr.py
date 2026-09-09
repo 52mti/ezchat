@@ -12,6 +12,7 @@ from .screen import ImageInput, crop_region, load_image, normalize_box
 
 _OCR_NATIVE_CALL_CONDITION = threading.Condition()
 _OCR_NATIVE_ACTIVE_CALLS = 0
+_OCR_NATIVE_WAITING_CALLS = 0
 _OCR_ENGINE_INIT_LOCK = threading.RLock()
 
 
@@ -209,11 +210,13 @@ def _ocr_max_concurrency(config: dict[str, Any]) -> int:
 
 @contextlib.contextmanager
 def _ocr_native_call_slot(max_concurrency: int):
-    global _OCR_NATIVE_ACTIVE_CALLS
+    global _OCR_NATIVE_ACTIVE_CALLS, _OCR_NATIVE_WAITING_CALLS
     limit = min(16, max(1, int(max_concurrency or 1)))
     with _OCR_NATIVE_CALL_CONDITION:
+        _OCR_NATIVE_WAITING_CALLS += 1
         while _OCR_NATIVE_ACTIVE_CALLS >= limit:
             _OCR_NATIVE_CALL_CONDITION.wait()
+        _OCR_NATIVE_WAITING_CALLS -= 1
         _OCR_NATIVE_ACTIVE_CALLS += 1
     try:
         yield
@@ -221,6 +224,15 @@ def _ocr_native_call_slot(max_concurrency: int):
         with _OCR_NATIVE_CALL_CONDITION:
             _OCR_NATIVE_ACTIVE_CALLS -= 1
             _OCR_NATIVE_CALL_CONDITION.notify_all()
+
+
+def get_ocr_queue_status() -> dict[str, int]:
+    """返回当前进程中 OCR 并发槽位的等待数和执行数。"""
+    with _OCR_NATIVE_CALL_CONDITION:
+        return {
+            "waiting": max(0, int(_OCR_NATIVE_WAITING_CALLS)),
+            "active": max(0, int(_OCR_NATIVE_ACTIVE_CALLS)),
+        }
 
 
 @lru_cache(maxsize=8)

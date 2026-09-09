@@ -59,6 +59,24 @@ class BaseApp:
         self._status_callback: Callable[[dict[str, Any]], None] | None = None
         self._log_callback: Callable[[str, str, dict[str, Any] | None], None] | None = None
 
+    def _runtime_context(self) -> dict[str, Any]:
+        runtime = self.config.get("_runtime")
+        if not isinstance(runtime, dict):
+            runtime = {}
+            self.config["_runtime"] = runtime
+        return runtime
+
+    def _append_runtime_path(self, key: str, path: str, *, limit: int = 5) -> None:
+        runtime = self._runtime_context()
+        values = runtime.get(key)
+        if not isinstance(values, list):
+            values = []
+        path_text = str(path).strip()
+        if path_text:
+            values = [item for item in values if str(item) != path_text]
+            values.append(path_text)
+            runtime[key] = values[-limit:]
+
     def run_once(self) -> None:
         raise NotImplementedError
 
@@ -93,7 +111,13 @@ class BaseApp:
             self.robot.reset_device(wait=True)
 
     def get_status(self) -> dict[str, Any]:
-        return self.status.as_dict()
+        result = self.status.as_dict()
+        runtime = self._runtime_context()
+        result["phone_screen_health"] = str(runtime.get("phone_screen_health", "unknown") or "unknown")
+        metrics = runtime.get("phone_screen_health_metrics", {})
+        if isinstance(metrics, dict):
+            result["phone_screen_health_metrics"] = dict(metrics)
+        return result
 
     def mark_success(self) -> None:
         self.status.last_success_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -203,6 +227,11 @@ class BaseApp:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(capture_transform_image(self.robot, self.config, pre_move=True, label="error"))
+            runtime = self._runtime_context()
+            runtime["last_error_capture_path"] = str(path)
+            runtime["error_screenshot"] = str(path)
+            self._append_runtime_path("recent_error_capture_paths", str(path))
+            self._append_runtime_path("related_capture_paths", str(path), limit=10)
             cleanup_old_error_captures(path.parent, retention_days=int(self.config.get("error_capture_retention_days", 7) or 7), max_files=int(self.config.get("error_capture_max_files", 200) or 200))
         except Exception:
             return

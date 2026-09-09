@@ -117,7 +117,7 @@ class RuntimeManifest:
 
 
 def _runtime_state_path(project_root: str | Path | None = None) -> Path:
-    root = Path(project_root) if project_root is not None else Path(__file__).resolve().parents[1]
+    root = Path(project_root) if project_root is not None else _package_root()
     return root / "runtime" / "install_state.json"
 
 
@@ -641,6 +641,9 @@ def normalize_execution_mode(raw_value: object) -> str:
 def _package_root(project_root: str | Path | None = None) -> Path:
     if project_root is not None:
         return package_root_from_path(project_root)
+    configured = str(os.environ.get("JIXIEBI_PACKAGE_ROOT", "") or "").strip()
+    if configured:
+        return Path(configured).resolve()
     return Path(__file__).resolve().parents[1]
 
 
@@ -811,7 +814,10 @@ def validate_paddle_gpu_runtime() -> GpuEnvironmentReport:
     if not report.gpu_names:
         raise RuntimeError("No usable NVIDIA GPU was detected; paddle_cuda OCR backend cannot be used.")
     try:
-        import paddle
+        # Paddle 在 Windows 导入阶段会输出 ccache 等诊断信息；这不是 OCR
+        # 初始化失败。运行时仍会把真正的异常抛给上层进行日志记录。
+        with suppress_native_output():
+            import paddle
     except ImportError as exc:
         raise RuntimeError("The current Python environment does not have Paddle GPU runtime installed.") from exc
     report.paddle_version = getattr(paddle, "__version__", None)
@@ -939,7 +945,11 @@ class PaddleOcrRuntimeEngine:
             if cache_key in _PADDLE_OCR_BY_CACHE_KEY:
                 return _PADDLE_OCR_BY_CACHE_KEY[cache_key], device
             try:
-                from paddleocr import PaddleOCR  # type: ignore
+                # PaddleOCR/PaddleX 导入时也可能直接写入 stdout/stderr（例如模型
+                # 源连通性检查提示）。OCR 子进程协议依赖 stdout 为纯 JSON，主进程
+                # 同样不应把这些第三方提示显示为启动异常。
+                with suppress_native_output():
+                    from paddleocr import PaddleOCR  # type: ignore
             except ImportError as exc:
                 raise RuntimeError(
                     f"Missing packaged PaddleOCR runtime for backend {self.backend}: {exc}. "
@@ -1134,7 +1144,7 @@ class SubprocessOcrRuntimeEngine:
             str(python_exe),
             "-s",
             "-u",
-            str(root / "ocr_subprocess_entry.py"),
+            str(root / "ocr_subprocess_entry.pyc"),
             "--root",
             str(root),
             "--backend",

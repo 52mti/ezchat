@@ -106,6 +106,88 @@ def test_template_region_match_maps_result_back_to_full_image(tmp_path):
     assert result == pytest.approx({"x": 0.3, "y": 0.5, "w": 0.04, "h": 0.1, "score": 0.99})
 
 
+def test_template_region_match_can_expand_configured_region(tmp_path):
+    template_path = tmp_path / "btn.jpg"
+    template_path.write_bytes(b"template")
+    image = Image.new("RGB", (100, 200), "white")
+    config = {
+        "template_match_region_expand_ratio": 0.05,
+        "template_match_regions": {
+            visual_assets.SEND_BUTTON: [0.2, 0.3, 0.4, 0.5],
+        },
+    }
+    seen_sizes: list[tuple[int, int]] = []
+
+    def fake_match(cropped_image, template, threshold=0.85):
+        seen_sizes.append(cropped_image.size)
+        return {"x": 0.25, "y": 0.4, "w": 0.1, "h": 0.2, "score": 0.99}
+
+    visual_assets.match_template_with_region(
+        image,
+        template_path,
+        config,
+        visual_assets.SEND_BUTTON,
+        threshold=0.7,
+        match_func=fake_match,
+    )
+
+    assert seen_sizes == [(44, 111)]
+
+
+def test_template_candidates_score_all_and_return_best_candidate(tmp_path):
+    paths = [tmp_path / "first.jpg", tmp_path / "second.jpg"]
+    for path in paths:
+        path.write_bytes(b"template")
+    calls: list[str] = []
+
+    def fake_match(image, template, threshold=0.85):
+        calls.append(Path(template).name)
+        score = 0.75 if Path(template).name == "first.jpg" else 0.92
+        return {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4, "score": score, "channel": "gray"}
+
+    config: dict[str, object] = {}
+    result = visual_assets.match_template_candidates_with_region(
+        "image",
+        paths,
+        config,
+        visual_assets.SEND_BUTTON,
+        threshold=0.7,
+        match_func=fake_match,
+    )
+
+    assert calls == ["first.jpg", "second.jpg"]
+    assert result is not None
+    assert result["_template_name"] == "second.jpg"
+    assert result["score"] == pytest.approx(0.92)
+
+
+def test_template_candidates_failure_records_best_diagnostic(tmp_path):
+    paths = [tmp_path / "first.jpg", tmp_path / "second.jpg"]
+    for path in paths:
+        path.write_bytes(b"template")
+
+    def fake_match(image, template, threshold=0.85):
+        score = 0.64 if Path(template).name == "first.jpg" else 0.68
+        return {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4, "score": score, "channel": "gray_norm"}
+
+    config: dict[str, object] = {}
+    result = visual_assets.match_template_candidates_with_region(
+        "image",
+        paths,
+        config,
+        visual_assets.SEND_BUTTON,
+        threshold=0.7,
+        match_func=fake_match,
+    )
+
+    assert result is None
+    diagnostic = visual_assets.format_template_match_diagnostic(config, visual_assets.SEND_BUTTON)
+    assert "second.jpg" in diagnostic
+    assert "0.680" in diagnostic
+    assert "0.700" in diagnostic
+    assert "gray_norm" in diagnostic
+
+
 def test_template_match_reuses_previous_result_when_same_photo(tmp_path):
     visual_assets._TEMPLATE_MATCH_CACHE.clear()
     template_path = tmp_path / "btn.jpg"
@@ -262,6 +344,31 @@ def test_fixed_template_import_uses_incremental_variant_names(tmp_path):
 
     assert send_target.name == "btn_发送按钮_3.jpg"
     assert list_target.name == "screen_聊天列表_2.jpg"
+
+
+def test_customer_template_import_uses_separate_namespace(tmp_path):
+    buttons_dir = tmp_path / "buttons"
+    screens_dir = tmp_path / "screens"
+    buttons_dir.mkdir()
+    screens_dir.mkdir()
+    (screens_dir / "screen_聊天界面.jpg").write_bytes(b"developer")
+    (screens_dir / "screen_聊天界面_2.jpg").write_bytes(b"developer")
+    (screens_dir / "screen_聊天界面__customer_1.jpg").write_bytes(b"customer")
+
+    target = visual_assets.import_target_path(
+        visual_assets.CHAT_WINDOW_SCREEN,
+        buttons_dir,
+        screens_dir,
+        owner="customer",
+    )
+
+    assert target.name == "screen_聊天界面__customer_2.jpg"
+    paths = visual_assets.template_variant_paths(screens_dir, "screen_聊天界面.jpg")
+    assert [path.name for path in paths] == [
+        "screen_聊天界面.jpg",
+        "screen_聊天界面_2.jpg",
+        "screen_聊天界面__customer_1.jpg",
+    ]
 
 
 def test_template_variant_paths_load_incremental_templates(tmp_path):
