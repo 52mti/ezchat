@@ -995,6 +995,12 @@ def _bottom_nav_center(
     return center
 
 
+def _correct_bottom_nav_center(center: tuple[float, float]) -> tuple[float, float]:
+    """Move a bottom-nav OCR center to the icon's actual click position."""
+    center_x, center_y = center
+    return center_x, max(0.02, min(0.98, center_y + BOTTOM_NAV_CACHE_Y_OFFSET))
+
+
 def _bottom_nav_item(
     items: list[dict[str, Any]],
     keywords: tuple[str, ...],
@@ -1062,8 +1068,7 @@ def _cache_bottom_nav_from_ocr_result(config: dict[str, Any], ocr_result: dict[s
         item = _bottom_nav_item(bottom_nav, keywords, min_center_y=0.5)
         if item is None:
             continue
-        center_x, center_y = item[1]
-        corrected_center = (center_x, max(0.02, min(0.98, center_y + BOTTOM_NAV_CACHE_Y_OFFSET)))
+        corrected_center = _correct_bottom_nav_center(item[1])
         detected[cache_key] = corrected_center
         _cache_point_once(config, "screen_anchors", cache_key, corrected_center)
 
@@ -2016,7 +2021,11 @@ def keep_screen_awake(
     ocr_result = _run_ocr_mode(image, cfg, "list", region=None)
     _cache_bottom_nav_from_ocr_result(cfg, ocr_result)
     bottom_nav = ocr_result["result"].get("bottom_nav", [])
-    message = _bottom_nav_center(bottom_nav, ("消息",), min_center_y=0.5)
+    message = _cached_point(cfg, "screen_anchors", "bottom_message")
+    if message is None:
+        raw_message = _bottom_nav_center(bottom_nav, ("消息",), min_center_y=0.5)
+        if raw_message is not None:
+            message = _correct_bottom_nav_center(raw_message)
     if message is None:
         return False
 
@@ -2088,11 +2097,15 @@ def read_my_points(
         ocr_result = _run_ocr_mode(image, cfg, "list", region=None)
         _cache_bottom_nav_from_ocr_result(cfg, ocr_result)
         bottom_nav = ocr_result.get("result", {}).get("bottom_nav", [])
-        pos = _cached_point(cfg, "screen_anchors", "bottom_my") or _bottom_nav_center(
-            bottom_nav if isinstance(bottom_nav, list) else [],
-            ("我的",),
-            min_center_y=0.5,
-        )
+        pos = _cached_point(cfg, "screen_anchors", "bottom_my")
+        if pos is None:
+            raw_pos = _bottom_nav_center(
+                bottom_nav if isinstance(bottom_nav, list) else [],
+                ("我的",),
+                min_center_y=0.5,
+            )
+            if raw_pos is not None:
+                pos = _correct_bottom_nav_center(raw_pos)
     if pos is None:
         _report(reporter, "points_skip_no_my", "底部导航未识别到我的，跳过积分读取")
         return None
