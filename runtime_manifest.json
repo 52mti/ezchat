@@ -87,7 +87,7 @@
       }
     }
   },
-  "appVersion": "20260910-01",
-  "runtimeVersion": "2026.06.02-full-package",
+  "appVersion": "20260910-02",
+  "runtimeVersion": "2026.09.10-engine",
   "modelVersion": "2026.06.02-full-package-lite"
 }

@@ -104,12 +104,12 @@ def _project_roots() -> list[Path]:
 
 def _find_piper_model() -> Path:
     for root in _project_roots():
-        for directory in (root / "runtime" / "tts" / "piper", root / "tts" / "piper"):
+        for directory in (root / "tts" / "piper", root / "runtime" / "tts" / "piper"):
             model_path = directory / PIPER_MODEL_FILENAME
             config_path = model_path.with_suffix(".onnx.json")
             if model_path.is_file() and config_path.is_file():
                 return model_path
-    raise RuntimeError("缺少 Piper 中文离线语音模型，请使用包含 runtime/tts/piper 的完整包安装")
+    raise RuntimeError("缺少 Piper 中文离线语音模型，请使用包含 tts/piper 的完整包安装")
 
 
 def _is_chinese_sapi_voice(voice: object) -> bool:

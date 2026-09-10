@@ -120,6 +120,7 @@ def test_write_customer_update_archive_excludes_full_runtimes_and_models(tmp_pat
     assert f"{build.PACKAGE_NAME}/main.py" in names
     assert f"{build.PACKAGE_NAME}/{build.LAUNCHER_EXE}" not in names
     assert f"{build.PACKAGE_NAME}/{build.LAUNCHER_ALIAS_EXE}" not in names
+    assert all(not name.startswith(f"{build.PACKAGE_NAME}/engine/") for name in names)
     assert all(not name.startswith(f"{build.PACKAGE_NAME}/runtime/app/") for name in names)
     assert all(not name.startswith(f"{build.PACKAGE_NAME}/runtime/ocr_cpu/") for name in names)
     assert all(not name.startswith(f"{build.PACKAGE_NAME}/runtime/tts/piper/") for name in names)
@@ -517,8 +518,10 @@ def test_write_full_package_runtime_state_uses_auto_backend(tmp_path):
     assert payload["execution_mode"] == "subprocess"
     assert payload["package_mode"] == "full"
     assert payload["cache_home"] == "runtime/.paddlex"
-    assert payload["python_executable"] == "runtime/app/python.exe"
-    assert payload["runtime_path"] == "runtime/app"
+    assert payload["python_executable"] == "engine/app/python.exe"
+    assert payload["runtime_path"] == "engine/app"
+    assert payload["runtime_inventory"]["app"] == "engine/app"
+    assert payload["runtime_inventory"]["cpu"] == "engine/ocr_cpu"
     assert payload["installed_backends"] == ["cpu", "paddle_cuda", "onnx_directml"]
 
 

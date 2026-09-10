@@ -176,3 +176,18 @@ def test_read_app_version_requires_a_nonempty_app_version(tmp_path):
 def test_update_preserves_customer_template_and_app_config_scopes():
     assert update_apply._is_preserved("apps/xinyu/templates/buttons/btn_test__customer_1.jpg")
     assert update_apply._is_preserved("apps/xinyu/config.json")
+
+
+def test_update_keeps_engine_runtime_when_incremental_manifest_omits_it(tmp_path):
+    target_root = tmp_path / "target"
+    engine_python = target_root / "engine" / "app" / "python.exe"
+    engine_python.parent.mkdir(parents=True)
+    engine_python.write_bytes(b"engine-python")
+
+    update_apply._remove_obsolete_files(
+        target_root,
+        {"engine/app/python.exe", "engine/ocr_cpu/python.exe"},
+        set(),
+    )
+
+    assert engine_python.read_bytes() == b"engine-python"

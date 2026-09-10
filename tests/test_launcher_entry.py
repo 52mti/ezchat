@@ -5,11 +5,18 @@ from pathlib import Path
 import launcher_entry
 
 
-def test_spawn_packaged_app_uses_inline_bootstrap(monkeypatch, tmp_path: Path):
+def _package_root_with_entry(tmp_path: Path) -> tuple[Path, Path]:
     root = tmp_path / "package"
-    python_exe = root / "runtime" / "app" / "python.exe"
+    python_exe = root / "engine" / "app" / "python.exe"
     python_exe.parent.mkdir(parents=True)
     python_exe.write_text("", encoding="utf-8")
+    (root / "app_core_entry.pyc").write_bytes(b"entry")
+    (root / "app_modules.zip").write_bytes(b"modules")
+    return root, python_exe
+
+
+def test_spawn_packaged_app_uses_bytecode_entry(monkeypatch, tmp_path: Path):
+    root, python_exe = _package_root_with_entry(tmp_path)
 
     captured: dict[str, object] = {}
 
@@ -35,17 +42,12 @@ def test_spawn_packaged_app_uses_inline_bootstrap(monkeypatch, tmp_path: Path):
 
     assert launcher_entry._spawn_packaged_app(root) == 0
     assert captured["cwd"] == root
-    assert captured["command"][:4] == [str(python_exe), "-s", "-u", "-c"]
-    assert "sys.path.insert(0, str(root))" in captured["command"][4]
-    assert "from main import main as _entry" in captured["command"][4]
+    assert captured["command"] == [str(python_exe), "-s", "-u", str(root / "app_core_entry.pyc")]
     assert captured["env"]["PADDLEX_HOME"] == str(root / "cache")
 
 
 def test_spawn_packaged_app_ignores_staging_cache_home(monkeypatch, tmp_path: Path):
-    root = tmp_path / "package"
-    python_exe = root / "runtime" / "app" / "python.exe"
-    python_exe.parent.mkdir(parents=True)
-    python_exe.write_text("", encoding="utf-8")
+    root, python_exe = _package_root_with_entry(tmp_path)
     public_root = tmp_path / "Public"
     captured: dict[str, object] = {}
 
@@ -78,10 +80,7 @@ def test_spawn_packaged_app_ignores_staging_cache_home(monkeypatch, tmp_path: Pa
 
 
 def test_spawn_packaged_app_logs_nonzero_exit(monkeypatch, tmp_path: Path):
-    root = tmp_path / "package"
-    python_exe = root / "runtime" / "app" / "python.exe"
-    python_exe.parent.mkdir(parents=True)
-    python_exe.write_text("", encoding="utf-8")
+    root, python_exe = _package_root_with_entry(tmp_path)
 
     logged: list[tuple[str, str]] = []
 

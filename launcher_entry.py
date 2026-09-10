@@ -38,7 +38,7 @@ def _runtime_python_fallback(root: Path) -> Path:
 
 
 def _is_valid_runtime_python(path: Path) -> bool:
-    """Reject malformed layouts such as runtime/app/pythonw/.exe."""
+    """Reject malformed layouts such as engine/app/pythonw/.exe."""
     return path.is_file() and path.name.lower() in {"python.exe", "pythonw.exe"}
 
 

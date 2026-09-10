@@ -4,6 +4,7 @@ import ctypes
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 from contextlib import contextmanager
@@ -40,6 +41,29 @@ def _log_retention_days(config_manager: ConfigManager | None = None) -> int:
 
 def _runtime_state_path() -> Path:
     return PACKAGE_ROOT / "runtime" / "install_state.json"
+
+
+LEGACY_ENGINE_DIRS = (
+    "runtime/app",
+    "runtime/ocr_cpu",
+    "runtime/ocr_nvidia",
+    "runtime/ocr_directml",
+    "runtime/tts/piper",
+)
+
+
+def _prune_legacy_engine_layout() -> None:
+    """engine/ 就位后清除旧布局遗留在 runtime/ 下的引擎目录。
+
+    runtime/tts 下的其他内容（音频缓存）保留；只删引擎本身。
+    """
+    engine_root = PACKAGE_ROOT / "engine"
+    if not (engine_root / "app").is_dir():
+        return
+    for relative in LEGACY_ENGINE_DIRS:
+        target = PACKAGE_ROOT / relative
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
 
 
 def _load_runtime_state() -> dict[str, object] | None:
@@ -125,6 +149,7 @@ def _start_ocr_preload_in_background() -> threading.Thread:
 
 def main() -> int:
     _configure_quiet_native_runtime()
+    _prune_legacy_engine_layout()
     config_manager = ConfigManager()
     setup_runtime_logging()
     cleanup_old_logs(retention_days=_log_retention_days(config_manager))

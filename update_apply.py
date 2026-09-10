@@ -18,6 +18,9 @@ WAIT_TIMEOUT_SECONDS = 120
 PRESERVE_PREFIXES = (
     "config.json",
     "outbox.json",
+    # engine/ 是基础服务（Python 解释器、OCR 运行时），只随全量包分发；
+    # 普通更新包的清单不含 engine 条目，不保护就会被当作过时文件误删。
+    "engine/",
     "runtime/",
     "models/",
     "runtime/install_state.json",

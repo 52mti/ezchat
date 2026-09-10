@@ -4,6 +4,10 @@ import os
 from pathlib import Path
 
 
+ENGINE_DIR_NAME = "engine"
+DATA_DIR_NAME = "runtime"
+
+
 RUNTIME_NAMES = ("app", "ocr_cpu", "ocr_nvidia", "ocr_directml")
 MODEL_PROVIDER_PADDLEX = "paddlex_named_models"
 REQUIRED_MODEL_FILES = ("config.json", "inference.json", "inference.pdiparams", "inference.yml")
@@ -15,7 +19,12 @@ def package_root_from_path(path: str | Path) -> Path:
 
 
 def runtime_root(root: str | Path) -> Path:
-    return package_root_from_path(root) / "runtime"
+    """引擎根目录：Python 解释器与各 OCR 运行时（engine/）。
+
+    基础服务不属于客户数据，放在 engine/ 下由包清单管理，
+    runtime/ 只保留日志、缓存等运行数据。
+    """
+    return package_root_from_path(root) / ENGINE_DIR_NAME
 
 
 def runtime_dir(root: str | Path, runtime_name: str) -> Path:
@@ -59,11 +68,12 @@ def runtime_python(root: str | Path, runtime_name: str, *, gui: bool = False) ->
 
 
 def runtime_state_path(root: str | Path) -> Path:
-    return runtime_root(root) / "install_state.json"
+    # install_state 属于安装状态数据，固定在 runtime/ 下，不随引擎目录迁移。
+    return package_root_from_path(root) / DATA_DIR_NAME / "install_state.json"
 
 
 def runtime_reports_dir(root: str | Path) -> Path:
-    return runtime_root(root) / "reports"
+    return package_root_from_path(root) / DATA_DIR_NAME / "reports"
 
 
 def models_root(root: str | Path) -> Path:

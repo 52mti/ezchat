@@ -70,13 +70,12 @@ BUNDLED_DATA_FILES = [
     "runtime/greetings/pingtai.txt",
 ]
 PIPER_SOURCE_ASSETS_DIR = "tts/piper"
-PIPER_RUNTIME_ASSETS_DIR = "runtime/tts/piper"
 
 RUNTIME_SKELETON_DIRS = [
-    "runtime/app",
-    "runtime/ocr_cpu",
-    "runtime/ocr_nvidia",
-    "runtime/ocr_directml",
+    "engine/app",
+    "engine/ocr_cpu",
+    "engine/ocr_nvidia",
+    "engine/ocr_directml",
     "runtime/logs",
     "runtime/errors",
     "runtime/memory",
@@ -895,7 +894,9 @@ def _archive_excludes(
     if exclude_app_customer_config_assets and _is_app_customer_config_asset(relative):
         return True
     if exclude_full_runtimes and (
-        _relative_matches_prefix(relative, "runtime/app")
+        # engine/ 是基础服务（Python 解释器 + OCR 运行时），只随全量包分发。
+        _relative_matches_prefix(relative, "engine")
+        or _relative_matches_prefix(relative, "runtime/app")
         or _relative_matches_prefix(relative, "runtime/ocr_cpu")
         or _relative_matches_prefix(relative, "runtime/ocr_nvidia")
         or _relative_matches_prefix(relative, "runtime/ocr_directml")
@@ -1062,11 +1063,8 @@ def _copy_bundled_data(root: Path, package_root: Path) -> None:
         source = root / relative
         if source.is_file():
             _copy_item(source, package_root / relative)
-    # Piper 引擎只随全量包安装到 runtime/tts/piper；更新器保留客户本地副本，
-    # 普通更新包不携带引擎（见 _archive_excludes），换语音模型需发全量包。
-    piper_source = root / PIPER_SOURCE_ASSETS_DIR
-    if piper_source.is_dir():
-        _copy_item(piper_source, package_root / PIPER_RUNTIME_ASSETS_DIR)
+    # TTS 引擎（tts/piper）随包顶层分发并直接在该位置运行；
+    # runtime/ 只保留运行数据，不再复制引擎副本。
 
 
 def _run_build_step(command: list[str], *, cwd: Path) -> None:
@@ -1149,8 +1147,8 @@ def _write_full_package_runtime_state(package_root: Path, *, model_tier: str, nv
         "cuda_lane": nvidia_cuda_lane,
         "cache_home": "runtime/.paddlex",
         "status": "installed",
-        "python_executable": "runtime/app/python.exe",
-        "runtime_path": "runtime/app",
+        "python_executable": "engine/app/python.exe",
+        "runtime_path": "engine/app",
         "message": "Full package runtimes assembled by build.py",
         "validation": "ok",
         "validation_error": "",
@@ -1160,10 +1158,10 @@ def _write_full_package_runtime_state(package_root: Path, *, model_tier: str, nv
         "packages": [],
         "installed_backends": ["cpu", "paddle_cuda", "onnx_directml"],
         "runtime_inventory": {
-            "app": "runtime/app",
-            "cpu": "runtime/ocr_cpu",
-            "paddle_cuda": "runtime/ocr_nvidia",
-            "onnx_directml": "runtime/ocr_directml",
+            "app": "engine/app",
+            "cpu": "engine/ocr_cpu",
+            "paddle_cuda": "engine/ocr_nvidia",
+            "onnx_directml": "engine/ocr_directml",
         },
         "models": model_spec,
         "validation_details": {
@@ -1223,10 +1221,10 @@ def _runtime_cache_dir(root: Path, *, runtime_name: str, cache_key: str) -> Path
 
 
 def _restore_runtime_from_cache(package_root: Path, cache_dir: Path, *, runtime_name: str) -> bool:
-    runtime_source = cache_dir / "runtime" / runtime_name
+    runtime_source = cache_dir / "engine" / runtime_name
     if not runtime_source.is_dir():
         return False
-    runtime_target = package_root / "runtime" / runtime_name
+    runtime_target = package_root / "engine" / runtime_name
     if runtime_target.exists():
         shutil.rmtree(runtime_target, onexc=_handle_remove_readonly)
     shutil.copytree(runtime_source, runtime_target)
@@ -1239,8 +1237,8 @@ def _restore_runtime_from_cache(package_root: Path, cache_dir: Path, *, runtime_
 def _store_runtime_cache(package_root: Path, cache_dir: Path, *, runtime_name: str, include_models: bool) -> None:
     if cache_dir.exists():
         shutil.rmtree(cache_dir, onexc=_handle_remove_readonly)
-    (cache_dir / "runtime").mkdir(parents=True, exist_ok=True)
-    shutil.copytree(package_root / "runtime" / runtime_name, cache_dir / "runtime" / runtime_name)
+    (cache_dir / "engine").mkdir(parents=True, exist_ok=True)
+    shutil.copytree(package_root / "engine" / runtime_name, cache_dir / "engine" / runtime_name)
     if include_models:
         models_root = package_root / "models"
         if models_root.is_dir():
