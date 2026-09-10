@@ -59,6 +59,7 @@ INCLUDE_PATHS = [
     "launcher_entry.py",
     "ocr_subprocess_entry.py",
     "update_apply.py",
+    "update_orchestration.py",
     "runtime_layout.py",
     "requirements.txt",
     "pyproject.toml",
@@ -98,6 +99,7 @@ PROTECTED_SOURCE_PATHS = (
     "tts",
     "main.py",
     "launcher_entry.py",
+    "update_orchestration.py",
     "ocr_subprocess_entry.py",
     "update_apply.py",
     "runtime_layout.py",
@@ -867,47 +869,33 @@ def _relative_matches_prefix(relative: str, prefix: str) -> bool:
 
 
 def _is_app_customer_config_asset(relative: str) -> bool:
+    """App 级配置是客户界面数据：不进任何归档（新装机默认值由代码层
+    DEFAULT_CONFIG 提供），也不由更新器删除/覆盖（update_apply 镜像保留）。"""
     parts = relative.split("/")
-    if len(parts) < 3 or parts[0] != "apps":
+    if len(parts) != 3 or parts[0] != "apps" or not parts[1]:
         return False
-    if (
-        parts[2] == "ocr_config.py"
-        or parts[2].endswith("_ocr_config.py")
-    ):
-        return True
-    return False
+    return parts[2] in {"config.json", "dialogue_ocr_config.json", "list_ocr_config.json"}
 
 
-def _archive_excludes(
-    relative: str,
-    *,
-    exclude_runtime_state: bool,
-    exclude_full_runtimes: bool,
-    exclude_app_customer_config_assets: bool,
-) -> bool:
-    # 客户更新由当前启动器拉起，启动器自身仍被 Windows 占用，更新包不能携带
-    # 这两个 EXE，否则更新程序会尝试覆盖正在运行的文件并失败。
-    if exclude_full_runtimes and relative in {LAUNCHER_EXE, LAUNCHER_ALIAS_EXE}:
+def _archive_excludes(relative: str, *, update_payload: bool) -> bool:
+    # package_manifest.json 由归档内容现场生成，不作为普通文件收录。
+    if relative == "package_manifest.json":
         return True
-    if exclude_runtime_state and relative == "runtime/install_state.json":
+    if _is_app_customer_config_asset(relative):
         return True
-    if exclude_app_customer_config_assets and _is_app_customer_config_asset(relative):
-        return True
-    if exclude_full_runtimes and (
-        # engine/ 是基础服务（Python 解释器 + OCR 运行时），只随全量包分发。
-        _relative_matches_prefix(relative, "engine")
-        or _relative_matches_prefix(relative, "runtime/app")
-        or _relative_matches_prefix(relative, "runtime/ocr_cpu")
-        or _relative_matches_prefix(relative, "runtime/ocr_nvidia")
-        or _relative_matches_prefix(relative, "runtime/ocr_directml")
-        or _relative_matches_prefix(relative, "runtime/tts/piper")
-        # 顶层 tts/piper 是引擎安装源（约 119MB）。客户机由全量包安装到
-        # runtime/tts/piper 并被更新器保留；更新包携带它只增加下载体积，
-        # 运行时也永远优先使用 runtime/tts/piper 下的副本。
-        or _relative_matches_prefix(relative, "tts/piper")
-        or _relative_matches_prefix(relative, "models/ocr")
-    ):
-        return True
+    if update_payload:
+        # 更新包结构隔离：engine/、models/、runtime/ 只随全量包变化，
+        # 客户运行状态（runtime/）任何情况下都不随包下发；tts/piper 是
+        # 顶层 TTS 引擎（本项目以它为运行位置），同样只随全量包走。
+        # 启动器 EXE 运行中被 Windows 占用，也不能进更新包。
+        if (
+            relative in {LAUNCHER_EXE, LAUNCHER_ALIAS_EXE}
+            or _relative_matches_prefix(relative, "engine")
+            or _relative_matches_prefix(relative, "models")
+            or _relative_matches_prefix(relative, "runtime")
+            or _relative_matches_prefix(relative, "tts/piper")
+        ):
+            return True
     if _relative_matches_prefix(relative, "runtime/.paddlex"):
         return True
     parts = relative.split("/")
@@ -922,25 +910,26 @@ def _archive_excludes(
     return relative.endswith((".pyc", ".pyo")) and relative not in protected_bytecode
 
 
-def _iter_archive_dirs(
-    package_root: Path,
-    *,
-    exclude_runtime_state: bool,
-    exclude_full_runtimes: bool,
-    exclude_app_customer_config_assets: bool,
-) -> Iterator[str]:
+def _iter_archive_dirs(package_root: Path, *, update_payload: bool) -> Iterator[str]:
+    file_parents: set[str] | None = None
+    if update_payload:
+        # 更新包不写空目录：客户若用"替换文件夹"式解压，包里的空骨架目录
+        # 会顶掉本机真实内容。只保留确实含文件的目录。
+        file_parents = set()
+        for _path, arcname in _iter_archive_files(package_root, update_payload=update_payload):
+            parent = arcname.rsplit("/", 1)[0]
+            while parent and parent != PACKAGE_NAME:
+                file_parents.add(parent)
+                parent = parent.rsplit("/", 1)[0]
     for path in sorted(package_root.rglob("*")):
         if not path.is_dir():
             continue
         relative = path.relative_to(package_root).as_posix()
         if not relative:
             continue
-        if _archive_excludes(
-            relative,
-            exclude_runtime_state=exclude_runtime_state,
-            exclude_full_runtimes=exclude_full_runtimes,
-            exclude_app_customer_config_assets=exclude_app_customer_config_assets,
-        ):
+        if file_parents is not None and relative not in file_parents:
+            continue
+        if _archive_excludes(relative, update_payload=update_payload):
             continue
         yield f"{PACKAGE_NAME}/{relative}/"
 
@@ -948,22 +937,29 @@ def _iter_archive_dirs(
 def _iter_archive_files(
     package_root: Path,
     *,
-    exclude_runtime_state: bool,
-    exclude_full_runtimes: bool,
-    exclude_app_customer_config_assets: bool,
+    update_payload: bool,
 ) -> Iterator[tuple[Path, str]]:
     for path in sorted(package_root.rglob("*")):
         if not path.is_file():
             continue
         relative = path.relative_to(package_root).as_posix()
-        if _archive_excludes(
-            relative,
-            exclude_runtime_state=exclude_runtime_state,
-            exclude_full_runtimes=exclude_full_runtimes,
-            exclude_app_customer_config_assets=exclude_app_customer_config_assets,
-        ):
+        if _archive_excludes(relative, update_payload=update_payload):
             continue
         yield path, f"{PACKAGE_NAME}/{relative}"
+
+
+def _archive_manifest_payload(package_root: Path, entries: list[tuple[Path, str]]) -> dict:
+    """清单必须与归档实际内容一致；幻影条目会让应用端误删真实文件。"""
+    files = []
+    for path, arcname in entries:
+        relative = arcname.split("/", 1)[1]
+        files.append({"path": relative, "sha256": _sha256(path), "size": path.stat().st_size})
+    return {
+        "schema_version": 2,
+        "package_name": PACKAGE_NAME,
+        "contains_private_config": False,
+        "files": files,
+    }
 
 
 def _write_archive(
@@ -971,54 +967,32 @@ def _write_archive(
     dist_root: Path,
     suffix: str,
     *,
-    exclude_runtime_state: bool,
-    exclude_full_runtimes: bool,
-    exclude_app_customer_config_assets: bool,
+    update_payload: bool,
     timestamp: str = "",
 ) -> Path:
     dist_root.mkdir(parents=True, exist_ok=True)
     archive_path = dist_root / f"{PACKAGE_NAME}{suffix}{'_' + timestamp if timestamp else ''}.zip"
+    entries = list(_iter_archive_files(package_root, update_payload=update_payload))
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for arcname in _iter_archive_dirs(
-            package_root,
-            exclude_runtime_state=exclude_runtime_state,
-            exclude_full_runtimes=exclude_full_runtimes,
-            exclude_app_customer_config_assets=exclude_app_customer_config_assets,
-        ):
+        for arcname in _iter_archive_dirs(package_root, update_payload=update_payload):
             archive.writestr(arcname, "")
-        for path, arcname in _iter_archive_files(
-            package_root,
-            exclude_runtime_state=exclude_runtime_state,
-            exclude_full_runtimes=exclude_full_runtimes,
-            exclude_app_customer_config_assets=exclude_app_customer_config_assets,
-        ):
+        for path, arcname in entries:
             compression = zipfile.ZIP_STORED if path.suffix.lower() in _STORED_SUFFIXES else zipfile.ZIP_DEFLATED
             archive.write(path, arcname, compress_type=compression)
+        manifest = _archive_manifest_payload(package_root, entries)
+        archive.writestr(
+            f"{PACKAGE_NAME}/package_manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        )
     return archive_path
 
 
 def _write_full_package_archive(package_root: Path, dist_root: Path, *, timestamp: str = "") -> Path:
-    return _write_archive(
-        package_root,
-        dist_root,
-        "_full",
-        exclude_runtime_state=False,
-        exclude_full_runtimes=False,
-        exclude_app_customer_config_assets=False,
-        timestamp=timestamp,
-    )
+    return _write_archive(package_root, dist_root, "_full", update_payload=False, timestamp=timestamp)
 
 
 def _write_customer_update_archive(package_root: Path, dist_root: Path, *, timestamp: str = "") -> Path:
-    return _write_archive(
-        package_root,
-        dist_root,
-        "_update",
-        exclude_runtime_state=True,
-        exclude_full_runtimes=True,
-        exclude_app_customer_config_assets=True,
-        timestamp=timestamp,
-    )
+    return _write_archive(package_root, dist_root, "_update", update_payload=True, timestamp=timestamp)
 
 
 def _ignore(_dir_path: str, names: list[str]) -> set[str]:
@@ -1046,6 +1020,16 @@ def _copy_sources(root: Path, package_root: Path) -> None:
         if not source.exists():
             continue
         _copy_item(source, package_root / relative)
+    # 模板变体按 MAC 命名空间区分所有权：开发机标定（__developer_）与
+    # 本机 UI 采集（__customer_{本机MAC}_）不属于发布内容；从客户机收集
+    # 来的外来 MAC 客户模板保留在包里，用于向其他机器分发。无 MAC 段的
+    # 历史 __customer_ 模板（如 popup_custom__customer_1）是共享资产，保留。
+    from apps.visual_assets import machine_template_id
+
+    own_customer_pattern = f"*__customer_{machine_template_id()}_*"
+    for templates_dir in (package_root / "apps").glob("*/templates"):
+        for variant in list(templates_dir.rglob("*__developer_*")) + list(templates_dir.rglob(own_customer_pattern)):
+            _remove_path(variant)
     for relative in DEPRECATED_PACKAGE_PATHS:
         deprecated_path = package_root / relative
         if deprecated_path.exists():

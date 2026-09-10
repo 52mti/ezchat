@@ -9,12 +9,13 @@ from services.config_manager import ConfigManager
 
 
 def _read_app_config(tmp_path, app_name):
-    path = tmp_path / "apps" / app_name / "config.json"
+    # 双层布局：UI 保存只写客户层 runtime/configs/<app>/。
+    path = tmp_path / "runtime" / "configs" / app_name / "config.json"
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _read_app_ocr_mode_config(tmp_path, app_name, filename):
-    path = tmp_path / "apps" / app_name / filename
+    path = tmp_path / "runtime" / "configs" / app_name / filename
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -581,3 +582,56 @@ def test_config_manager_preserves_app_screen_detection_rules(tmp_path):
     config = manager.get_app_config("192.168.1.1", "xinyu", {})
 
     assert config["screen_detection_rules"] == rules
+
+
+def test_packaged_migration_moves_legacy_configs_to_customer_layer(tmp_path, monkeypatch):
+    """客户机迁移：复制到 runtime/configs 并消费源文件，防止旧 json 遮蔽新默认。"""
+    monkeypatch.setenv("JIXIEBI_PACKAGE_ROOT", str(tmp_path))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"schema_version": 3, "devices": []}), encoding="utf-8")
+    for filename in ("config.json", "dialogue_ocr_config.json", "list_ocr_config.json"):
+        app_dir = tmp_path / "apps" / "xinyu"
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / filename).write_text('{"legacy": true}', encoding="utf-8")
+
+    ConfigManager(config_path, tmp_path / "outbox.json")
+
+    for filename in ("config.json", "dialogue_ocr_config.json", "list_ocr_config.json"):
+        customer = tmp_path / "runtime" / "configs" / "xinyu" / filename
+        assert customer.is_file(), filename
+        assert json.loads(customer.read_text(encoding="utf-8")) == {"legacy": True}
+        assert not (tmp_path / "apps" / "xinyu" / filename).exists(), filename
+    assert (tmp_path / "runtime" / "configs" / ".layout_v2").is_file()
+
+
+def test_dev_environment_keeps_apps_configs_as_defaults_layer(tmp_path, monkeypatch):
+    """开发机（无打包环境变量）：apps json 原地保留，只作 defaults 层。"""
+    monkeypatch.delenv("JIXIEBI_PACKAGE_ROOT", raising=False)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"schema_version": 3, "devices": []}), encoding="utf-8")
+    (tmp_path / "apps" / "xinyu").mkdir(parents=True)
+    (tmp_path / "apps" / "xinyu" / "config.json").write_text(
+        json.dumps({"match_threshold": 0.75}), encoding="utf-8"
+    )
+
+    manager = ConfigManager(config_path, tmp_path / "outbox.json")
+
+    assert (tmp_path / "apps" / "xinyu" / "config.json").is_file()
+    assert manager.get_app_overrides("xinyu")["match_threshold"] == 0.75
+
+
+def test_fresh_install_starts_customer_layer_empty(tmp_path):
+    """全新安装：客户层从空开始，绝不复制随包默认值。"""
+    config_path = tmp_path / "config.json"
+    (tmp_path / "apps" / "xinyu").mkdir(parents=True)
+    (tmp_path / "apps" / "xinyu" / "config.json").write_text(
+        json.dumps({"match_threshold": 0.75}), encoding="utf-8"
+    )
+
+    manager = ConfigManager(config_path, tmp_path / "outbox.json")
+
+    # 客户层从空开始（不复制默认值文件）；读取时 defaults 层兜底，
+    # 客户机上 apps json 不随包分发，因此 defaults 层同样为空。
+    assert not (tmp_path / "runtime" / "configs" / "xinyu" / "config.json").exists()
+    assert manager.get_app_overrides("xinyu")["match_threshold"] == 0.75
+    assert (tmp_path / "runtime" / "configs" / ".layout_v2").is_file()

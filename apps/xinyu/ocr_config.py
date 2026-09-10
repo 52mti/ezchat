@@ -7,13 +7,28 @@ from pathlib import Path
 
 
 def _load_mode_config(filename: str) -> dict:
+    """三层回退：客户层(runtime/configs) -> 包内 json(开发机/迁移前) -> 代码内置默认。
+
+    App 级配置 json 不随包分发（见 build.py 归档排除），全新装机没有
+    json 文件，由 ocr_defaults.py 的代码层默认兜底。
+    """
     root = str(os.environ.get("JIXIEBI_PACKAGE_ROOT", "") or "").strip()
-    path = Path(root) / "apps" / "xinyu" / filename if root else Path(__file__).with_name(filename)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return copy.deepcopy(payload) if isinstance(payload, dict) else {}
+    base = Path(root) if root else Path(__file__).resolve().parents[2]
+    candidates = (
+        base / "runtime" / "configs" / "xinyu" / filename,
+        base / "apps" / "xinyu" / filename,
+        Path(__file__).with_name(filename),
+    )
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload:
+            return copy.deepcopy(payload)
+    from .ocr_defaults import DIALOGUE_OCR_DEFAULT, LIST_OCR_DEFAULT
+
+    return {"dialogue_ocr_config.json": DIALOGUE_OCR_DEFAULT, "list_ocr_config.json": LIST_OCR_DEFAULT}.get(filename, {})
 
 
 DIALOGUE_OCR_MODE = _load_mode_config("dialogue_ocr_config.json")

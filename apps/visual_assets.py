@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from hashlib import blake2b
 import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -70,6 +71,22 @@ SCREEN_ROLES_CONFIG_KEY = "screen_roles"
 TEMPLATE_MATCH_REGIONS_CONFIG_KEY = "template_match_regions"
 GLOBAL_MATCH_TEMPLATE_KEYS = frozenset({"screen.no_phone", "screen.black_screen"})
 TEMPLATE_MATCH_CACHE_MAX_SIZE = 512
+_MACHINE_TEMPLATE_ID: str | None = None
+
+
+def machine_template_id() -> str:
+    """客户模板命名空间：本机 MAC 的 12 位小写十六进制。
+
+    取不到真实 MAC 时退回固定标记 local（控制机械臂的机器都有网卡，
+    实际不会走到）。
+    """
+    global _MACHINE_TEMPLATE_ID
+    if _MACHINE_TEMPLATE_ID is None:
+        node = uuid.getnode()
+        _MACHINE_TEMPLATE_ID = "local" if (node >> 40) & 0x01 else f"{node:012x}"
+    return _MACHINE_TEMPLATE_ID
+
+
 _TEMPLATE_MATCH_CACHE: dict[tuple[Any, ...], dict[str, float] | None] = {}
 _TEMPLATE_MATCH_CACHE_LOCK = Lock()
 

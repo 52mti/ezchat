@@ -161,10 +161,12 @@ def test_write_customer_update_archive_keeps_app_json_configs_and_templates(tmp_
     assert f"{build.PACKAGE_NAME}/apps/xinyu/app.py" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/steps.py" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/config.py" in names
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/config.json" in names
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/ocr_config.py" not in names
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/dialogue_ocr_config.json" in names
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/list_ocr_config.json" in names
+    # App 级配置三件套是客户界面数据，不进任何归档（默认值走代码层）。
+    # .py 不由归档排除；真实构建中源码在编译阶段已被移除进 app_modules.zip。
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/config.json" not in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/ocr_config.py" in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/dialogue_ocr_config.json" not in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/list_ocr_config.json" not in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/templates/buttons/btn_返回按钮.jpg" in names
 
 
@@ -194,6 +196,7 @@ def test_write_full_package_archive_includes_app_customer_config_assets(tmp_path
     (app_root / "templates" / "buttons").mkdir(parents=True)
     (app_root / "config.json").write_text('{"persona": "default"}', encoding="utf-8")
     (app_root / "ocr_config.py").write_text("RULES = {}\n", encoding="utf-8")
+    (app_root / "ocr_defaults.py").write_text("DIALOGUE_OCR_DEFAULT = {}\n", encoding="utf-8")
     (app_root / "dialogue_ocr_config.json").write_text('{"mode": "dialogue"}', encoding="utf-8")
     (app_root / "list_ocr_config.json").write_text('{"mode": "list"}', encoding="utf-8")
     (app_root / "templates" / "buttons" / "btn_返回按钮.jpg").write_bytes(b"image")
@@ -203,10 +206,12 @@ def test_write_full_package_archive_includes_app_customer_config_assets(tmp_path
     with zipfile.ZipFile(archive_path) as archive:
         names = set(archive.namelist())
 
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/config.json" in names
+    # 三件套客户配置不进归档；代码层默认(ocr_defaults.py)随包分发。
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/config.json" not in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/ocr_config.py" in names
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/dialogue_ocr_config.json" in names
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/list_ocr_config.json" in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/dialogue_ocr_config.json" not in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/list_ocr_config.json" not in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/ocr_defaults.py" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/templates/buttons/btn_返回按钮.jpg" in names
 
 
@@ -782,7 +787,7 @@ def test_remove_dist_archives_removes_legacy_and_timestamped_zip_names(tmp_path)
 def test_ensure_runtime_available_reuses_cached_runtime(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     package_root = tmp_path / "package"
-    runtime_cache = tmp_path / "runtime_cache" / "app" / "cache123" / "runtime" / "app"
+    runtime_cache = tmp_path / "runtime_cache" / "app" / "cache123" / "engine" / "app"
     (runtime_cache / "Lib").mkdir(parents=True)
     (runtime_cache / "python.exe").write_bytes(b"python")
 
@@ -800,7 +805,7 @@ def test_ensure_runtime_available_reuses_cached_runtime(tmp_path, monkeypatch):
         use_cache=True,
     )
 
-    assert (package_root / "runtime" / "app" / "python.exe").read_bytes() == b"python"
+    assert (package_root / "engine" / "app" / "python.exe").read_bytes() == b"python"
     assert install_calls == []
 
 

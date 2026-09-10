@@ -300,10 +300,23 @@ def _load_app_ocr_mode_override_files(app_config_root: Path, app_name: str) -> d
     return {"ocr_modes": ocr_modes} if ocr_modes else {}
 
 
-def _load_app_override_file(app_config_root: Path, app_name: str) -> dict[str, Any]:
-    payload = _load_json_dict(_app_config_path(app_config_root, app_name))
+def _load_app_override_file(
+    app_config_root: Path,
+    app_name: str,
+    defaults_root: Path | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if defaults_root is not None:
+        # 包内随包默认值（apps/<app>/，只读），客户层缺失的键由此兜底。
+        payload = _load_json_dict(_app_config_path(defaults_root, app_name))
+        payload = _deep_merge(payload, _load_app_ocr_mode_override_files(defaults_root, app_name))
+    payload = _deep_merge(payload, _load_json_dict(_app_config_path(app_config_root, app_name)))
     payload = _deep_merge(payload, _load_app_ocr_mode_override_files(app_config_root, app_name))
-    app_level, _, _ = _split_override_scopes(payload)
+    app_level, _, legacy_device_app = _split_override_scopes(payload)
+    # 旧布局把业务参数（时长/关键词等）写在 App 层文件里；读取时并回作为
+    # 兜底值，设备层（devices[].app_overrides）合并时优先级更高。
+    for key, value in legacy_device_app.items():
+        app_level.setdefault(key, copy.deepcopy(value))
     _normalize_app_templates(app_name, app_level)
     _normalize_match_threshold(app_level)
     _normalize_huanyou_dialogue_rules(app_name, app_level)
@@ -347,10 +360,15 @@ def _normalize_device_scopes(device: dict[str, Any]) -> None:
     device["app_overrides"] = normalized
 
 
-def _merge_app_level_config(app_config_root: Path, app_name: str, updates: dict[str, Any]) -> None:
+def _merge_app_level_config(
+    app_config_root: Path,
+    app_name: str,
+    updates: dict[str, Any],
+    defaults_root: Path | None = None,
+) -> None:
     if not updates:
         return
-    existing = _load_app_override_file(app_config_root, app_name)
+    existing = _load_app_override_file(app_config_root, app_name, defaults_root=defaults_root)
     merged = _deep_merge(existing, updates)
     _normalize_app_templates(app_name, merged)
     _normalize_match_threshold(merged)
@@ -397,6 +415,7 @@ def _apply_scoped_app_overrides(
     app_config_root: Path,
     device: dict[str, Any],
     app_overrides: dict[str, Any],
+    defaults_root: Path | None = None,
 ) -> None:
     if not isinstance(app_overrides, dict):
         return
@@ -405,7 +424,7 @@ def _apply_scoped_app_overrides(
             continue
         app_name = str(raw_app_name)
         app_level, device_level, device_app_level = _split_override_scopes(raw_override)
-        _merge_app_level_config(app_config_root, app_name, app_level)
+        _merge_app_level_config(app_config_root, app_name, app_level, defaults_root=defaults_root)
         _merge_runtime_overrides(device, device_level)
         _merge_device_app_overrides(device, app_name, device_app_level)
     _normalize_device_scopes(device)
@@ -421,13 +440,77 @@ class ConfigManager:
     ) -> None:
         self.config_path = Path(config_path)
         self.outbox_path = Path(outbox_path)
-        self.app_config_root = self.config_path.parent / "apps"
+        # 双文件分层：apps/<app>/ = 随包默认值（只读兜底，开发机上是源码）；
+        # runtime/configs/<app>/ = 客户 App 级配置（UI 保存只写这里）。
+        # 根 config.json 的 devices[].app_overrides = 客户对应设备的业务参数。
+        fresh_install = not self.config_path.exists()
+        self.app_config_root = self.config_path.parent / "runtime" / "configs"
+        self.app_defaults_root = self.config_path.parent / "apps"
+        self._migrate_legacy_app_configs(fresh_install=fresh_install)
         self._config = self._load_json(self.config_path, DEFAULT_CONFIG)
         self._outbox = self._load_json(self.outbox_path, DEFAULT_OUTBOX)
         self._migrate_if_needed()
         self._normalize_loaded_device_scopes()
         self._move_config_apikey_to_env()
         self._apply_environment_overrides()
+
+    def _migrate_legacy_app_configs(self, *, fresh_install: bool) -> None:
+        """双层配置的边界保护与一次性迁移。
+
+        - apps/<app>/ 三个 json 在客户机上是历史布局的客户界面数据；
+        - runtime/configs/<app>/ 是客户层，只装客户自己的设定；全新安装
+          从空开始——绝不把随包默认值整份复制进来，否则客户层按键遮蔽
+          默认值，开发端后续更新默认值的通道会被冻结；
+        - 客户机（JIXIEBI_PACKAGE_ROOT 存在）迁移 = 复制到客户层并消费
+          源文件：旧 json 留在 apps/ 会作为 defaults 层永久遮蔽新的代码层
+          默认值。复制校验失败则保留源文件降级兜底。开发机上 apps json
+          是 git 源码资产，只作 defaults 层，绝不动。
+        """
+        stamp = self.app_config_root / ".layout_v2"
+        if stamp.is_file():
+            return
+        packaged_launch = bool(str(os.environ.get("JIXIEBI_PACKAGE_ROOT", "") or "").strip())
+        legacy_root = self.config_path.parent / "apps"
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        if fresh_install:
+            stamp.write_text("fresh install: customer layers start empty\n", encoding="utf-8")
+            return
+        if not legacy_root.is_dir():
+            stamp.write_text("no legacy apps configs\n", encoding="utf-8")
+            return
+        try:
+            migrated = False
+            for app_dir in sorted(legacy_root.iterdir()):
+                if not app_dir.is_dir():
+                    continue
+                for file_name in (
+                    APP_CONFIG_FILE_NAME,
+                    APP_DIALOGUE_OCR_CONFIG_FILE_NAME,
+                    APP_LIST_OCR_CONFIG_FILE_NAME,
+                ):
+                    source = app_dir / file_name
+                    if not source.is_file():
+                        continue
+                    target = self.app_config_root / app_dir.name / file_name
+                    if not target.is_file():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source, target)
+                    if target.is_file() and target.read_bytes() == source.read_bytes():
+                        if packaged_launch:
+                            source.unlink()
+                        migrated = True
+            if migrated:
+                marker = self.app_config_root / "migrated_from_apps.txt"
+                marker.write_text(
+                    f"legacy app configs migrated from {legacy_root}\n",
+                    encoding="utf-8",
+                )
+        except OSError:
+            return
+        try:
+            stamp.write_text("legacy app configs migrated\n", encoding="utf-8")
+        except OSError:
+            pass
 
     def _load_json(self, path: Path, default: dict[str, Any]) -> dict[str, Any]:
         if not path.exists():
@@ -535,7 +618,9 @@ class ConfigManager:
             if offsets:
                 legacy_app_offsets[str(app_name)] = offsets
             app_level, _, _ = _split_override_scopes(normalized_app_config)
-            _merge_app_level_config(self.app_config_root, str(app_name), app_level)
+            _merge_app_level_config(
+                self.app_config_root, str(app_name), app_level, defaults_root=self.app_defaults_root
+            )
         if isinstance(devices, list):
             migrated["devices"] = _normalize_devices(devices)
             for device in migrated["devices"]:
@@ -550,7 +635,9 @@ class ConfigManager:
                 old_app_overrides = old_app_overrides if isinstance(old_app_overrides, dict) else {}
                 device["runtime_overrides"] = runtime_overrides
                 device["app_overrides"] = {}
-                _apply_scoped_app_overrides(self.app_config_root, device, old_app_overrides)
+                _apply_scoped_app_overrides(
+                    self.app_config_root, device, old_app_overrides, defaults_root=self.app_defaults_root
+                )
                 for app_name, offsets in legacy_app_offsets.items():
                     if str(device.get("selected_app", "")) == app_name or (
                         isinstance(old_app_overrides, dict) and app_name in old_app_overrides
@@ -623,7 +710,12 @@ class ConfigManager:
                     if isinstance(runtime_updates, dict):
                         _merge_runtime_overrides(device, runtime_updates)
                     if isinstance(scoped_app_overrides, dict):
-                        _apply_scoped_app_overrides(self.app_config_root, device, scoped_app_overrides)
+                        _apply_scoped_app_overrides(
+                            self.app_config_root,
+                            device,
+                            scoped_app_overrides,
+                            defaults_root=self.app_defaults_root,
+                        )
                     _normalize_device_scopes(device)
                     self._config["devices"] = _normalize_devices(devices)
                     self._write_config()
@@ -632,7 +724,9 @@ class ConfigManager:
             if isinstance(runtime_updates, dict):
                 _merge_runtime_overrides(new_device, runtime_updates)
             if isinstance(scoped_app_overrides, dict):
-                _apply_scoped_app_overrides(self.app_config_root, new_device, scoped_app_overrides)
+                _apply_scoped_app_overrides(
+                    self.app_config_root, new_device, scoped_app_overrides, defaults_root=self.app_defaults_root
+                )
             _normalize_device_scopes(new_device)
             devices.append(new_device)
             self._config["devices"] = _normalize_devices(devices)
@@ -650,7 +744,9 @@ class ConfigManager:
             if any(isinstance(existing, dict) and str(existing.get("ip", "")).strip() == device_ip for existing in devices):
                 return False
             new_device = copy.deepcopy(device)
-            _apply_scoped_app_overrides(self.app_config_root, new_device, new_device.get("app_overrides", {}))
+            _apply_scoped_app_overrides(
+                self.app_config_root, new_device, new_device.get("app_overrides", {}), defaults_root=self.app_defaults_root
+            )
             _normalize_device_scopes(new_device)
             devices.append(new_device)
             self._config["devices"] = _normalize_devices(devices)
@@ -704,14 +800,18 @@ class ConfigManager:
 
     def get_app_overrides(self, app_name: str) -> dict[str, Any]:
         with self._lock:
-            return _load_app_override_file(self.app_config_root, str(app_name))
+            return _load_app_override_file(
+                self.app_config_root, str(app_name), defaults_root=self.app_defaults_root
+            )
 
     def update_app_config(self, app_name: str, updates: dict[str, Any]) -> None:
         scoped_updates, _, _ = _split_override_scopes(copy.deepcopy(updates))
         if not scoped_updates:
             return
         with self._lock:
-            _merge_app_level_config(self.app_config_root, str(app_name), scoped_updates)
+            _merge_app_level_config(
+                self.app_config_root, str(app_name), scoped_updates, defaults_root=self.app_defaults_root
+            )
 
     def get_device_runtime_overrides(self, device_ip: str) -> dict[str, Any]:
         device = self.find_device(device_ip) or {}
