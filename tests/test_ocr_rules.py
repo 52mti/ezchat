@@ -7,6 +7,7 @@ from PIL import Image
 import vision.ocr_rules as ocr_rules
 from apps.huanyou.ocr_config import DIALOGUE_OCR_MODE as HUANYOU_DIALOGUE_OCR_MODE
 from apps.xinyu.ocr_config import DIALOGUE_OCR_MODE as XINYU_DIALOGUE_OCR_MODE
+from apps.xinyu.ocr_defaults import DIALOGUE_OCR_DEFAULT as XINYU_DIALOGUE_OCR_DEFAULT
 from apps.wechat.config import DEFAULT_CONFIG as WECHAT_CONFIG
 from apps.wechat.ocr_config import DIALOGUE_OCR_MODE as WECHAT_DIALOGUE_OCR_MODE
 from vision.ocr_rules import build_dialogue_result, looks_like_time_text, run_ocr_mode
@@ -475,7 +476,9 @@ def test_xinyu_dialogue_rules_filter_prompt_keywords_before_sender_detection():
         },
     ]
 
-    result = build_dialogue_result(items, (562, 1254), XINYU_DIALOGUE_OCR_MODE["rules"])
+    # 用代码层默认值断言：本机/客户机存在 runtime/configs 客户层时会整表
+    # 覆盖关键词列表，用 DIALOGUE_OCR_MODE 会随机器不同而漂移。
+    result = build_dialogue_result(items, (562, 1254), XINYU_DIALOGUE_OCR_DEFAULT["rules"])
 
     # 心遇规则中“家乡”是系统资料/推荐话术的稳定片段，命中后整行过滤。
     assert result["dialogues"] == []

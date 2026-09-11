@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,6 +28,7 @@ from services import (
     setup_runtime_logging,
     write_error_incident,
 )
+from services.cancellation import OperationCancelled, raise_if_cancelled
 from services.license_client import _is_future_time
 
 
@@ -36,11 +38,87 @@ class WorkerEvent:
     level: str
     message: str
     payload: dict[str, Any] | None = None
+    worker_id: str = ""
 
 
 RECENT_LOG_BUFFER_LIMIT = 100
 PRE_ERROR_LOG_LIMIT = 10
 TIMELINE_LOG_LIMIT = 200
+
+# lgb 的 HTTP 请求全部没有超时（只读保护区改不了），设备断网/半死时一个
+# get_status 就能把工作线程挂住几分钟。守卫层按方法补上单次调用上限：
+# 动作类（move_click/swipe 走 send_command 且 wait=True）要等机械动作
+# 完成，上限放宽；查询/截图类收紧。
+ROBOT_CALL_TIMEOUT_SECONDS = {
+    "get_status": 8.0,
+    "get_capture_image": 20.0,
+    "get_transform_image": 20.0,
+    "send_command": 45.0,
+    "move_click": 45.0,
+    "swipe": 45.0,
+    "play_audio": 30.0,
+    "reset_device": 30.0,
+    "restart_system": 10.0,
+}
+DEFAULT_ROBOT_CALL_TIMEOUT_SECONDS = 20.0
+
+
+class _RobotCallGuard:
+    """机械臂调用守卫：停止后快速失败 + 单次调用限时。
+
+    1. 停止请求发出后，任何新的机械臂调用立即抛 OperationCancelled，
+       工作线程不必等上一个长步骤走完才开始退出；
+    2. 实际调用在独立 daemon 线程执行并限时等待，超时后放弃等待
+       （指令仍只会发一次，不会重复执行动作），避免无限挂起。
+    """
+
+    def __init__(self, robot: Any, stop_check: Any) -> None:
+        self._robot = robot
+        self._stop_check = stop_check
+
+    def __getattr__(self, name: str) -> Any:
+        target = getattr(self._robot, name)
+        if not callable(target):
+            return target
+        timeout = float(ROBOT_CALL_TIMEOUT_SECONDS.get(name, DEFAULT_ROBOT_CALL_TIMEOUT_SECONDS))
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            raise_if_cancelled(self._robot)
+            box: dict[str, Any] = {}
+
+            def runner() -> None:
+                try:
+                    box["result"] = target(*args, **kwargs)
+                except BaseException as exc:  # 原样回传给调用方处理
+                    box["error"] = exc
+
+            thread = threading.Thread(target=runner, name=f"robot-call-{name}", daemon=True)
+            thread.start()
+            thread.join(timeout)
+            if thread.is_alive():
+                if self._stop_check():
+                    raise OperationCancelled("operation cancelled")
+                raise TimeoutError(f"机械臂调用超时：{name} 超过 {timeout:.0f}s 未返回")
+            if "error" in box:
+                raise box["error"]
+            return box.get("result")
+
+        return call
+
+
+def is_stale_worker_event(event: WorkerEvent, current: Any) -> bool:
+    """旧 worker 迟到的事件应被 UI 忽略。
+
+    典型竞态：停止旧 worker 期间（退出可能要几十秒）又点了启动，新
+    worker 已经跑起来，旧 worker 退出时迟到的 "stopped" 事件会把行状态
+    打回"已停止"。带 worker_id 的事件只信当前注册的 worker。
+    """
+    worker_id = str(getattr(event, "worker_id", "") or "")
+    if not worker_id:
+        return False
+    if current is None:
+        return True
+    return str(getattr(current, "worker_id", "") or "") != worker_id
 
 
 def _ocr_backend_label_from_state() -> str:
@@ -107,15 +185,17 @@ class DeviceWorker(threading.Thread):
             # _runtime 不会写入 config.json。
             runtime_context["config_manager"] = self.config_manager
             runtime_context["rule_learning"] = global_config.get("rule_learning", {}) if isinstance(global_config, dict) else {}
-        self.robot = robot or RobotInterface(str(device["ip"]))
+        self.worker_id = f"{str(device['ip'])}-{uuid.uuid4().hex[:8]}"
+        self.robot_inner = robot or RobotInterface(str(device["ip"]))
         try:
-            setattr(self.robot, "_codex_click_jitter_enabled", True)
+            setattr(self.robot_inner, "_codex_click_jitter_enabled", True)
         except Exception:
             pass
         try:
-            setattr(self.robot, "_codex_should_stop", self._stop_event.is_set)
+            setattr(self.robot_inner, "_codex_should_stop", self._stop_event.is_set)
         except Exception:
             pass
+        self.robot = _RobotCallGuard(self.robot_inner, self._stop_event.is_set)
         self.ai_client = AIClient(
             api_base=str(global_config.get("chat_api_base", "http://liaotianbao.icu")),
             chat_bearer=str(global_config.get("chat_bearer", "")),
@@ -219,9 +299,13 @@ class DeviceWorker(threading.Thread):
         self._pause_event.set()
         self._emit("info", "stopping")
 
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_event.is_set()
+
     def _emit(self, level: str, message: str, payload: dict[str, Any] | None = None) -> None:
         self._record_log_entry(self._log_entry(level, message, payload))
-        self.events.put(WorkerEvent(str(self.device["ip"]), level, message, payload))
+        self.events.put(WorkerEvent(str(self.device["ip"]), level, message, payload, self.worker_id))
         safe_payload = "" if payload is None else f" {payload}"
         log_level = {"error": 40, "warning": 30, "info": 20, "status": 20}.get(level, 20)
         if log_level < 30:

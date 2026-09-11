@@ -194,7 +194,7 @@ def test_edit_app_config_saves_template_match_regions_to_app_config(qtbot, tmp_p
 
     window._edit_app_config(0)
 
-    app_config_path = tmp_path / "apps" / "xinyu" / "config.json"
+    app_config_path = tmp_path / "runtime" / "configs" / "xinyu" / "config.json"
     saved = json.loads(app_config_path.read_text(encoding="utf-8"))
     assert saved["template_match_regions"]["screen.chat_window"] == [0.007, 0.476, 0.261, 0.523]
     assert saved["template_match_regions"]["popup.custom.popup_custom_4"] == [0.037, 0.282, 0.954, 0.443]

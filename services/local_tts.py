@@ -119,10 +119,13 @@ class LocalTtsServer:
                 ["netstat", "-ano", "-p", "tcp"],
                 capture_output=True,
                 text=True,
+                errors="ignore",  # netstat 输出是本地码页文本；UTF-8 模式下强解码会炸
                 timeout=5,
                 check=False,
             ).stdout
         except (OSError, subprocess.SubprocessError):
+            return
+        if not output:
             return
         pids: set[str] = set()
         for line in output.splitlines():
@@ -154,10 +157,13 @@ class LocalTtsServer:
                 ["lsof", "-ti", f"tcp:{self.port}"],
                 capture_output=True,
                 text=True,
+                errors="ignore",
                 timeout=5,
                 check=False,
             ).stdout
         except (OSError, subprocess.SubprocessError):
+            return
+        if not output:
             return
         for pid in output.split():
             with contextlib.suppress(OSError, subprocess.SubprocessError):

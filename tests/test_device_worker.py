@@ -4,6 +4,8 @@ import queue
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from services.config_manager import ConfigManager
 from workers import device_worker as device_worker_module
 from workers.device_worker import DeviceWorker
@@ -309,3 +311,74 @@ def test_worker_writes_error_incident_after_recovery(tmp_path, monkeypatch):
     assert "photo/captures/current.jpg" in payload
     assert "before_1" in payload
     assert "between_errors" in payload
+
+
+class HangingRobot:
+    host = "192.168.9.9"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+        self._codex_should_stop = lambda: False
+
+    def get_status(self):
+        time.sleep(1.5)
+        return {"data": {}}
+
+    def move_click(self, x, y, click_count=1, hold_time=200, wait=True):
+        self.calls.append(("move_click", x, y))
+        return {"ok": True}
+
+
+def test_robot_call_guard_bounds_hanging_call(monkeypatch):
+    robot = HangingRobot()
+    guard = device_worker_module._RobotCallGuard(robot, lambda: False)
+    monkeypatch.setitem(device_worker_module.ROBOT_CALL_TIMEOUT_SECONDS, "get_status", 0.3)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        guard.get_status()
+    assert time.monotonic() - started < 1.2
+
+
+def test_robot_call_guard_fast_fails_after_stop():
+    robot = HangingRobot()
+    robot._codex_should_stop = lambda: True
+    guard = device_worker_module._RobotCallGuard(robot, lambda: True)
+    with pytest.raises(device_worker_module.OperationCancelled):
+        guard.move_click(0.5, 0.5)
+    assert robot.calls == []
+
+
+def test_robot_call_guard_delegates_success_and_attributes():
+    robot = HangingRobot()
+    guard = device_worker_module._RobotCallGuard(robot, lambda: False)
+    assert guard.host == "192.168.9.9"
+    assert guard.move_click(0.25, 0.75) == {"ok": True}
+    assert robot.calls == [("move_click", 0.25, 0.75)]
+
+
+def test_worker_events_carry_worker_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(device_worker_module, "get_registered_apps", lambda: {"dummy": DummyApp})
+    events: "queue.Queue" = queue.Queue()
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    worker = DeviceWorker(
+        {"ip": "192.168.1.108", "selected_app": "dummy"},
+        app_config={"poll_interval": 1},
+        events=events,
+        config_manager=manager,
+        robot=object(),
+    )
+    assert worker.stop_requested is False
+    worker._emit("info", "hello")
+    event = events.get_nowait()
+    assert event.worker_id == worker.worker_id
+    worker.stop()
+    assert worker.stop_requested is True
+
+
+def test_is_stale_worker_event_rules():
+    stale = device_worker_module.WorkerEvent("1.1.1.1", "info", "stopped", None, "w-old")
+    assert device_worker_module.is_stale_worker_event(stale, None) is True
+    assert device_worker_module.is_stale_worker_event(stale, SimpleNamespace(worker_id="w-new")) is True
+    assert device_worker_module.is_stale_worker_event(stale, SimpleNamespace(worker_id="w-old")) is False
+    # 无标记的事件（本地TTS/设备扫描等基础设施事件）永远不丢
+    assert device_worker_module.is_stale_worker_event(device_worker_module.WorkerEvent("本地TTS", "info", "started"), None) is False

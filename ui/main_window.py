@@ -83,6 +83,7 @@ from apps.visual_assets import (
     is_popup_template_name,
     match_template_with_region,
     match_template_candidates_with_region,
+    next_template_variant_path,
     TemplateMatchRegionMissingError,
     popup_template_paths,
     template_match_region,
@@ -110,6 +111,7 @@ from services.vision_usage import reset as reset_vision_usage
 from ui.chat_history_window import ChatHistoryDialog
 from vision.screen import ensure_portrait_image
 from workers import DeviceWorker, WorkerEvent
+from workers.device_worker import is_stale_worker_event
 
 
 PERSONA_PRESETS: tuple[tuple[str, str], ...] = (
@@ -581,6 +583,7 @@ class MainWindow(QMainWindow):
         self.events: "queue.Queue[WorkerEvent]" = queue.Queue()
         self.update_events: "queue.Queue[tuple[str, dict[str, Any]]]" = queue.Queue()
         self.workers: dict[str, DeviceWorker] = {}
+        self._device_scan_running = False
         self.log_events: "deque[tuple[str, str]]" = deque(maxlen=LOG_EVENT_LIMIT)
         self._last_unattended_refresh_at = 0.0
         self.unattended_started_at: dict[str, float] = {}
@@ -1331,6 +1334,14 @@ class MainWindow(QMainWindow):
             if current_status == "paused":
                 existing.resume()
                 self._set_row_status(device_ip, "running")
+                return
+            if existing.stop_requested or current_status == "stopping":
+                # 旧进程还在退出中（长步骤/网络挂起会拖几十秒），此刻启动会被
+                # 静默忽略——明确告知用户，等状态变成"已停止"再点启动。
+                self._append_log_line(
+                    device_ip,
+                    f"[{time.strftime('%H:%M:%S')}] [warning] {device_ip}: 旧进程正在退出，请等状态变为已停止后再启动",
+                )
             return
         selected_app = self._selected_app_for_row(row)
         device["selected_app"] = selected_app
@@ -1417,17 +1428,33 @@ class MainWindow(QMainWindow):
         self._load_devices()
 
     def _scan_devices(self) -> None:
-        self.scan_device_button.setEnabled(False)
-        QApplication.processEvents()
-        try:
-            found = scan_devices(timeout=0.3, max_workers=50)
-        except Exception as exc:
-            QMessageBox.warning(self, "扫描设备", str(exc))
+        """后台扫描全网段；扫描期间 UI 不阻塞（原先同步扫描会卡住界面数秒，Windows 直接标记无响应）。"""
+        if self._device_scan_running:
             return
-        finally:
-            self.scan_device_button.setEnabled(True)
+        self._device_scan_running = True
+        self.scan_device_button.setEnabled(False)
+        self.scan_device_button.setText("扫描中…")
+
+        def scan() -> None:
+            try:
+                found = scan_devices(timeout=0.3, max_workers=50)
+            except Exception as exc:
+                self.events.put(WorkerEvent("", "warning", "scan_error", {"error": str(exc)}))
+                return
+            # 设备入库在 UI 线程做（scan_complete 分支），避免和界面保存配置抢写。
+            self.events.put(WorkerEvent("", "info", "scan_complete", {"devices": list(found)}))
+
+        threading.Thread(target=scan, name="device-scan", daemon=True).start()
+
+    def _finish_device_scan(self, devices: list[str], *, error: str = "") -> None:
+        self._device_scan_running = False
+        self.scan_device_button.setEnabled(True)
+        self.scan_device_button.setText("扫描设备")
+        if error:
+            QMessageBox.warning(self, "扫描设备", error)
+            return
         added = 0
-        for device_ip in found:
+        for device_ip in devices:
             if self.config_manager.add_device(
                 {
                     "ip": device_ip,
@@ -1441,7 +1468,7 @@ class MainWindow(QMainWindow):
             ):
                 added += 1
         self._load_devices()
-        QMessageBox.information(self, "扫描设备", f"发现 {len(found)} 台，新增 {added} 台")
+        QMessageBox.information(self, "扫描设备", f"发现 {len(devices)} 台，新增 {added} 台")
 
     def _start_and_bind_local_tts(self, device_ips: list[str] | None = None) -> None:
         """后台启动本地 TTS；只有显式传入的设备 IP 会被重新绑定。"""
@@ -1474,7 +1501,15 @@ class MainWindow(QMainWindow):
         threading.Thread(target=bind, name="local-tts-bind", daemon=True).start()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        self.local_tts_server.stop()
+        # TTS 端口清理要跑 netstat/taskkill（秒级），放后台避免关窗卡死；
+        # 清理未完成也无妨：下次启动会按 server_version 自检并清孤儿。
+        def stop_tts() -> None:
+            try:
+                self.local_tts_server.stop()
+            except Exception:
+                pass
+
+        threading.Thread(target=stop_tts, name="tts-stop", daemon=True).start()
         super().closeEvent(event)
 
     def _bind_license(self, row: int) -> None:
@@ -2031,6 +2066,17 @@ class MainWindow(QMainWindow):
         event_ip = str(event.device_ip or "")
         message = str(event.message or "")
         level = str(event.level or "")
+        if message == "scan_complete":
+            devices = [str(ip) for ip in payload.get("devices", []) if str(ip).strip()]
+            self._finish_device_scan(devices)
+            return
+        if message == "scan_error":
+            self._finish_device_scan([], error=str(payload.get("error", "") or "扫描失败"))
+            return
+        if is_stale_worker_event(event, self.workers.get(event_ip)):
+            # 旧 worker 迟到的退出/状态事件：新 worker 已接管或设备已删除，直接丢弃，
+            # 否则会把正在运行的行状态打回"已停止"。
+            return
         if self._should_store_log_event(event):
             self._append_log_event(event)
         if level == "status":
@@ -2878,29 +2924,25 @@ class TemplateManagerWidget(QWidget):
         action_layout = QVBoxLayout(action_panel)
         action_layout.setContentsMargins(14, 12, 14, 12)
         action_layout.setSpacing(8)
-        template_action_rows: list[list[tuple[str, str, str]]] = [
-            [
-                ("添加弹窗", CUSTOM_POPUP, "弹窗模板"),
-                ("添加返回按钮", CUSTOM_BACK_BUTTON, "返回按钮模板"),
-                ("添加发送按钮", SEND_BUTTON, "发送按钮模板"),
-                ("添加麦克风", MICROPHONE_BUTTON, "麦克风模板"),
-                ("添加输入框", INPUT_BOX_BUTTON, "输入框模板"),
-            ],
-            [
-                ("添加下一条", NEXT_MESSAGE_BUTTON, "下一条模板"),
-                ("添加新招呼", NEW_GREETING_BUTTON, "新招呼模板"),
-                ("添加聊天界面", CHAT_WINDOW_SCREEN, "聊天界面模板"),
-                ("添加聊天列表", CHAT_LIST_SCREEN, "聊天列表模板"),
-                ("添加我的界面", MY_SCREEN, "我的界面模板"),
-            ],
-        ]
-        for row_index, action_specs in enumerate(template_action_rows):
+
+        # 添加入口与下方表格同源：目录里存在什么族，上面就有什么「添加X」。
+        # 弹窗是例外——它是用户自行框图、自选匹配范围的采集入口（范围存入
+        # 用户本机配置），必须始终可用，不依赖目录里已有弹窗文件；返回按钮
+        # 有专属采集流程，存在文件时出现；新增普通分类保存为该分类的下一
+        # 个客户变体，template_variant_paths 运行时自动把新变体纳入匹配。
+        dynamic_specs: list[tuple[str, str]] = [(CUSTOM_POPUP, "弹窗")]
+        if back_button_template_paths({"templates": {"buttons": str(self.buttons_dir)}}):
+            dynamic_specs.append((CUSTOM_BACK_BUTTON, "返回按钮"))
+        dynamic_specs.extend(
+            (f"variant::{group}::{base_name}", self._template_display_name(base_name))
+            for group, base_name in self._scan_template_bases()
+        )
+        per_row = 5
+        for start in range(0, len(dynamic_specs), per_row):
             template_actions = QHBoxLayout()
             template_actions.setSpacing(8)
-            for text, target_key, label in action_specs:
-                button = QPushButton(text)
-                if row_index == 0 and target_key in {CUSTOM_POPUP, CUSTOM_BACK_BUTTON}:
-                    button.setObjectName("PrimaryButton")
+            for target_key, label in dynamic_specs[start : start + per_row]:
+                button = QPushButton(f"添加{label}")
                 button.clicked.connect(lambda checked=False, key=target_key, title=label: self._capture_template(key, title))
                 template_actions.addWidget(button)
             template_actions.addStretch(1)
@@ -2928,51 +2970,106 @@ class TemplateManagerWidget(QWidget):
         layout.addWidget(list_panel)
         self.reload()
 
-    def reload(self) -> None:
-        files: list[tuple[str, Path]] = [
-            ("弹窗", path)
-            for path in sorted(self.buttons_dir.glob("popup_*.jpg"))
-            if is_popup_template_name(path.name)
-        ]
-        files.extend(
-            ("返回按钮", path)
-            for path in back_button_template_paths({"templates": {"buttons": str(self.buttons_dir)}})
-            if is_back_button_template_name(path.name)
-        )
-        for rule in fixed_template_rules():
-            root = self.buttons_dir if rule.group == "buttons" else self.screens_dir
-            for path in template_variant_paths(root, rule.filename):
-                files.append((rule.label, path))
-        seen: set[Path] = set()
-        unique_files: list[tuple[str, Path]] = []
-        for kind, path in files:
-            resolved = path.resolve()
-            if resolved in seen:
+    def _scan_template_bases(self) -> list[tuple[str, str]]:
+        """扫描模板目录，返回 (分组, 基础文件名) 列表。
+
+        同一模板的变体（btn_x.jpg / btn_x_2.jpg / btn_x__customer_1.jpg /
+        btn_x__customer_{机器MAC}_{序号}.jpg，新客户模板带 MAC 命名空间）
+        归并到基础文件名；弹窗走专属流程，跳过。
+        """
+        bases: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for group, root in (("buttons", self.buttons_dir), ("screens", self.screens_dir)):
+            if not root.is_dir():
                 continue
-            seen.add(resolved)
-            unique_files.append((kind, path))
-        self.table.setRowCount(len(unique_files))
-        for row, (kind, path) in enumerate(unique_files):
+            for path in sorted(root.glob("*.jpg")):
+                if path.name.startswith("popup_"):
+                    continue
+                if group == "buttons" and is_back_button_template_name(path.name):
+                    # 返回按钮有专属入口与规则，不重复生成动态按钮。
+                    continue
+                stem = re.sub(r"(?:__(?:customer|developer)(?:_[0-9a-f]{12})?)?_\d+$", "", path.stem)
+                base_name = f"{stem}{path.suffix}"
+                if (group, base_name) in seen:
+                    continue
+                seen.add((group, base_name))
+                bases.append((group, base_name))
+        return bases
+
+    @staticmethod
+    def _template_display_name(base_name: str) -> str:
+        """分类显示名：去掉 btn_/screen_ 前缀与扩展名。"""
+        stem = Path(base_name).stem
+        for prefix in ("btn_", "screen_"):
+            if stem.startswith(prefix):
+                return stem[len(prefix) :]
+        return stem
+
+    @staticmethod
+    def _parse_variant_key(target_key: str) -> tuple[str, str] | None:
+        """解析 variant::分组::基础文件名 形式的动态模板键。"""
+        if not target_key.startswith("variant::"):
+            return None
+        parts = target_key.split("::", 2)
+        if len(parts) != 3 or parts[1] not in {"buttons", "screens"} or not parts[2].endswith(".jpg"):
+            return None
+        return parts[1], parts[2]
+
+    def reload(self) -> None:
+        # 完全由模板目录驱动：目录里有什么文件就显示什么族（弹窗每文件
+        # 独立、返回按钮走专属族），显示名从文件名派生；范围列来自 config
+        # 的 template_match_regions（button.custom.* 反查 + 少数固定键兜底）。
+        # 不依赖任何写死的分类清单。
+        families: list[tuple[str, list[Path]]] = []
+        existing_paths: set[Path] = set()
+
+        def _add_family(kind: str, paths: list[Path]) -> None:
+            merged = [path for path in paths if path.resolve() not in existing_paths]
+            if not merged:
+                return
+            existing_paths.update(path.resolve() for path in merged)
+            families.append((kind, merged))
+
+        for path in sorted(self.buttons_dir.glob("popup_*.jpg")):
+            if is_popup_template_name(path.name):
+                _add_family("弹窗", [path])
+        _add_family("返回按钮", back_button_template_paths({"templates": {"buttons": str(self.buttons_dir)}}))
+        for group, base_name in self._scan_template_bases():
+            root = self.buttons_dir if group == "buttons" else self.screens_dir
+            _add_family(self._template_display_name(base_name), template_variant_paths(root, base_name))
+
+        self.table.setRowCount(len(families))
+        for row, (kind, paths) in enumerate(families):
+            primary = paths[0]
+            file_text = primary.name if len(paths) == 1 else f"{primary.name}（共 {len(paths)} 个变体）"
             self.table.setItem(row, 0, QTableWidgetItem(kind))
-            self.table.setItem(row, 1, QTableWidgetItem(path.name))
-            self.table.setItem(row, 2, QTableWidgetItem(self._template_region_text(path)))
+            self.table.setItem(row, 1, QTableWidgetItem(file_text))
+            self.table.setItem(row, 2, QTableWidgetItem(self._template_region_text(primary)))
             actions = QWidget()
             actions_layout = QHBoxLayout(actions)
             actions_layout.setContentsMargins(0, 0, 0, 0)
             actions_layout.setSpacing(6)
             test_button = QPushButton("测试当前图")
-            test_button.clicked.connect(lambda checked=False, p=path: self._test_saved_template(p))
+            test_button.clicked.connect(lambda checked=False, ps=list(paths): self._test_saved_template(ps))
             actions_layout.addWidget(test_button)
             delete_button = QPushButton("删除")
-            delete_button.clicked.connect(lambda checked=False, p=path: self._delete_template(p))
+            delete_button.clicked.connect(lambda checked=False, ps=list(paths): self._delete_template_family(ps))
             actions_layout.addWidget(delete_button)
             self.table.setCellWidget(row, 3, actions)
 
-    def _capture_popup_template(self) -> None:
-        self._capture_template(CUSTOM_POPUP, "弹窗模板")
-
-    def _capture_back_button_template(self) -> None:
-        self._capture_template(CUSTOM_BACK_BUTTON, "返回按钮模板")
+    def _delete_template_family(self, paths: list[Path]) -> None:
+        """删除模板：单变体直接走原确认流程；多变体弹出菜单选具体文件。"""
+        if len(paths) == 1:
+            self._delete_template(paths[0])
+            return
+        menu = QMenu(self)
+        for path in paths:
+            menu.addAction(path.name, lambda checked=False, p=path: self._delete_template(p))
+        button = self.sender()
+        if isinstance(button, QPushButton):
+            menu.exec(button.mapToGlobal(QPoint(0, button.height())))
+        else:
+            menu.exec()
 
     def _capture_template(self, target_key: str, label: str) -> None:
         try:
@@ -2995,12 +3092,18 @@ class TemplateManagerWidget(QWidget):
             match_region = None
 
         # 主 UI 中新增的模板明确标记为客户模板，更新包不会覆盖这些文件。
-        target = import_target_path(
-            target_key,
-            self.buttons_dir,
-            self.screens_dir,
-            owner="customer",
-        )
+        variant_spec = self._parse_variant_key(target_key)
+        if variant_spec is not None:
+            group, base_name = variant_spec
+            root = self.buttons_dir if group == "buttons" else self.screens_dir
+            target = next_template_variant_path(root, base_name, owner="customer")
+        else:
+            target = import_target_path(
+                target_key,
+                self.buttons_dir,
+                self.screens_dir,
+                owner="customer",
+            )
         try:
             dialog.cropped_image.convert("RGB").save(target, format="JPEG", quality=95)
         except Exception as exc:
@@ -3056,28 +3159,58 @@ class TemplateManagerWidget(QWidget):
                 rf"{re.escape(base_stem)}_\d+{re.escape(suffix)}",
                 path.name,
             ) or re.fullmatch(
-                rf"{re.escape(base_stem)}__(?:customer|developer)_\d+{re.escape(suffix)}",
+                rf"{re.escape(base_stem)}__(?:customer|developer)(?:_[0-9a-f]{{12}})?_\d+{re.escape(suffix)}",
                 path.name,
             ):
                 return rule.key
+        # 固定规则之外的按钮模板（如心遇的主界面心遇按钮等自定义按钮）：
+        # 按 template_match_regions 的 button.custom.* 配置反查，主文件与
+        # 变体都归到同一键，范围列才能显示出来。
+        regions = (
+            self.overrides.get(TEMPLATE_MATCH_REGIONS_CONFIG_KEY, {})
+            if isinstance(self.overrides, dict)
+            else {}
+        )
+        if isinstance(regions, dict):
+            suffix = path.suffix or ".jpg"
+            for config_key in regions:
+                key = str(config_key)
+                if not key.startswith("button.custom."):
+                    continue
+                name = key[len("button.custom."):].strip()
+                if not name:
+                    continue
+                stems = [f"btn_{name}"]
+                if name == "相册":
+                    stems.append("btn_照片按钮")
+                for stem in stems:
+                    if path.name == f"{stem}{suffix}" or re.fullmatch(
+                        rf"{re.escape(stem)}_\d+{re.escape(suffix)}",
+                        path.name,
+                    ) or re.fullmatch(
+                        rf"{re.escape(stem)}__(?:customer|developer)(?:_[0-9a-f]{{12}})?_\d+{re.escape(suffix)}",
+                        path.name,
+                    ):
+                        return key
         return ""
 
-    def _test_saved_template(self, path: Path) -> None:
+    def _test_saved_template(self, paths: list[Path]) -> None:
+        primary = paths[0]
         try:
             robot = RobotInterface(self.device_ip)
             image = ensure_portrait_image(capture_transform_image(robot, pre_move=True, label="template_test"))
         except Exception as exc:
             QMessageBox.critical(self, "模板测试失败", f"无法获取截图：{exc}")
             return
-        key = self._template_region_key(path)
+        key = self._template_region_key(primary)
         if not key:
-            QMessageBox.warning(self, "模板测试", f"无法确定模板类别范围：{path.name}")
+            QMessageBox.warning(self, "模板测试", f"无法确定模板类别范围：{primary.name}")
             return
         config = self.overrides if isinstance(self.overrides, dict) else {}
         thresholds = config.get("template_match_thresholds", {})
         threshold = float(
             config.get("popup_match_threshold", 0.8)
-            if is_popup_template_name(path.name)
+            if is_popup_template_name(primary.name)
             else config.get("match_threshold", 0.7)
         )
         if isinstance(thresholds, dict) and key in thresholds:
@@ -3086,16 +3219,19 @@ class TemplateManagerWidget(QWidget):
             except (TypeError, ValueError):
                 pass
         try:
-            # 用最低阈值取回最高候选，未达到正式阈值时也必须把相似度展示给用户。
-            result = match_template_with_region(
-                image, path, config, key,
+            # 整族多变体择优（与业务运行时一致）；用最低阈值取回最高候选，
+            # 未达到正式阈值时也必须把相似度展示给用户。
+            result = match_template_candidates_with_region(
+                image, list(paths), config, key,
                 threshold=-1.0,
                 match_func=match,
+                single_match_func=match_template_with_region,
             )
         except Exception as exc:
-            QMessageBox.critical(self, "模板测试失败", f"匹配 {path.name} 时出错：{exc}")
+            QMessageBox.critical(self, "模板测试失败", f"匹配 {primary.name} 时出错：{exc}")
             return
-        self._show_template_test_result(image, path.name, key, result, threshold)
+        name = primary.name if len(paths) == 1 else f"{primary.name}（共 {len(paths)} 个变体）"
+        self._show_template_test_result(image, name, key, result, threshold)
 
     def _show_template_test_result(
         self,
