@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from apps.step_timing import exclude_ocr_wait_from_step_timeout, step_deadline
+from services.step_timing import exclude_ocr_wait_from_step_timeout, step_deadline
 
 
 def test_ocr_wait_is_excluded_from_step_deadline() -> None:

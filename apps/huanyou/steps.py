@@ -12,11 +12,11 @@ from typing import Any
 
 import numpy as np
 
-from apps.cancellation import OperationCancelled
+from services.cancellation import OperationCancelled
 from apps.coordinates import click_image_point
-from apps.photo_capture import capture_transform_image
+from services.photo_capture import capture_transform_image
 from apps.reporting import Reporter, format_point, report_step
-from apps.step_timing import exclude_ocr_wait_from_step_timeout, step_deadline
+from services.step_timing import exclude_ocr_wait_from_step_timeout, step_deadline
 from apps.utils import play_prepared_tts_input, prepare_tts_input
 from services.vision_dialogue_client import VisionDialogueClient, VisionDialogueError
 from services.coordinate_cache import persist_from_runtime

@@ -29,7 +29,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from apps.coordinates import click_image_point  # noqa: E402
-from apps.photo_capture import capture_transform_image  # noqa: E402
+from services.photo_capture import capture_transform_image  # noqa: E402
 from apps.xinyu import steps as xinyu_steps  # noqa: E402
 from apps.xinyu.config import DEFAULT_CONFIG as XINYU_DEFAULT_CONFIG  # noqa: E402
 from auto_glm.gpt_planner import GPTPlannerClient, GPTPlannerConfig  # noqa: E402

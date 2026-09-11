@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from apps.defaults import with_app_defaults
+from services.defaults import with_app_defaults
 
 from .config_manager import ConfigManager, _deep_merge
 

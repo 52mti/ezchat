@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from typing import Any
 
-from apps.cancellation import raise_if_cancelled
+from services.cancellation import raise_if_cancelled
 
 
 CLICK_JITTER_MIN = 0.001

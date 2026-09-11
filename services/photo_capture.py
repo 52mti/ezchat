@@ -13,8 +13,8 @@ from services.coordinate_cache import load_into_runtime
 
 import cv2
 import numpy as np
-from apps.cancellation import OperationCancelled, cancellable_sleep, raise_if_cancelled
-from apps.step_timing import exclude_ocr_wait_from_step_timeout
+from services.cancellation import OperationCancelled, cancellable_sleep, raise_if_cancelled
+from services.step_timing import exclude_ocr_wait_from_step_timeout
 from vision.screen import annotate_image_bytes, ensure_portrait_image
 
 

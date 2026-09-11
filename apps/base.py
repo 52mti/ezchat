@@ -6,7 +6,7 @@ from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any, Callable
 
-from apps.cancellation import OperationCancelled, operation_cancelled
+from services.cancellation import OperationCancelled, operation_cancelled
 
 
 ERROR_PHOTO_DIR = Path("photo") / "errors"
@@ -102,7 +102,7 @@ class BaseApp:
     def capture_entry_image(self, label: str = "app_entry_check") -> Any | None:
         if not hasattr(self.robot, "get_capture_image") or not hasattr(self.robot, "get_status"):
             return None
-        from apps.photo_capture import capture_transform_image
+        from services.photo_capture import capture_transform_image
 
         return capture_transform_image(self.robot, self.config, pre_move=True, label=label)
 
@@ -216,7 +216,7 @@ class BaseApp:
             )
 
     def _save_error_capture(self) -> None:
-        from apps.photo_capture import capture_transform_image
+        from services.photo_capture import capture_transform_image
         from services.retention import cleanup_old_error_captures
 
         if not hasattr(self.robot, "get_capture_image") or not hasattr(self.robot, "get_status"):

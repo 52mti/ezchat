@@ -6,7 +6,7 @@ from typing import Any
 
 import requests
 
-from apps.cancellation import cancellable_sleep, raise_if_cancelled
+from services.cancellation import cancellable_sleep, raise_if_cancelled
 from services.local_tts import ensure_local_tts_server, tts_url_for_device
 
 

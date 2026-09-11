@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from apps.photo_capture import _sync_coordinate_cache
+from services.photo_capture import _sync_coordinate_cache
 from apps.xinyu.steps import _acquire_llm_vision_slot
 from apps.xinyu.steps import _update_dynamic_chat_area
 from services import vision_usage

@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 
 from apps.base import BaseApp
-from apps.cancellation import OperationCancelled
+from services.cancellation import OperationCancelled
 from apps.coordinates import click_image_point
-from apps.photo_capture import capture_transform_image
+from services.photo_capture import capture_transform_image
 from apps.utils import tts_input
 
 

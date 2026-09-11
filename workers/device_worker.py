@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from apps import get_registered_apps, resolve_app_name
-from apps.defaults import with_app_defaults
+from services.defaults import with_app_defaults
 from apps.visual_assets import back_button_template_paths
 from lgb.lgb import RobotInterface
 from services import (

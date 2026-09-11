@@ -5,9 +5,9 @@ from pathlib import Path
 from typing import Any
 
 from apps.coordinates import click_image_point
-from apps.photo_capture import capture_transform_image
+from services.photo_capture import capture_transform_image
 from apps.reporting import Reporter, format_point as _format_point, report_step
-from apps.step_timing import exclude_ocr_wait_from_step_timeout, step_deadline
+from services.step_timing import exclude_ocr_wait_from_step_timeout, step_deadline
 from apps.utils import play_prepared_tts_input, prepare_tts_input
 from apps.visual_assets import (
     BACK_BUTTON,

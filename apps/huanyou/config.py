@@ -1,4 +1,4 @@
-from apps.defaults import DEFAULT_PERSONA_CONFIG, DEFAULT_RUNTIME_CONFIG
+from services.defaults import DEFAULT_PERSONA_CONFIG, DEFAULT_RUNTIME_CONFIG
 
 from .ocr_config import LLM_DIALOGUE_CONFIG, OCR_MODES
 

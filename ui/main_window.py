@@ -60,9 +60,9 @@ from PyQt6.QtWidgets import (
 from PIL import Image
 
 from apps import get_default_app_name, get_registered_apps, resolve_app_name
-from apps.defaults import DEFAULT_RUNTIME_CONFIG, with_app_defaults
+from services.defaults import DEFAULT_RUNTIME_CONFIG, with_app_defaults
 from apps.coordinates import robot_point_with_jitter
-from apps.photo_capture import capture_transform_image
+from services.photo_capture import capture_transform_image
 from apps.visual_assets import (
     CHAT_LIST_SCREEN,
     CHAT_WINDOW_SCREEN,

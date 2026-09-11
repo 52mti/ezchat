@@ -3,10 +3,10 @@ from __future__ import annotations
 from io import BytesIO
 from pathlib import Path
 
-from apps import photo_capture as photo_capture_module
+from services import photo_capture as photo_capture_module
 from apps.base import BaseApp
-from apps.photo_capture import capture_transform_image
-from apps.photo_capture import _sync_coordinate_cache, _sync_photo_result_cache
+from services.photo_capture import capture_transform_image
+from services.photo_capture import _sync_coordinate_cache, _sync_photo_result_cache
 from services import coordinate_cache
 from PIL import Image
 
