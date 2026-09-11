@@ -59,6 +59,16 @@ def _append_runtime_path(runtime: dict[str, Any], key: str, path: str, *, limit:
 
 
 def _portrait_bytes(image_bytes: bytes) -> bytes:
+    # cv2 编解码释放 GIL：PIL 的 save/decode 全程持锁，多设备并发截图时
+    # 会把 UI 线程饿出可感知卡顿。行为与 PIL 路径一致（逆时针 90° 转竖屏、
+    # JPEG quality 95）；cv2 解不了的罕见格式回退 PIL。
+    decoded = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if decoded is not None:
+        if decoded.shape[1] > decoded.shape[0]:
+            decoded = cv2.rotate(decoded, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        ok, encoded = cv2.imencode(".jpg", decoded, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if ok:
+            return encoded.tobytes()
     image = ensure_portrait_image(image_bytes)
     output = BytesIO()
     image.save(output, format="JPEG", quality=95)

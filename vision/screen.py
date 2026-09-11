@@ -6,12 +6,27 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Sequence
 
+import cv2
 import numpy as np
 from PIL import Image
 
 
 ImageInput = bytes | bytearray | str | Path | Image.Image | np.ndarray
 Region = Sequence[float]
+
+
+def _decode_bytes_to_bgr(data: bytes | bytearray) -> np.ndarray | None:
+    """bytes 图片 → BGR ndarray（cv2 解码全程释放 GIL）。
+
+    截图/模板匹配的高频路径原先走 PIL 解码，PIL 编解码不释放 GIL，多设备
+    并发时会把 Qt UI 线程饿出"经常性卡顿"。cv2 解不了罕见格式时返回 None，
+    由调用方回退 PIL。
+    """
+    try:
+        array = np.frombuffer(data, dtype=np.uint8)
+        return cv2.imdecode(array, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
 
 
 class ImageBytes(bytes):
@@ -73,6 +88,9 @@ def load_image(image: ImageInput) -> Image.Image:
                 return Image.fromarray(image[:, :, ::-1]).convert("RGB")
             return Image.fromarray(image).convert("RGB")
         if isinstance(image, (bytes, bytearray)):
+            decoded = _decode_bytes_to_bgr(image)
+            if decoded is not None:
+                return Image.fromarray(cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB))
             return Image.open(BytesIO(image)).convert("RGB")
         return Image.open(Path(image)).convert("RGB")
     except Exception as exc:
@@ -104,6 +122,10 @@ def ensure_portrait_image(image: ImageInput) -> Image.Image:
 def to_cv2(image: ImageInput) -> np.ndarray:
     if isinstance(image, np.ndarray):
         return image
+    if isinstance(image, (bytes, bytearray)):
+        decoded = _decode_bytes_to_bgr(image)
+        if decoded is not None:
+            return decoded
     pil_image = load_image(image)
     return np.array(pil_image)[:, :, ::-1].copy()
 
