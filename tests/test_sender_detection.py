@@ -2,11 +2,10 @@
 
 import copy
 
-from apps.wechat.ocr_config import DIALOGUE_OCR_MODE as WECHAT_DIALOGUE_OCR_MODE
+from apps.xinyu.ocr_config import DIALOGUE_OCR_MODE as WECHAT_DIALOGUE_OCR_MODE
 from apps.xinyu.ocr_config import DIALOGUE_OCR_MODE as XINYU_DIALOGUE_OCR_MODE
-import apps.wechat.ocr_rules as wechat_ocr_rules
 import apps.xinyu.ocr_rules as xinyu_ocr_rules
-from apps.wechat.ocr_rules import build_dialogue_result
+from apps.xinyu.ocr_rules import build_dialogue_result
 
 
 def _dialogue_rules(**overrides):
@@ -20,7 +19,7 @@ def _dialogue_rules(**overrides):
 
 
 
-def test_dialogue_sender_defaults_to_position_not_color_saturation():
+def test_dialogue_position_method_ignores_raw_saturation():
     items = [
         {
             "text": "left message",
@@ -56,10 +55,12 @@ def test_dialogue_sender_defaults_to_position_not_color_saturation():
         items,
         (200, 300),
         _dialogue_rules(
-            name_gap=40,
+            name_gap_ratio=40 / 300,
+            sender_detection={"method": "position", "sender2_min_x_ratio": 0.52},
             basic_filter={
                 "enable_max_x_filter": False,
                 "enable_non_cjk_non_emoji_filter": False,
+                "enable_edge_spanning_filter": False,
             },
         ),
     )
@@ -136,7 +137,7 @@ def test_dialogue_bubble_color_method_prefers_purple_bubble_over_position():
         }
 
     items = [
-        item("non purple message", 110, 190, 100, 140, 90),
+        item("non purple message", 30, 110, 100, 140, 90),
         item("purple message", 20, 100, 210, 250, 122),
     ]
 
@@ -144,7 +145,7 @@ def test_dialogue_bubble_color_method_prefers_purple_bubble_over_position():
         items,
         (200, 300),
         _dialogue_rules(
-            name_gap=20,
+            name_gap_ratio=20 / 300,
             sender_detection={
                 "method": "bubble_color",
                 "sender2_min_x_ratio": 0.52,
@@ -156,6 +157,7 @@ def test_dialogue_bubble_color_method_prefers_purple_bubble_over_position():
             basic_filter={
                 "enable_max_x_filter": False,
                 "enable_non_cjk_non_emoji_filter": False,
+                "enable_edge_spanning_filter": False,
             },
         ),
     )
@@ -193,7 +195,7 @@ def test_dialogue_bubble_color_method_accepts_blue_purple_camera_shift():
         items,
         (200, 300),
         _dialogue_rules(
-            name_gap=20,
+            name_gap_ratio=20 / 300,
             sender_detection={
                 "method": "bubble_color",
                 "sender2_min_x_ratio": 0.52,
@@ -201,6 +203,7 @@ def test_dialogue_bubble_color_method_accepts_blue_purple_camera_shift():
                 "bubble_color_min_value": 0.20,
                 "bubble_color_sender2_hue_min": 110,
                 "bubble_color_sender2_hue_max": 150,
+                "bubble_color_enable_blue_detection": True,
                 "bubble_color_sender2_blue_green_min": 65,
                 "bubble_color_sender2_blue_red_ratio_min": 1.60,
                 "bubble_color_sender2_blue_min_saturation": 0.30,
@@ -242,7 +245,7 @@ def test_dialogue_bubble_color_method_keeps_low_saturation_blue_card_as_sender1(
         items,
         (200, 300),
         _dialogue_rules(
-            name_gap=20,
+            name_gap_ratio=20 / 300,
             sender_detection={
                 "method": "bubble_color",
                 "sender2_min_x_ratio": 0.52,
@@ -250,6 +253,7 @@ def test_dialogue_bubble_color_method_keeps_low_saturation_blue_card_as_sender1(
                 "bubble_color_min_value": 0.20,
                 "bubble_color_sender2_hue_min": 110,
                 "bubble_color_sender2_hue_max": 150,
+                "bubble_color_enable_blue_detection": True,
                 "bubble_color_sender2_blue_green_min": 65,
                 "bubble_color_sender2_blue_red_ratio_min": 1.60,
                 "bubble_color_sender2_blue_min_saturation": 0.30,

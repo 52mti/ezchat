@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor
 
-from apps.wechat.config import DEFAULT_CONFIG as WECHAT_DEFAULT_CONFIG
+from apps.xinyu.config import DEFAULT_CONFIG as WECHAT_DEFAULT_CONFIG
 from apps.xinyu.config import DEFAULT_CONFIG as XINYU_DEFAULT_CONFIG
 from services.config_manager import ConfigManager
 

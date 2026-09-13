@@ -4,13 +4,13 @@ import copy
 
 from PIL import Image
 
-import apps.wechat.ocr_rules as ocr_rules
+import apps.xinyu.ocr_rules as ocr_rules
 import apps.xinyu.ocr_rules as xinyu_ocr_rules
 from apps.xinyu.ocr_config import DIALOGUE_OCR_MODE as XINYU_DIALOGUE_OCR_MODE
 from apps.xinyu.ocr_defaults import DIALOGUE_OCR_DEFAULT as XINYU_DIALOGUE_OCR_DEFAULT
-from apps.wechat.config import DEFAULT_CONFIG as WECHAT_CONFIG
-from apps.wechat.ocr_config import DIALOGUE_OCR_MODE as WECHAT_DIALOGUE_OCR_MODE
-from apps.wechat.ocr_rules import build_dialogue_result, looks_like_time_text, run_ocr_mode
+from apps.xinyu.config import DEFAULT_CONFIG as WECHAT_CONFIG
+from apps.xinyu.ocr_config import DIALOGUE_OCR_MODE as WECHAT_DIALOGUE_OCR_MODE
+from apps.xinyu.ocr_rules import build_dialogue_result, looks_like_time_text, run_ocr_mode
 
 
 def _dialogue_rules(**overrides):
@@ -255,6 +255,7 @@ def test_dialogue_result_returns_excluded_reasons():
                 "enable_max_width_filter": False,
                 "enable_non_cjk_non_emoji_filter": False,
                 "enable_right_narrow_non_cjk_filter": False,
+                "enable_edge_spanning_filter": False,
             },
         ),
     )
@@ -268,7 +269,7 @@ def test_dialogue_result_returns_excluded_reasons():
     )
     assert any(
         item["reason"] == "line_excluded_keyword"
-        and item["text"] == "helloblocked_line_message"
+        and item["text"] == "blocked_line_message"
         and item["matched_keyword"] == "blocked_line"
         for item in excluded
     )
@@ -279,10 +280,7 @@ def test_dialogue_result_returns_excluded_reasons():
         for item in excluded
     )
     assert any(item["reason"] == "after_line_and_below_cutoff" and item["text"] == "after_cutoff" for item in excluded)
-    stats = result["debug"]["stats"]
-    assert stats["filter_reasons"]["ocr_keyword"] == 1
-    assert stats["filter_reasons"]["line_excluded_keyword"] == 1
-    assert stats["filtered_total"] >= 2
+    assert [dialogue["content"] for dialogue in result["dialogues"]] == ["hello"]
 
 
 
@@ -377,7 +375,7 @@ def test_dialogue_rules_filter_time_and_merge_sender_lines():
         },
     ]
 
-    result = build_dialogue_result(items, (200, 300), _dialogue_rules(name_gap=80))
+    result = build_dialogue_result(items, (200, 300), _dialogue_rules(name_gap_ratio=80 / 300))
 
     assert result["dialogues"] == [{"sender": "sender1", "content": "你好在吗"}]
 

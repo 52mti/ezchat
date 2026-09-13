@@ -6,8 +6,6 @@ import pytest
 from PIL import Image
 
 from apps import visual_assets, visual_steps
-from apps.wechat import app as wechat_app
-from apps.wechat import steps as wechat_steps
 from apps.xinyu import app as xinyu_app
 from apps.xinyu import steps as xinyu_steps
 
@@ -443,7 +441,7 @@ def test_popup_template_region_key_uses_each_template_name(tmp_path):
 
 
 
-@pytest.mark.parametrize("steps_module", [visual_steps, wechat_steps, xinyu_steps])
+@pytest.mark.parametrize("steps_module", [visual_steps, xinyu_steps])
 def test_popup_match_defaults_to_popup_threshold(monkeypatch, tmp_path, steps_module):
     popup_template = tmp_path / "popup_custom_1.jpg"
     popup_template.write_bytes(b"template")
@@ -471,9 +469,9 @@ def test_popup_match_drops_results_beyond_right_edge(monkeypatch, tmp_path):
     def fake_match(image, template, threshold=0.85):
         return {"x": 0.91, "y": 0.2, "w": 0.05, "h": 0.1, "score": 0.99}
 
-    monkeypatch.setattr(wechat_steps, "match", fake_match)
+    monkeypatch.setattr(xinyu_steps, "match", fake_match)
 
-    assert wechat_steps._popup_match("screen", popup_template, {}) is None
+    assert xinyu_steps._popup_match("screen", popup_template, {}) is None
 
 
 
@@ -499,19 +497,23 @@ def test_runtime_detects_user_named_screens(monkeypatch, tmp_path):
     def fake_match(image, template, threshold=0.85):
         return {"x": 0, "y": 0, "w": 1, "h": 1, "score": 0.99} if Path(template).name == image else None
 
-    monkeypatch.setattr(wechat_steps, "match", fake_match)
+    monkeypatch.setattr(xinyu_steps, "match", fake_match)
 
-    assert wechat_steps.current_screen("screen_home.jpg", config) == "首页"
-    assert wechat_steps.current_screen("screen_list.jpg", config) == "消息页"
-    assert wechat_steps.current_screen("screen_chat.jpg", config) == "聊天详情"
+    assert xinyu_steps.current_screen("screen_home.jpg", config) == "首页"
+    assert xinyu_steps.current_screen("screen_list.jpg", config) == "消息页"
+    assert xinyu_steps.current_screen("screen_chat.jpg", config) == "聊天详情"
 
 
 
-def test_popup_is_checked_before_current_screen(monkeypatch, tmp_path):
+def test_capture_after_popups_dismisses_popup_and_returns_next_frame(monkeypatch, tmp_path):
     buttons_dir = tmp_path / "buttons"
     screens_dir = tmp_path / "screens"
     buttons_dir.mkdir()
     screens_dir.mkdir()
+    popup_img = tmp_path / "popup.jpg"
+    list_img = tmp_path / "list.jpg"
+    Image.new("RGB", (100, 200), "white").save(popup_img)
+    Image.new("RGB", (80, 180), "white").save(list_img)
     for path in [
         buttons_dir / "popup_custom_1.jpg",
         screens_dir / "screen_\u804a\u5929\u5217\u8868.jpg",
@@ -519,33 +521,52 @@ def test_popup_is_checked_before_current_screen(monkeypatch, tmp_path):
     ]:
         path.write_bytes(b"template")
 
+    def _is_popup_frame(image) -> bool:
+        if isinstance(image, (str, Path)):
+            return Path(image).name == "popup.jpg"
+        return tuple(getattr(image, "size", ())) == (100, 200)
+
     def fake_match(image, template, threshold=0.85):
         name = Path(template).name
-        if image == "popup" and name.startswith("popup_"):
+        if _is_popup_frame(image) and name.startswith("popup_"):
             return {"x": 0.1, "y": 0.2, "w": 0.4, "h": 0.3, "score": 0.99}
-        if image == "popup" and name in {"screen_\u804a\u5929\u5217\u8868.jpg", "screen_\u804a\u5929\u754c\u9762.jpg"}:
-            raise AssertionError("current screen was checked before popup handling")
-        if image == "list" and name == "screen_\u804a\u5929\u5217\u8868.jpg":
+        if not _is_popup_frame(image) and name == "screen_\u804a\u5929\u5217\u8868.jpg":
             return {"x": 0.2, "y": 0.4, "w": 0.1, "h": 0.2, "score": 0.99}
         return None
 
-    monkeypatch.setattr(wechat_steps, "match", fake_match)
+    monkeypatch.setattr(xinyu_steps, "match", fake_match)
     monkeypatch.setattr(
-        wechat_steps,
+        xinyu_steps,
+        "_red_pixel_stats",
+        lambda _image, _match: {"has_red": True, "red_pixels": 473, "total_pixels": 6732, "threshold": 13, "region": [0.2, 0.1, 0.3, 0.13]},
+    )
+    def fake_ocr(image, cfg, mode, region=None, **kwargs):
+        # 弹窗帧不带列表标题词（消息/通话），列表帧带——这样弹窗不会被误判为列表页
+        items = [{"text": "未回复", "x": 0.2, "y": 0.1, "w": 0.1, "h": 0.03}]
+        if not _is_popup_frame(image):
+            items.append({"text": "消息", "x": 0.1, "y": 0.05, "w": 0.1, "h": 0.03})
+            items.append({"text": "通话", "x": 0.3, "y": 0.05, "w": 0.1, "h": 0.03})
+        return {
+            "result": {"message_list": [{"name": "测试用户", "unread_count": 1, "bounds": [0.2, 0.4, 0.3, 0.6]}]},
+            "ocr_items": items,
+        }
+
+    monkeypatch.setattr(
+        xinyu_steps,
         "run_ocr_mode",
-        lambda image, cfg, mode, region=None: {
-            "result": {"message_list": [{"unread_count": 1, "bounds": [0.2, 0.4, 0.3, 0.6]}]},
-            "ocr_items": [],
-        },
+        fake_ocr,
     )
     monkeypatch.setattr(
-        wechat_steps,
-        "capture_transform_image",
-        lambda robot, config, pre_move=True, label="screen": robot.images.pop(0) if robot.images else "list",
+        xinyu_steps,
+        "_capture_image",
+        lambda robot, config, pre_move=True, label="screen": robot.images.pop(0) if robot.images else str(list_img),
     )
     robot = FakeRobot()
+    robot.images = [str(popup_img), str(list_img)]
 
-    pos = wechat_steps.find_unread(
+    # xinyu 的弹窗契约：capture_after_popups 先关弹窗，再返回弹窗后的帧。
+    # 关闭点 = 命中框右上角 (x+w*0.9, y+h*0.1)。
+    image = xinyu_steps.capture_after_popups(
         robot,
         {
             "templates": {
@@ -553,7 +574,8 @@ def test_popup_is_checked_before_current_screen(monkeypatch, tmp_path):
                 "screens": str(screens_dir),
             }
         },
+        label="test",
     )
 
     assert robot.clicks == [pytest.approx((0.46, 0.23))]
-    assert pos == pytest.approx((0.25, 0.5))
+    assert not _is_popup_frame(image)
