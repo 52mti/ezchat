@@ -45,6 +45,9 @@ env/
 jiekou/卡密对接.md
 jiekou/TTS_caokao.md
 
+# 内部开发文档（模块文档/规划/方案讨论），仅本地保留
+docs/
+
 # IDE
 .idea/
 .vscode/

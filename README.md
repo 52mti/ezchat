@@ -39,7 +39,6 @@ main.py ──► ui/（PyQt6 界面）
 | `services/` | 配置管理、DeepSeek 人设、视觉对话识别客户端、TTS、消息、记忆、更新、卡密 |
 | `auto_glm/` | AutoGLM / GPT Planner 规划模型接入 |
 | `lgb/`、`jiekou/` | 🔒 只读保护区：机械臂控制与接口参考文档 |
-| `docs/` | 模块文档索引（[入口](docs/README.md)） |
 
 ## 环境要求
 
@@ -149,11 +148,7 @@ python build.py
 
 > ⚠️ 打包必须在官方工程目录（本仓库根目录）执行，禁止从任何 worktree / 副本目录打包。
 
-## 更多文档
-
-模块级详细文档见 [docs/README.md](docs/README.md)（入口与打包、UI、设备线程、App 层、视觉层、服务层、机械臂接口、配置体系、测试、基础服务调用手册）。
-
 ## 重要约束
 
 - `jiekou/` 与 `lgb/` 为只读保护区，只允许读取与调用，不允许修改其中文件（详见 `AGENTS.md`）。
-- `.env/`、`config.json`、`runtime/`（日志/照片/错误快照等运行数据）均不入库。
+- `docs/`（内部开发文档）、`.env/`、`config.json`、`runtime/`（日志/照片/错误快照等运行数据）均为本地资料，不入库。
