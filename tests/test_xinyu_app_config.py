@@ -3,9 +3,6 @@ from __future__ import annotations
 from apps.xinyu.config import DEFAULT_CONFIG as XINYU_CONFIG
 
 
-DEFAULT_PERSONA_ID = "REMOVED-BEARER-TOKEN"
-
-
 def test_app_owns_dialogue_and_list_ocr_modes():
     config = XINYU_CONFIG
     assert "dialogue" in config["ocr_modes"]
@@ -19,7 +16,6 @@ def test_app_uses_shared_runtime_defaults():
     config = XINYU_CONFIG
     assert config["poll_interval"] == 1
     assert config["keep_awake_interval_seconds"] == 200
-    assert config["persona"]["requestPersona"] == DEFAULT_PERSONA_ID
 
 
 def test_xinyu_owns_xinyu_list_layout_rules():

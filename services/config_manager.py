@@ -25,7 +25,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "bearer_token": "",
         },
         "persona": {
-            "requestPersona": "",
             "name": "",
             "age": "",
             "work": "",

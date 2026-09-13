@@ -12,7 +12,7 @@ from typing import Any
 import yaml
 
 
-PERSONA_FIELDS = ("requestPersona", "name", "age", "work", "location", "renshe")
+PERSONA_FIELDS = ("name", "age", "work", "location", "renshe")
 
 
 def normalize_text(value: str) -> str:

@@ -74,7 +74,7 @@ copy config.json.example config.json
 | `devices[].ip` | 机械臂控制盒的 IP（如 `192.168.1.108`） |
 | `devices[].license_key` | 该设备的卡密（授权服务签发） |
 | `devices[].selected_app` | 运行的 App，当前为 `xinyu` |
-| `devices[].app_overrides.xinyu.persona` | 人设配置（`requestPersona` 为 Coze 人设应用 ID） |
+| `devices[].app_overrides.xinyu.persona` | 人设配置（姓名/年龄/职业/城市/人设文本） |
 | `global.license_api_url` | 卡密校验服务地址（内部部署） |
 
 ### 3. 配置 API Key（重点）

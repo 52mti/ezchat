@@ -11,9 +11,6 @@ from workers import device_worker as device_worker_module
 from workers.device_worker import DeviceWorker
 
 
-DEFAULT_PERSONA_ID = "REMOVED-BEARER-TOKEN"
-
-
 class DummyApp:
     name = "dummy"
 
@@ -90,7 +87,6 @@ def test_worker_suppresses_app_status_after_stop(tmp_path, monkeypatch):
     assert worker.app_config["_runtime"]["should_stop"]() is False
     assert worker.app_config["poll_interval"] == 1
     assert worker.app_config["keep_awake_interval_seconds"] == 200
-    assert worker.app_config["persona"]["requestPersona"] == DEFAULT_PERSONA_ID
     worker.stop()
     assert worker.app_config["_runtime"]["should_stop"]() is True
     worker._emit_app_status({"current_step_label": "列表OCR扫描"})

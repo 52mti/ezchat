@@ -158,10 +158,7 @@ class ChatHistoryDialog(QDialog):
 
     def _persona_label(self) -> str:
         name = str(self.persona.get("name", "") or "").strip()
-        persona_id = str(self.persona.get("requestPersona", "") or "").strip()
-        if name and persona_id:
-            return f"{name} / {persona_id}"
-        return name or persona_id or "默认人设"
+        return name or "默认人设"
 
     def reload(self) -> None:
         self.contacts = self.store.list_contacts(

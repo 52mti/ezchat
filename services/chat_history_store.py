@@ -66,7 +66,6 @@ class ChatHistoryStore:
                 device_ip TEXT NOT NULL,
                 app_name TEXT NOT NULL,
                 persona_signature TEXT NOT NULL,
-                persona_id TEXT NOT NULL DEFAULT '',
                 contact_name TEXT NOT NULL,
                 direction TEXT NOT NULL,
                 content TEXT NOT NULL,
@@ -110,12 +109,6 @@ class ChatHistoryStore:
         return build_persona_signature(persona if isinstance(persona, dict) else {})
 
     @staticmethod
-    def _persona_id(persona: dict[str, Any] | None) -> str:
-        if not isinstance(persona, dict):
-            return ""
-        return str(persona.get("requestPersona", "") or "").strip()
-
-    @staticmethod
     def _round_key(
         *,
         device_ip: str,
@@ -156,7 +149,6 @@ class ChatHistoryStore:
             return False
 
         persona_signature = self._persona_signature(persona)
-        persona_id = self._persona_id(persona)
         round_key = self._round_key(
             device_ip=normalize_text(device_ip),
             app_name=normalize_text(app_name),
@@ -173,7 +165,6 @@ class ChatHistoryStore:
                 normalize_text(device_ip),
                 normalize_text(app_name),
                 persona_signature,
-                persona_id,
                 contact,
                 "incoming",
                 incoming,
@@ -188,7 +179,6 @@ class ChatHistoryStore:
                 normalize_text(device_ip),
                 normalize_text(app_name),
                 persona_signature,
-                persona_id,
                 contact,
                 "outgoing",
                 outgoing,
@@ -209,7 +199,6 @@ class ChatHistoryStore:
                         device_ip,
                         app_name,
                         persona_signature,
-                        persona_id,
                         contact_name,
                         direction,
                         content,
@@ -220,7 +209,7 @@ class ChatHistoryStore:
                         created_at,
                         meta_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     rows,
                 )
@@ -266,7 +255,6 @@ class ChatHistoryStore:
                         m.content AS last_message,
                         m.direction AS last_direction,
                         m.created_at AS last_message_at,
-                        m.persona_id,
                         grouped.message_count
                     FROM grouped
                     JOIN messages m ON m.id = grouped.max_id

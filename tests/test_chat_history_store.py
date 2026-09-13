@@ -3,7 +3,7 @@ from __future__ import annotations
 from services.chat_history_store import ChatHistoryStore
 
 
-PERSONA = {"requestPersona": "app-test", "name": "bot"}
+PERSONA = {"name": "bot", "age": "22"}
 
 
 def test_chat_history_contacts_are_sorted_by_last_message_time(tmp_path):
@@ -90,7 +90,7 @@ def test_chat_history_skips_greeting_records(tmp_path):
 
 def test_chat_history_is_scoped_by_persona(tmp_path):
     store = ChatHistoryStore(tmp_path / "history")
-    other_persona = {"requestPersona": "app-other", "name": "bot"}
+    other_persona = {"name": "bot", "age": "30"}
     store.append_exchange(
         device_ip="1.1.1.1",
         app_name="xinyu",

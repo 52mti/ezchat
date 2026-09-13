@@ -11,10 +11,7 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "ocr_max_concurrency": 1,
 }
 
-DEFAULT_REQUEST_PERSONA_ID = "REMOVED-BEARER-TOKEN"
-
 DEFAULT_PERSONA_CONFIG: dict[str, Any] = {
-    "requestPersona": DEFAULT_REQUEST_PERSONA_ID,
     "name": "",
     "age": "",
     "work": "",
@@ -49,8 +46,4 @@ def with_runtime_defaults(config: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def with_app_defaults(config: dict[str, Any] | None) -> dict[str, Any]:
-    merged = _deep_merge(DEFAULT_APP_CONFIG, config or {})
-    persona = merged.get("persona", {})
-    if isinstance(persona, dict) and not str(persona.get("requestPersona", "") or "").strip():
-        persona["requestPersona"] = DEFAULT_REQUEST_PERSONA_ID
-    return merged
+    return _deep_merge(DEFAULT_APP_CONFIG, config or {})

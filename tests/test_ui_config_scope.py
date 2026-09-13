@@ -21,9 +21,6 @@ from ui.main_window import (
 )
 
 
-DEFAULT_PERSONA_ID = "REMOVED-BEARER-TOKEN"
-
-
 def test_app_config_dialog_returns_device_app_template_paths(qtbot, tmp_path):
     template_root = tmp_path / "apps" / "wechat" / "templates"
     dialog = AppConfigDialog(

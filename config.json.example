@@ -28,7 +28,6 @@
       "app_overrides": {
         "xinyu": {
           "persona": {
-            "requestPersona": "app-你的Coze人设应用ID",
             "name": "",
             "age": "",
             "work": "",
