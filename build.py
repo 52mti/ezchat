@@ -70,6 +70,11 @@ INCLUDE_PATHS = [
 BUNDLED_DATA_FILES = [
     "runtime/greetings/pingtai.txt",
 ]
+# OpenRouter 视觉密钥：仓库与 Gitee 不保存（git 历史已清洗），打包时从本机
+# .env/ 注入客户包，保证视觉识别到手即用；缓存键纳入其内容，换 key 即重打。
+BUNDLED_SECRET_FILES = (
+    ".env/vision_dialogue_keys.json",
+)
 PIPER_SOURCE_ASSETS_DIR = "tts/piper"
 
 RUNTIME_SKELETON_DIRS = [
@@ -1051,6 +1056,30 @@ def _copy_bundled_data(root: Path, package_root: Path) -> None:
     # runtime/ 只保留运行数据，不再复制引擎副本。
 
 
+def _copy_bundled_vision_key(root: Path, package_root: Path) -> None:
+    """把本机 .env 的 OpenRouter 视觉密钥注入客户包（到手即用链路）。
+
+    运行时从安装根的 .env/vision_dialogue_keys.json 读取（环境变量
+    OPENROUTER_API_KEY 优先）；密钥本身绝不进 git，分发渠道只有打包。
+    """
+    source = root / ".env" / "vision_dialogue_keys.json"
+    if not source.is_file():
+        raise SystemExit(
+            "打包中止：缺少 .env/vision_dialogue_keys.json（OpenRouter 视觉识别密钥）。\n"
+            "密钥不入库；请在打包机项目根的 .env/ 目录放置后再打包。"
+        )
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"打包中止：无法解析 .env/vision_dialogue_keys.json（{exc}）。") from exc
+    key = str(payload.get("openrouter_key", "") or "").strip() if isinstance(payload, dict) else ""
+    if not key or "请" in key:
+        raise SystemExit("打包中止：.env/vision_dialogue_keys.json 中没有有效的 openrouter_key。")
+    target = package_root / ".env" / "vision_dialogue_keys.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+
+
 def _run_build_step(command: list[str], *, cwd: Path) -> None:
     print("[build-step] " + " ".join(str(part) for part in command))
     subprocess.check_call(command, cwd=cwd)
@@ -1380,7 +1409,7 @@ def _package_cache_key(
         "python": sys.version,
     }
     digest.update(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8"))
-    relatives = [*INCLUDE_PATHS, *BUNDLED_DATA_FILES, *PACKAGE_CACHE_EXTRA_INPUTS]
+    relatives = [*INCLUDE_PATHS, *BUNDLED_DATA_FILES, *BUNDLED_SECRET_FILES, *PACKAGE_CACHE_EXTRA_INPUTS]
     for relative, path in _iter_hashable_input_files(root, relatives):
         digest.update(relative.encode("utf-8"))
         digest.update(_cache_input_bytes(relative, path))
@@ -1833,6 +1862,7 @@ def main(argv: list[str] | None = None) -> int:
     package_root = _prepare_staging_package_root(dist)
     _copy_sources(root, package_root)
     _copy_bundled_data(root, package_root)
+    _copy_bundled_vision_key(root, package_root)
     _write_package_release_metadata(
         package_root,
         app_version=app_version,

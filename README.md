@@ -84,7 +84,7 @@ copy config.json.example config.json
 | 文件（`.env/` 下） | 内容格式 | 用途 | 去哪申请 | 必填？ |
 | --- | --- | --- | --- | --- |
 | `deepseek_api_key.txt` | 一行裸 key | 人设 AI 对话回复（DeepSeek 官方直连） | platform.deepseek.com | **跑人设必填** |
-| `vision_dialogue_keys.json` | JSON（见下） | 视觉对话识别：截图 → 消息与 sender 判定（走 OpenRouter） | openrouter.ai | **视觉识别必填** |
+| `vision_dialogue_keys.json` | JSON（见下） | 视觉对话识别：截图 → 消息与 sender 判定（走 OpenRouter）；**也是打包时注入客户包的密钥来源** | openrouter.ai | **视觉识别必填** |
 | `autoglm.txt` 或 `zhipu.txt` | 一行裸 key | 智谱 AutoGLM 规划模型 | open.bigmodel.cn | 可选 |
 | `gpt_planner.txt` | 一行裸 key | GPT Planner（OpenAI 兼容接口） | 按所用平台 | 可选 |
 | `cos.txt` | `TENCENT_COS_SECRET_ID=...` 等多行 | 打包后上传腾讯云 COS | 腾讯云控制台 | 仅打包发布需要 |
@@ -147,6 +147,8 @@ python build.py
 ```
 
 > ⚠️ 打包必须在官方工程目录（本仓库根目录）执行，禁止从任何 worktree / 副本目录打包。
+>
+> 打包时会自动把本机 `.env/vision_dialogue_keys.json`（OpenRouter 视觉密钥）注入客户包的 `.env/`，客户到手即可用视觉识别，无需任何手工配置；缺该文件或 key 无效时打包直接中止。
 
 ## 重要约束
 

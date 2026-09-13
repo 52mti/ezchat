@@ -4,6 +4,8 @@ import json
 import shutil
 import zipfile
 
+import pytest
+
 import build
 
 
@@ -94,6 +96,55 @@ def test_copy_sources_excludes_deprecated_wechat_app(tmp_path):
 
     assert not (package_root / "apps" / "wechat").exists()
     assert (package_root / "apps" / "xinyu" / "app.py").is_file()
+
+
+def _write_vision_key(root, key: str) -> None:
+    (root / ".env").mkdir(exist_ok=True)
+    (root / ".env" / "vision_dialogue_keys.json").write_text(
+        json.dumps({"openrouter_key": key}, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def test_copy_bundled_vision_key_injects_into_package(tmp_path):
+    root = tmp_path / "repo"
+    package_root = tmp_path / "package"
+    root.mkdir()
+    _write_vision_key(root, "sk-or-v1-test-key")
+
+    build._copy_bundled_vision_key(root, package_root)
+
+    injected = package_root / ".env" / "vision_dialogue_keys.json"
+    assert json.loads(injected.read_text(encoding="utf-8"))["openrouter_key"] == "sk-or-v1-test-key"
+
+
+def test_copy_bundled_vision_key_requires_valid_key(tmp_path):
+    root = tmp_path / "repo"
+    package_root = tmp_path / "package"
+    root.mkdir()
+
+    with pytest.raises(SystemExit):
+        build._copy_bundled_vision_key(root, package_root)
+
+    _write_vision_key(root, "请在这里填写你自己的 OpenRouter API Key")
+    with pytest.raises(SystemExit):
+        build._copy_bundled_vision_key(root, package_root)
+
+    assert not (package_root / ".env").exists()
+
+
+def test_package_cache_key_changes_with_vision_key(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _write_vision_key(root, "sk-or-v1-key-a")
+    first = build._package_cache_key(
+        root, model_tier="lite", nvidia_cuda_lane="cpu", include_full_payload=False
+    )
+    _write_vision_key(root, "sk-or-v1-key-b")
+    second = build._package_cache_key(
+        root, model_tier="lite", nvidia_cuda_lane="cpu", include_full_payload=False
+    )
+
+    assert first != second
 
 
 def test_write_customer_update_archive_excludes_full_runtimes_and_models(tmp_path):
@@ -821,6 +872,7 @@ def test_main_default_builds_update_only(tmp_path, monkeypatch):
     monkeypatch.setattr(build, "_prepare_staging_package_root", lambda _dist: package_root)
     monkeypatch.setattr(build, "_copy_sources", lambda *args, **kwargs: None)
     monkeypatch.setattr(build, "_copy_bundled_data", lambda *args, **kwargs: None)
+    monkeypatch.setattr(build, "_copy_bundled_vision_key", lambda *args, **kwargs: None)
     runtime_calls: list[str] = []
     full_calls: list[str] = []
     monkeypatch.setattr(build, "_build_full_package_runtimes", lambda *args, **kwargs: runtime_calls.append("runtime"))
