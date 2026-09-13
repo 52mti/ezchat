@@ -20,24 +20,22 @@
       "ip": "192.168.1.108",
       "license_key": "",
       "license_expires": "",
-      "selected_app": "wechat",
+      "selected_app": "xinyu",
       "runtime_overrides": {
         "poll_interval": 1,
         "keep_awake_interval_seconds": 200
       },
       "app_overrides": {
-        "wechat": {
+        "xinyu": {
           "persona": {
-            "requestPersona": "REMOVED-BEARER-TOKEN",
+            "requestPersona": "app-你的Coze人设应用ID",
             "name": "",
             "age": "",
             "work": "",
             "location": "",
             "renshe": ""
           }
-        },
-        "xinyu": {},
-        "huanyou": {}
+        }
       }
     }
   ],

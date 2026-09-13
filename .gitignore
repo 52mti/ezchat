@@ -40,3 +40,12 @@ photo/
 .venv/
 venv/
 env/
+
+# 内部资料 / 含真实密钥的对接与参考文档（仅本地保留，绝不上库）
+jiekou/卡密对接.md
+jiekou/TTS_caokao.md
+
+# IDE
+.idea/
+.vscode/
+
