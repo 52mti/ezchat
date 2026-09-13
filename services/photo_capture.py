@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime
 from hashlib import blake2b
@@ -18,7 +18,46 @@ from services.step_timing import exclude_ocr_wait_from_step_timeout
 from vision.screen import annotate_image_bytes, ensure_portrait_image
 
 
-PHOTO_ROOT = Path("photo")
+PHOTO_ROOT = Path("runtime/photo")
+_LEGACY_PHOTO_ROOT = Path("photo")
+
+
+def _merge_tree(source: Path, target: Path) -> bool:
+    """把旧目录内容并进新目录；同名冲突的旧文件留在原地。返回是否可整目录删除。"""
+    all_merged = True
+    if not source.exists():
+        return True
+    for item in list(source.iterdir()):
+        destination = target / item.name
+        if item.is_dir():
+            if destination.exists():
+                all_merged = _merge_tree(item, destination) and all_merged
+                if all_merged:
+                    item.rmdir()
+            else:
+                item.replace(destination)
+        elif destination.exists():
+            all_merged = False  # 同名冲突：不覆盖，留在原地避免丢数据
+        else:
+            item.replace(destination)
+    return all_merged
+
+
+def ensure_photo_root() -> Path:
+    """确保照片根目录存在；把遗留的根目录 photo/ 迁入 runtime/photo（数据分层规范）。"""
+    try:
+        PHOTO_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    try:
+        if _LEGACY_PHOTO_ROOT.exists() and _LEGACY_PHOTO_ROOT != PHOTO_ROOT:
+            if _merge_tree(_LEGACY_PHOTO_ROOT, PHOTO_ROOT):
+                _LEGACY_PHOTO_ROOT.rmdir()
+    except OSError:
+        pass
+    return PHOTO_ROOT
+
+
 DEFAULT_STATUS_CACHE_TTL_SECONDS = 0.0
 DEFAULT_IMAGE_CHANGE_MEAN_THRESHOLD = 0.8
 DEFAULT_IMAGE_CHANGE_PIXEL_THRESHOLD = 5
@@ -433,4 +472,11 @@ def capture_transform_image(
     source = f"机械臂截图 device={host} app={app_name} label={label}"
     if path is not None:
         source = f"{source} path={path}"
+    try:
+        # 监控墙数据源：每次成功取图发布最近一帧（限频 1s/设备，仅内存）
+        from services.monitor_feed import publish_capture
+
+        publish_capture(host, app_name, bytes(image), label=str(label))
+    except Exception:
+        pass
     return annotate_image_bytes(bytes(image), source)

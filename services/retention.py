@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import deque
 from datetime import datetime, timedelta
@@ -35,3 +35,27 @@ def cleanup_old_error_captures(
             removed += 1
     return removed
 
+
+
+def cleanup_old_error_incidents(
+    incident_root: str | Path = "runtime/errors",
+    *,
+    retention_days: int = 30,
+) -> int:
+    """按日期目录清理过期的错误事故记录（runtime/errors/YYYYMMDD/）。"""
+    import shutil
+
+    root = Path(incident_root)
+    if not root.exists():
+        return 0
+    removed = 0
+    cutoff = datetime.now() - timedelta(days=max(1, retention_days))
+    for day_dir in sorted(item for item in root.iterdir() if item.is_dir()):
+        try:
+            day = datetime.strptime(day_dir.name, "%Y%m%d")
+        except ValueError:
+            continue
+        if day < cutoff:
+            shutil.rmtree(day_dir, ignore_errors=True)
+            removed += 1
+    return removed

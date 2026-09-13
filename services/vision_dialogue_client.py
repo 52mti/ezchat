@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import json
@@ -117,6 +117,20 @@ def _content_to_text(content: Any) -> str:
     return str(content or "")
 
 
+_SENDER_ALIASES = {
+    "对方": "sender1",
+    "other": "sender1",
+    "peer": "sender1",
+    "left": "sender1",
+    "them": "sender1",
+    "我": "sender2",
+    "我方": "sender2",
+    "self": "sender2",
+    "me": "sender2",
+    "right": "sender2",
+}
+
+
 def _normalize_messages(payload: dict[str, Any]) -> dict[str, Any]:
     result = dict(payload if isinstance(payload, dict) else {})
     senders = result.get("senders")
@@ -131,6 +145,9 @@ def _normalize_messages(payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict):
             continue
         sender = str(item.get("sender", "")).strip()
+        # 汇总模型偶发用「对方/我/left/right」等别名，直接丢弃会把整轮
+        # 识别清零（曾表现为标定报「视觉返回消息 0 条」），先做别名归一。
+        sender = _SENDER_ALIASES.get(sender.lower(), sender)
         if sender not in {"sender1", "sender2"}:
             continue
         message_type = str(item.get("type", "text") or "text").strip() or "text"
@@ -393,19 +410,52 @@ class VisionDialogueClient:
             "不要输出分析过程。\n独立分析结果：\n"
             f"{json.dumps(analyses, ensure_ascii=False, default=str)}"
         )
-        judge = self._request_once(
-            config, judge_prompt, data_uri, "openrouter", model_override=judge_model,
-            session=self.session if self._session_is_custom else requests.Session(),
-        )
+        judge = self._judge_with_fallback(config, judge_prompt, data_uri, judge_model, results)
+        if judge.provider == "openrouter_ensemble_fallback":
+            return judge
         return VisionDialogueReply(
             payload=judge.payload, provider="openrouter_ensemble", model=judge_model, raw_text=judge.raw_text
         )
+
+    def _judge_with_fallback(
+        self,
+        config: dict[str, Any],
+        prompt: str,
+        data_uri: str,
+        judge_model: str,
+        results: list[tuple[str, "VisionDialogueReply"]],
+    ) -> "VisionDialogueReply":
+        """请求汇总模型；其输出非法 JSON 时降级采用消息数最多的单模型结果。
+
+        汇总提示词要装下全部独立分析再输出全量 JSON，偶发被截断/畸形，
+        整体抛错会让一次识别全废（曾表现为标定「视觉识别连续失败」）。
+        """
+        try:
+            return self._request_once(
+                config, prompt, data_uri, "openrouter", model_override=judge_model,
+                session=self.session if self._session_is_custom else requests.Session(),
+            )
+        except VisionDialogueError:
+            if not results:
+                raise
+            best = max(
+                results,
+                key=lambda item: len(item[1].payload.get("messages", []) or []),
+            )
+            return VisionDialogueReply(
+                payload=best[1].payload,
+                provider="openrouter_ensemble_fallback",
+                model=best[0],
+                raw_text=best[1].raw_text,
+            )
 
     def parse_dialogue(self, image: Any, config: dict[str, Any]) -> VisionDialogueReply:
         dialogue_llm = config.get("dialogue_llm", {})
         if not isinstance(dialogue_llm, dict):
             raise VisionDialogueError("dialogue_llm config must be a dict")
-        prompt_path = dialogue_llm.get("prompt_path") or "apps/huanyou/dialogue_llm_prompt.txt"
+        prompt_path = dialogue_llm.get("prompt_path")
+        if not str(prompt_path or "").strip():
+            raise VisionDialogueError("dialogue_llm.prompt_path is not configured")
         prompt = self._prompt_text(prompt_path)
         data_uri = self._image_to_data_uri(image)
         return self._request_openrouter_ensemble(dialogue_llm, prompt, data_uri)

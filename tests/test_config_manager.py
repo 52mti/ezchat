@@ -24,12 +24,11 @@ def test_config_manager_get_set_and_atomic_write(tmp_path):
     outbox_path = tmp_path / "outbox.json"
     manager = ConfigManager(config_path, outbox_path)
 
-    manager.set("global", "apikey", value="abc123")
+    manager.update_global("persona_chat_model", "deepseek-flash")
 
-    assert manager.get("global", "apikey") == "abc123"
+    assert manager.get("global", "persona_chat_model") == "deepseek-flash"
     saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert "apikey" not in saved["global"]
-    assert (tmp_path / ".env" / "apikey.txt").read_text(encoding="utf-8") == "CHATBOT_APIKEY=abc123\n"
+    assert saved["global"]["persona_chat_model"] == "deepseek-flash"
 
 
 def test_config_manager_has_global_greetings_dir_default(tmp_path):
@@ -40,101 +39,20 @@ def test_config_manager_has_global_greetings_dir_default(tmp_path):
     assert "greetings_dir" not in manager.get_app_config("1.1.1.1", "wechat", {})
 
 
-def test_config_manager_environment_override_is_not_written(tmp_path, monkeypatch):
+def test_config_manager_strips_stale_global_apikey_on_write(tmp_path):
+    """旧链路 global.apikey 已无消费方：写盘时剥离（docs/13 第七节 C5 清理）。"""
     config_path = tmp_path / "config.json"
     outbox_path = tmp_path / "outbox.json"
     config_path.write_text(
-        json.dumps({"global": {"apikey": "file-key"}, "devices": []}),
+        json.dumps({"global": {"apikey": "legacy-key"}, "devices": []}),
         encoding="utf-8",
     )
-    monkeypatch.setenv("CHATBOT_APIKEY", "env-key")
 
     manager = ConfigManager(config_path, outbox_path)
+    manager.update_global("persona_chat_model", "deepseek-flash")
 
-    assert manager.get("global", "apikey") == "env-key"
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert "apikey" not in saved["global"]
-
-
-def test_config_manager_local_env_apikey_override_is_not_written(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.json"
-    outbox_path = tmp_path / "outbox.json"
-    config_path.write_text(
-        json.dumps({"global": {"apikey": "file-key"}, "devices": []}),
-        encoding="utf-8",
-    )
-    env_dir = tmp_path / ".env"
-    env_dir.mkdir()
-    (env_dir / "apikey.txt").write_text("# local only\nCHATBOT_APIKEY=local-key\n", encoding="utf-8")
-    monkeypatch.delenv("CHATBOT_APIKEY", raising=False)
-
-    manager = ConfigManager(config_path, outbox_path)
-
-    assert manager.get("global", "apikey") == "local-key"
-    saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert "apikey" not in saved["global"]
-
-
-def test_config_manager_reads_local_env_apikey_with_utf8_bom(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.json"
-    outbox_path = tmp_path / "outbox.json"
-    env_dir = tmp_path / ".env"
-    env_dir.mkdir()
-    (env_dir / "apikey.txt").write_text("\ufeff41d83b9a-525b-424b-bbea-c5857de9d21c\n", encoding="utf-8")
-    monkeypatch.delenv("CHATBOT_APIKEY", raising=False)
-
-    manager = ConfigManager(config_path, outbox_path)
-
-    assert manager.get("global", "apikey") == "41d83b9a-525b-424b-bbea-c5857de9d21c"
-
-
-def test_config_manager_reads_key_value_local_env_apikey_with_utf8_bom(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.json"
-    outbox_path = tmp_path / "outbox.json"
-    env_dir = tmp_path / ".env"
-    env_dir.mkdir()
-    (env_dir / "apikey.txt").write_text("\ufeffCHATBOT_APIKEY=bom-key\n", encoding="utf-8")
-    monkeypatch.delenv("CHATBOT_APIKEY", raising=False)
-
-    manager = ConfigManager(config_path, outbox_path)
-
-    assert manager.get("global", "apikey") == "bom-key"
-
-
-def test_config_manager_environment_apikey_wins_over_local_env_file(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.json"
-    outbox_path = tmp_path / "outbox.json"
-    config_path.write_text(
-        json.dumps({"global": {"apikey": "file-key"}, "devices": []}),
-        encoding="utf-8",
-    )
-    env_dir = tmp_path / ".env"
-    env_dir.mkdir()
-    (env_dir / "apikey.txt").write_text("local-key\n", encoding="utf-8")
-    monkeypatch.setenv("CHATBOT_APIKEY", "real-env-key")
-
-    manager = ConfigManager(config_path, outbox_path)
-
-    assert manager.get("global", "apikey") == "real-env-key"
-    saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert "apikey" not in saved["global"]
-
-
-def test_config_manager_migrates_file_apikey_to_local_env(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.json"
-    outbox_path = tmp_path / "outbox.json"
-    config_path.write_text(
-        json.dumps({"global": {"apikey": "file-key"}, "devices": []}),
-        encoding="utf-8",
-    )
-    monkeypatch.delenv("CHATBOT_APIKEY", raising=False)
-
-    manager = ConfigManager(config_path, outbox_path)
-
-    assert manager.get("global", "apikey") == "file-key"
-    saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert "apikey" not in saved["global"]
-    assert (tmp_path / ".env" / "apikey.txt").read_text(encoding="utf-8") == "CHATBOT_APIKEY=file-key\n"
 
 
 def test_config_manager_upserts_outbox_entry(tmp_path):
@@ -228,7 +146,8 @@ def test_config_manager_splits_app_level_dialogue_and_list_ocr_files_on_save(tmp
 
     assert "dialogue" not in base_saved.get("ocr_modes", {})
     assert "list" not in base_saved.get("ocr_modes", {})
-    assert base_saved["ocr_modes"]["points"]["rules"]["neighbor_x_ratio"] == 0.66
+    # points 等其余模式属开发域（随包默认下发），不落客户层。
+    assert "ocr_modes" not in base_saved
     assert dialogue_saved["rules"]["line_gap"] == 31
     assert list_saved["rules"]["main_top_ratio"] == 0.18
 
@@ -284,15 +203,16 @@ def test_config_manager_normalizes_device_template_paths_to_app_scope(tmp_path):
     )
 
     manager = ConfigManager(config_path, tmp_path / "outbox.json")
-    app_config = manager.get_app_config("192.168.1.108", "wechat", {})
+    app_config = manager.get_app_config("192.168.1.108", "wechat", WECHAT_DEFAULT_CONFIG)
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     app_saved = _read_app_config(tmp_path, "wechat")
 
-    assert app_config["templates"]["buttons"] == "apps\\wechat\\templates\\buttons"
-    assert app_config["templates"]["screens"] == "apps\\wechat\\templates\\screens"
+    # 模板路径属开发域：历史设备层残留的 runtime\templates 路径被清除，
+    # 生效值回落到随包/代码默认（本就是规范化目标位置）。
+    assert app_config["templates"]["buttons"] == WECHAT_DEFAULT_CONFIG["templates"]["buttons"]
+    assert app_config["templates"]["screens"] == WECHAT_DEFAULT_CONFIG["templates"]["screens"]
     assert "apps" not in saved
-    assert app_saved["templates"]["buttons"] == "apps\\wechat\\templates\\buttons"
-    assert app_saved["templates"]["screens"] == "apps\\wechat\\templates\\screens"
+    assert "templates" not in app_saved
 
 
 def test_config_manager_migrates_and_backs_up_old_schema(tmp_path):
@@ -331,14 +251,15 @@ def test_config_manager_updates_app_runtime_and_persona_scopes_independently(tmp
     merged = manager.get_app_config("1.1.1.1", "wechat", WECHAT_DEFAULT_CONFIG)
 
     assert "apps" not in saved
-    assert app_saved["match_threshold"] == 0.91
-    assert app_saved["ocr"]["det_db_thresh"] == 0.21
+    # 视觉调参属开发域：客户层与存盘都不保留，生效值回到随包/代码默认。
+    assert "match_threshold" not in app_saved
+    assert "ocr" not in app_saved
     assert saved["devices"][0]["runtime_overrides"]["poll_interval"] == 6
     assert saved["devices"][0]["runtime_overrides"]["keep_awake_interval_seconds"] == 300
     assert saved["devices"][0]["runtime_overrides"]["exclude_ocr_wait_from_step_timeout"] is False
     assert saved["devices"][0]["app_overrides"]["wechat"]["persona"]["name"] == "bot"
     assert device["runtime_overrides"]["poll_interval"] == 6
-    assert merged["match_threshold"] == 0.91
+    assert merged["match_threshold"] == WECHAT_DEFAULT_CONFIG["match_threshold"]
     assert merged["persona"]["name"] == "bot"
 
 
@@ -364,58 +285,28 @@ def test_config_manager_defaults_invalid_match_threshold(tmp_path):
     assert config["match_threshold"] == 0.7
 
 
-def test_config_manager_updates_device_app_offsets_independently(tmp_path):
-    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
-    manager.add_device({"ip": "1.1.1.1", "selected_app": "huanyou", "app_overrides": {"huanyou": {"persona": {}}}})
-
-    manager.update_device_app_overrides(
-        "1.1.1.1",
-        "huanyou",
-        {
-            "new_greeting_click_x_offset": 0.02,
-            "new_greeting_click_y_offset": -0.03,
-            "next_message_click_x_offset": 0.05,
-            "next_message_click_y_offset": -0.02,
-        },
-    )
-
-    saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
-    merged = manager.get_app_config("1.1.1.1", "huanyou", {})
-
-    assert saved["devices"][0]["app_overrides"]["huanyou"]["new_greeting_click_x_offset"] == 0.02
-    assert saved["devices"][0]["app_overrides"]["huanyou"]["new_greeting_click_y_offset"] == -0.03
-    assert saved["devices"][0]["app_overrides"]["huanyou"]["next_message_click_x_offset"] == 0.05
-    assert saved["devices"][0]["app_overrides"]["huanyou"]["next_message_click_y_offset"] == -0.02
-    assert not (tmp_path / "apps" / "huanyou" / "config.json").exists()
-    assert merged["new_greeting_click_x_offset"] == 0.02
-    assert merged["new_greeting_click_y_offset"] == -0.03
-    assert merged["next_message_click_x_offset"] == 0.05
-    assert merged["next_message_click_y_offset"] == -0.02
-
-
 def test_config_manager_keeps_template_match_regions_in_app_scope(tmp_path):
     manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
-    manager.add_device({"ip": "1.1.1.1", "selected_app": "huanyou", "app_overrides": {"huanyou": {"persona": {}}}})
+    manager.add_device({"ip": "1.1.1.1", "selected_app": "xinyu", "app_overrides": {"xinyu": {"persona": {}}}})
 
     manager.update_app_config(
-        "huanyou",
+        "xinyu",
         {
             "template_match_regions": {
                 "button.send": [0.1, 0.7, 0.8, 0.2],
-                "screen.chat_list": [0.0, 0.1, 1.0, 0.8],
+                "popup.custom.popup_custom_1": [0.2, 0.3, 0.6, 0.3],
             }
         },
     )
 
     saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
-    app_saved = _read_app_config(tmp_path, "huanyou")
-    merged = manager.get_app_config("1.1.1.1", "huanyou", {})
+    app_saved = _read_app_config(tmp_path, "xinyu")
+    merged = manager.get_app_config("1.1.1.1", "xinyu", {})
 
-    regions = app_saved["template_match_regions"]
-    assert regions["button.send"] == [0.1, 0.7, 0.8, 0.2]
-    assert regions["screen.chat_list"] == [0.0, 0.1, 1.0, 0.8]
-    assert "template_match_regions" not in saved["devices"][0].get("app_overrides", {}).get("huanyou", {})
-    assert merged["template_match_regions"]["button.send"] == [0.1, 0.7, 0.8, 0.2]
+    # 客户层只保留 popup.* 模板规则；button/screen 区域属开发域随包默认。
+    assert list(app_saved["template_match_regions"]) == ["popup.custom.popup_custom_1"]
+    assert "template_match_regions" not in saved["devices"][0].get("app_overrides", {}).get("xinyu", {})
+    assert merged["template_match_regions"]["popup.custom.popup_custom_1"] == [0.2, 0.3, 0.6, 0.3]
 
 
 def test_config_manager_keeps_template_match_thresholds_in_app_scope(tmp_path):
@@ -426,6 +317,7 @@ def test_config_manager_keeps_template_match_thresholds_in_app_scope(tmp_path):
         {
             "template_match_thresholds": {
                 "screen.chat_window": 0.7,
+                "popup.custom.popup_custom_2": 0.85,
             }
         },
     )
@@ -433,8 +325,8 @@ def test_config_manager_keeps_template_match_thresholds_in_app_scope(tmp_path):
     app_saved = _read_app_config(tmp_path, "xinyu")
     merged = manager.get_app_config("1.1.1.1", "xinyu", XINYU_DEFAULT_CONFIG)
 
-    assert app_saved["template_match_thresholds"]["screen.chat_window"] == 0.7
-    assert merged["template_match_thresholds"]["screen.chat_window"] == 0.7
+    assert list(app_saved["template_match_thresholds"]) == ["popup.custom.popup_custom_2"]
+    assert merged["template_match_thresholds"]["popup.custom.popup_custom_2"] == 0.85
 
 
 def test_config_manager_keeps_xinyu_photo_settings_in_device_app_scope(tmp_path):
@@ -481,49 +373,6 @@ def test_xinyu_partial_app_config_keeps_default_template_regions(tmp_path):
 
     assert merged["template_match_regions"]["screen.chat_window"] == [0.007, 0.476, 0.261, 0.523]
     assert merged["template_match_regions"]["popup.custom.popup_custom_4"] == [0.037, 0.282, 0.954, 0.443]
-
-
-def test_config_manager_migrates_legacy_app_level_offsets_to_device_app_scope(tmp_path):
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 2,
-                "apps": {
-                    "huanyou": {
-                        "new_greeting_click_x_offset": 0.03,
-                        "new_greeting_click_y_offset": -0.02,
-                        "next_message_click_x_offset": 0.04,
-                        "next_message_click_y_offset": -0.01,
-                    }
-                },
-                "devices": [
-                    {
-                        "ip": "1.1.1.1",
-                        "selected_app": "huanyou",
-                        "app_overrides": {"huanyou": {"persona": {"name": "tester"}}},
-                    }
-                ],
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-
-    manager = ConfigManager(config_path, tmp_path / "outbox.json")
-    saved = json.loads(config_path.read_text(encoding="utf-8"))
-    merged = manager.get_app_config("1.1.1.1", "huanyou", {})
-
-    assert "apps" not in saved
-    assert not (tmp_path / "apps" / "huanyou" / "config.json").exists()
-    assert saved["devices"][0]["app_overrides"]["huanyou"]["new_greeting_click_x_offset"] == 0.03
-    assert saved["devices"][0]["app_overrides"]["huanyou"]["new_greeting_click_y_offset"] == -0.02
-    assert saved["devices"][0]["app_overrides"]["huanyou"]["next_message_click_x_offset"] == 0.04
-    assert saved["devices"][0]["app_overrides"]["huanyou"]["next_message_click_y_offset"] == -0.01
-    assert merged["new_greeting_click_x_offset"] == 0.03
-    assert merged["new_greeting_click_y_offset"] == -0.02
-    assert merged["next_message_click_x_offset"] == 0.04
-    assert merged["next_message_click_y_offset"] == -0.01
 
 
 def test_config_manager_add_device_sorts_and_rejects_duplicates(tmp_path):
