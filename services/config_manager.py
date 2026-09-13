@@ -8,9 +8,7 @@ import shutil
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any
-
-from apps import resolve_app_name
+from typing import Any, Callable
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -19,9 +17,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "license_api_url": "",
         "project_uuid": "",
         "project_secret": "",
-        "chat_api_base": "http://liaotianbao.icu",
-        "chat_bearer": "",
-        "credits_bearer": "",
         "greetings_dir": "runtime/greetings",
         "ocr_max_concurrency": 1,
         "rule_learning": {
@@ -76,14 +71,64 @@ DEVICE_APP_LEVEL_KEYS = {
     "persona",
     "photo_sent_cooldown_seconds",
     "online_photo_send_count",
-    "new_greeting_click_x_offset",
-    "new_greeting_click_y_offset",
-    "next_message_click_x_offset",
-    "next_message_click_y_offset",
+    # 人设 AI 新链路客户域键（docs/13 五/六节，2026-09-13）：设备 IP+App 粒度
+    "persona_profile_json",
+    "greetings_txt",
+    "judge_enabled",
+    "greeting_ai_enabled",
+    "history_turns",
+    "summary_interval",
 }
 APP_CONFIG_FILE_NAME = "config.json"
 APP_DIALOGUE_OCR_CONFIG_FILE_NAME = "dialogue_ocr_config.json"
 APP_LIST_OCR_CONFIG_FILE_NAME = "list_ocr_config.json"
+
+# 开发域专属键（移植自 douyin）：视觉调参 / 模板路径 / OCR 引擎配置只随
+# apps/<app>/ 随包默认值下发。客户层（runtime/configs/<app>/）在读取和
+# 写盘两端剥离这些键，保证随包默认值的更新对客户机始终生效；客户层只
+# 保留客户自己的设定（popup.* 模板规则、dialogue/list OCR 模式规则、
+# 业务参数）。
+DEVELOPER_SCOPED_APP_KEYS = frozenset({
+    "screen_detection_rules",
+    "match_threshold",
+    "popup_match_threshold",
+    "enable_enhanced_template_match",
+    "template_match_region_expand_ratio",
+    "template_match_scales",
+    "template_match_scales_by_key",
+    "template_match_channels",
+    "template_match_channels_by_key",
+    "templates",
+    "ocr",
+})
+
+
+def _strip_customer_layer_template_scopes(payload: dict[str, Any]) -> dict[str, Any]:
+    """客户层只保留客户自己的设定。
+
+    - 开发域视觉键整体剔除；
+    - template_match_regions / template_match_thresholds 只保留 popup.*；
+    - ocr_modes 只保留 dialogue / list（points 等其余模式属开发域）。
+    """
+    for config_key in DEVELOPER_SCOPED_APP_KEYS:
+        payload.pop(config_key, None)
+    for config_key in ("template_match_regions", "template_match_thresholds"):
+        value = payload.get(config_key)
+        if not isinstance(value, dict):
+            continue
+        popup_only = {k: v for k, v in value.items() if str(k).startswith("popup.")}
+        if popup_only:
+            payload[config_key] = popup_only
+        else:
+            payload.pop(config_key, None)
+    ocr_modes = payload.get("ocr_modes")
+    if isinstance(ocr_modes, dict):
+        customer_modes = {k: v for k, v in ocr_modes.items() if k in ("dialogue", "list")}
+        if customer_modes:
+            payload["ocr_modes"] = customer_modes
+        else:
+            payload.pop("ocr_modes", None)
+    return payload
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -164,39 +209,19 @@ def _normalize_match_threshold(app_config: dict[str, Any]) -> None:
         app_config["match_threshold"] = DEFAULT_MATCH_THRESHOLD
 
 
-def _normalize_huanyou_dialogue_rules(app_name: str, app_config: dict[str, Any]) -> None:
-    if str(app_name) != "huanyou" or not isinstance(app_config, dict):
-        return
-    ocr_modes = app_config.get("ocr_modes", {})
-    if not isinstance(ocr_modes, dict):
-        return
-    dialogue = ocr_modes.get("dialogue", {})
-    if not isinstance(dialogue, dict):
-        return
-    rules = dialogue.get("rules", {})
-    if not isinstance(rules, dict):
-        return
-    sender_detection = rules.get("sender_detection", {})
-    if not isinstance(sender_detection, dict):
-        return
-    has_bubble_keys = any(str(key).startswith("bubble_color_") for key in sender_detection.keys())
-    if str(sender_detection.get("method", "")).strip() == "center_position" and not has_bubble_keys:
-        sender_detection["method"] = "bubble_color"
-        sender_detection["bubble_color_min_saturation"] = 0.12
-        sender_detection["bubble_color_min_value"] = 0.20
-        sender_detection["bubble_color_sender2_hue_min"] = 110
-        sender_detection["bubble_color_sender2_hue_max"] = 150
-        sender_detection["bubble_color_sender2_blue_green_min"] = 65
-        sender_detection["bubble_color_sender2_blue_red_ratio_min"] = 1.60
-        sender_detection["bubble_color_sender2_blue_min_saturation"] = 0.30
-    if "name_gap_ratio" not in rules and "name_gap" in rules:
-        try:
-            name_gap_value = float(rules["name_gap"])
-        except (TypeError, ValueError):
-            name_gap_value = 0.0
-        if name_gap_value >= 1:
-            rules["name_gap_ratio"] = 0.037
-            rules.pop("name_gap", None)
+# App 层（apps/<app>/config_rules.py）在包导入时注册各自的配置规范化钩子。
+# 配置服务只提供机制，不感知具体 App 的规则，保持 services 不反向依赖 apps。
+_APP_CONFIG_NORMALIZERS: dict[str, Callable[[dict[str, Any]], None]] = {}
+
+
+def register_app_config_normalizer(app_name: str, normalizer: Callable[[dict[str, Any]], None]) -> None:
+    _APP_CONFIG_NORMALIZERS[str(app_name)] = normalizer
+
+
+def _run_app_config_normalizer(app_name: str, app_config: dict[str, Any]) -> None:
+    normalizer = _APP_CONFIG_NORMALIZERS.get(str(app_name))
+    if normalizer is not None:
+        normalizer(app_config)
 
 
 def _normalize_app_configs(app_configs: dict[str, Any]) -> None:
@@ -206,7 +231,7 @@ def _normalize_app_configs(app_configs: dict[str, Any]) -> None:
         if isinstance(app_config, dict):
             _normalize_app_templates(str(app_name), app_config)
             _normalize_match_threshold(app_config)
-            _normalize_huanyou_dialogue_rules(str(app_name), app_config)
+            _run_app_config_normalizer(str(app_name), app_config)
 
 
 def _load_json_dict(path: Path) -> dict[str, Any]:
@@ -224,42 +249,6 @@ def _normalize_secret_value(value: Any) -> str:
     for marker in ("\ufeff", "\u200b", "\u200c", "\u200d", "\u2060"):
         text = text.replace(marker, "")
     return text.strip()
-
-
-def _read_local_apikey(config_path: Path) -> str:
-    env_dir = config_path.parent / ".env"
-    for path in (env_dir / "apikey.txt", env_dir / "apikey"):
-        if not path.is_file():
-            continue
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            stripped = _normalize_secret_value(line)
-            if not stripped or stripped.startswith("#"):
-                continue
-            if "=" in stripped:
-                key, value = stripped.split("=", 1)
-                if _normalize_secret_value(key).lower() in {"apikey", "chatbot_apikey", "chatbot_api_key"}:
-                    stripped = _normalize_secret_value(value).strip('"').strip("'")
-                else:
-                    continue
-            return stripped
-    return ""
-
-
-def _write_local_apikey(config_path: Path, apikey: str) -> None:
-    env_dir = config_path.parent / ".env"
-    path = env_dir / "apikey.txt"
-    value = _normalize_secret_value(apikey)
-    env_dir.mkdir(parents=True, exist_ok=True)
-    if not value:
-        path.unlink(missing_ok=True)
-        return
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(f"CHATBOT_APIKEY={value}\n", encoding="utf-8")
-    os.replace(tmp_path, path)
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -310,8 +299,11 @@ def _load_app_override_file(
         # 包内随包默认值（apps/<app>/，只读），客户层缺失的键由此兜底。
         payload = _load_json_dict(_app_config_path(defaults_root, app_name))
         payload = _deep_merge(payload, _load_app_ocr_mode_override_files(defaults_root, app_name))
-    payload = _deep_merge(payload, _load_json_dict(_app_config_path(app_config_root, app_name)))
-    payload = _deep_merge(payload, _load_app_ocr_mode_override_files(app_config_root, app_name))
+    # 客户层先剥离开发域键再合并：随包默认值的视觉调参更新不被遮蔽。
+    customer_payload = _load_json_dict(_app_config_path(app_config_root, app_name))
+    customer_payload = _deep_merge(customer_payload, _load_app_ocr_mode_override_files(app_config_root, app_name))
+    customer_payload = _strip_customer_layer_template_scopes(customer_payload)
+    payload = _deep_merge(payload, customer_payload)
     app_level, _, legacy_device_app = _split_override_scopes(payload)
     # 旧布局把业务参数（时长/关键词等）写在 App 层文件里；读取时并回作为
     # 兜底值，设备层（devices[].app_overrides）合并时优先级更高。
@@ -319,21 +311,16 @@ def _load_app_override_file(
         app_level.setdefault(key, copy.deepcopy(value))
     _normalize_app_templates(app_name, app_level)
     _normalize_match_threshold(app_level)
-    _normalize_huanyou_dialogue_rules(app_name, app_level)
+    _run_app_config_normalizer(app_name, app_level)
     return app_level
 
 
-def _extract_legacy_app_level_offsets(app_config: dict[str, Any]) -> dict[str, Any]:
-    offsets: dict[str, Any] = {}
-    for key in (
-        "new_greeting_click_x_offset",
-        "new_greeting_click_y_offset",
-        "next_message_click_x_offset",
-        "next_message_click_y_offset",
-    ):
-        if key in app_config:
-            offsets[key] = copy.deepcopy(app_config.pop(key))
-    return offsets
+def _default_app_name() -> str:
+    # 延迟导入 App 注册表：仅旧版根配置迁移时需要，避免 services 在模块
+    # 加载期反向依赖 apps 形成环。
+    from apps import resolve_app_name
+
+    return resolve_app_name(None)
 
 
 def _normalize_device_scopes(device: dict[str, Any]) -> None:
@@ -368,18 +355,22 @@ def _merge_app_level_config(
 ) -> None:
     if not updates:
         return
-    existing = _load_app_override_file(app_config_root, app_name, defaults_root=defaults_root)
+    # 保存基线只取客户层自身（不掺随包默认值），否则开发端默认会被复制
+    # 进客户层文件，永久遮蔽后续默认值更新。
+    existing = _load_json_dict(_app_config_path(app_config_root, app_name))
+    existing = _deep_merge(existing, _load_app_ocr_mode_override_files(app_config_root, app_name))
+    existing = _strip_customer_layer_template_scopes(existing)
     merged = _deep_merge(existing, updates)
     _normalize_app_templates(app_name, merged)
     _normalize_match_threshold(merged)
+    # 客户层只保留客户自己的设定：dialogue/list 拆专属文件；其余开发端
+    # 视觉键（含规范化器补回的默认值、points 等模式）写盘前统一剥离。
     ocr_modes = merged.get("ocr_modes", {})
     ocr_modes = copy.deepcopy(ocr_modes) if isinstance(ocr_modes, dict) else {}
     dialogue_mode = ocr_modes.pop("dialogue", None)
     list_mode = ocr_modes.pop("list", None)
-    if ocr_modes:
-        merged["ocr_modes"] = ocr_modes
-    else:
-        merged.pop("ocr_modes", None)
+    merged.pop("ocr_modes", None)
+    merged = _strip_customer_layer_template_scopes(merged)
     _atomic_write_json(_app_config_path(app_config_root, app_name), merged)
     for mode_payload, path in (
         (dialogue_mode, _app_dialogue_ocr_config_path(app_config_root, app_name)),
@@ -436,10 +427,15 @@ class ConfigManager:
     def __init__(
         self,
         config_path: str | Path = "config.json",
-        outbox_path: str | Path = "outbox.json",
+        outbox_path: str | Path | None = None,
     ) -> None:
         self.config_path = Path(config_path)
-        self.outbox_path = Path(outbox_path)
+        # 收件箱是运行数据（数据分层规范 L3），落 runtime/；显式传路径用于测试与隔离。
+        self.outbox_path = (
+            Path(outbox_path)
+            if outbox_path is not None
+            else self.config_path.parent / "runtime" / "outbox.json"
+        )
         # 双文件分层：apps/<app>/ = 随包默认值（只读兜底，开发机上是源码）；
         # runtime/configs/<app>/ = 客户 App 级配置（UI 保存只写这里）。
         # 根 config.json 的 devices[].app_overrides = 客户对应设备的业务参数。
@@ -447,24 +443,64 @@ class ConfigManager:
         self.app_config_root = self.config_path.parent / "runtime" / "configs"
         self.app_defaults_root = self.config_path.parent / "apps"
         self._migrate_legacy_app_configs(fresh_install=fresh_install)
+        self._migrate_legacy_outbox()
         self._config = self._load_json(self.config_path, DEFAULT_CONFIG)
         self._outbox = self._load_json(self.outbox_path, DEFAULT_OUTBOX)
         self._migrate_if_needed()
         self._normalize_loaded_device_scopes()
-        self._move_config_apikey_to_env()
         self._apply_environment_overrides()
 
-    def _migrate_legacy_app_configs(self, *, fresh_install: bool) -> None:
-        """双层配置的边界保护与一次性迁移。
+    def _migrate_legacy_outbox(self) -> None:
+        """旧布局的 outbox.json 在根目录；一次性搬入 runtime/（数据分层规范）。
 
-        - apps/<app>/ 三个 json 在客户机上是历史布局的客户界面数据；
+        冲突裁决：非空者优先于空文件（防止后写入的空壳盖掉真实账本），
+        其次修改时间新者胜（旧版程序停写前的最后一份必须赢，否则已发送
+        标记回退会导致重复回复）。
+        """
+        legacy = self.config_path.parent / "outbox.json"
+        if self.outbox_path == legacy or not legacy.is_file():
+            return
+
+        def _message_count(path: Path) -> int:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return -1
+            if not isinstance(payload, dict):
+                return -1
+            return len(payload.get("messages", []) or [])
+
+        try:
+            if not self.outbox_path.exists():
+                self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
+                legacy.replace(self.outbox_path)
+                return
+            legacy_count = _message_count(legacy)
+            target_count = _message_count(self.outbox_path)
+            legacy_wins = (
+                (legacy_count > 0 and target_count <= 0)
+                or (
+                    legacy_count > 0
+                    and target_count > 0
+                    and legacy.stat().st_mtime > self.outbox_path.stat().st_mtime
+                )
+            )
+            if legacy_wins:
+                legacy.replace(self.outbox_path)
+        except OSError:
+            pass
+
+    def _migrate_legacy_app_configs(self, *, fresh_install: bool) -> None:
+        """旧单层布局的一次性迁移（stamp: runtime/configs/.layout_v2）。
+
+        - 旧布局把客户界面数据存放在 apps/<app>/ 三个 json；本迁移把它们
+          复制到客户层 runtime/configs/<app>/，客户机上随后消费源文件。
         - runtime/configs/<app>/ 是客户层，只装客户自己的设定；全新安装
-          从空开始——绝不把随包默认值整份复制进来，否则客户层按键遮蔽
-          默认值，开发端后续更新默认值的通道会被冻结；
-        - 客户机（JIXIEBI_PACKAGE_ROOT 存在）迁移 = 复制到客户层并消费
-          源文件：旧 json 留在 apps/ 会作为 defaults 层永久遮蔽新的代码层
-          默认值。复制校验失败则保留源文件降级兜底。开发机上 apps json
-          是 git 源码资产，只作 defaults 层，绝不动。
+          从空开始——不把随包默认值整份复制进来，否则客户层按键遮蔽
+          默认值，开发端后续更新默认值的通道会被冻结。
+        - 新布局里 apps/<app>/ json 是开发端随包默认（defaults 层）：
+          客户层按键遮蔽它，它遮蔽代码层默认；stamp 之后随更新包落地的
+          json 不再被本迁移触碰。
         """
         stamp = self.app_config_root / ".layout_v2"
         if stamp.is_file():
@@ -539,7 +575,6 @@ class ConfigManager:
     def _reload_config_for_write(self) -> None:
         self._config = self._load_json(self.config_path, DEFAULT_CONFIG)
         self._normalize_loaded_device_scopes()
-        self._move_config_apikey_to_env()
         self._apply_environment_overrides()
 
     def _reload_outbox_for_write(self) -> None:
@@ -588,15 +623,6 @@ class ConfigManager:
         if changed:
             self._write_config()
 
-    def _move_config_apikey_to_env(self) -> None:
-        global_config = self._config.get("global", {})
-        if not isinstance(global_config, dict) or "apikey" not in global_config:
-            return
-        file_apikey = _normalize_secret_value(global_config.pop("apikey", ""))
-        if file_apikey and not os.getenv("CHATBOT_APIKEY") and not _read_local_apikey(self.config_path):
-            _write_local_apikey(self.config_path, file_apikey)
-        self._write_config()
-
     def _migrate_config(
         self,
         data: dict[str, Any],
@@ -609,14 +635,10 @@ class ConfigManager:
         if not isinstance(legacy_app_configs, dict):
             legacy_app_configs = {}
         devices = migrated.get("devices", [])
-        legacy_app_offsets: dict[str, dict[str, Any]] = {}
         for app_name, app_config in list(legacy_app_configs.items()):
             if not isinstance(app_config, dict):
                 continue
             normalized_app_config = copy.deepcopy(app_config)
-            offsets = _extract_legacy_app_level_offsets(normalized_app_config)
-            if offsets:
-                legacy_app_offsets[str(app_name)] = offsets
             app_level, _, _ = _split_override_scopes(normalized_app_config)
             _merge_app_level_config(
                 self.app_config_root, str(app_name), app_level, defaults_root=self.app_defaults_root
@@ -626,9 +648,8 @@ class ConfigManager:
             for device in migrated["devices"]:
                 if not isinstance(device, dict):
                     continue
-                device.setdefault("selected_app", resolve_app_name(None))
+                device.setdefault("selected_app", _default_app_name())
                 device.setdefault("persona", {})
-                device.setdefault("contact_personas", {})
                 runtime_overrides = device.get("runtime_overrides", {})
                 runtime_overrides = runtime_overrides if isinstance(runtime_overrides, dict) else {}
                 old_app_overrides = device.get("app_overrides", {})
@@ -638,11 +659,6 @@ class ConfigManager:
                 _apply_scoped_app_overrides(
                     self.app_config_root, device, old_app_overrides, defaults_root=self.app_defaults_root
                 )
-                for app_name, offsets in legacy_app_offsets.items():
-                    if str(device.get("selected_app", "")) == app_name or (
-                        isinstance(old_app_overrides, dict) and app_name in old_app_overrides
-                    ):
-                        _merge_device_app_overrides(device, app_name, offsets)
                 _normalize_device_scopes(device)
         return migrated
 
@@ -660,10 +676,6 @@ class ConfigManager:
         return migrated
 
     def _apply_environment_overrides(self) -> None:
-        apikey = _normalize_secret_value(os.getenv("CHATBOT_APIKEY")) or _read_local_apikey(self.config_path)
-        if apikey:
-            self._config.setdefault("global", {})["apikey"] = apikey
-
         devices = self._config.get("devices", [])
         if isinstance(devices, list):
             for device in devices:
@@ -854,14 +866,6 @@ class ConfigManager:
             raise ValueError("at least one key is required")
         with self._lock:
             self._reload_config_for_write()
-            if keys == ("global", "apikey"):
-                apikey = str(value or "").strip()
-                _write_local_apikey(self.config_path, apikey)
-                self._config.setdefault("global", {}).pop("apikey", None)
-                self._write_config()
-                if apikey:
-                    self._config.setdefault("global", {})["apikey"] = apikey
-                return
             current = self._config
             for key in keys[:-1]:
                 current = current.setdefault(key, {})
@@ -869,6 +873,10 @@ class ConfigManager:
                     raise ValueError(f"cannot set nested key under non-dict: {key}")
             current[keys[-1]] = value
             self._write_config()
+
+    def update_global(self, key: str, value: Any) -> None:
+        """写 global 段单键（如 persona_chat_model，docs/13 五节）。"""
+        self.set("global", key, value=value)
 
     def save_outbox_entry(self, entry: dict[str, Any]) -> None:
         fingerprint = entry.get("message_fingerprint")
