@@ -82,3 +82,33 @@ def test_xinyu_list_confirmation_never_falls_back_to_template(monkeypatch):
     )
 
     assert steps._matches_chat_list_screen("list", config) is False
+
+
+def test_check_unread_button_full_fallback_has_no_orphan_calls(monkeypatch):
+    """条带未见未回复入口 → 回退完整 OCR 的路径不得调用已删除的导航缓存函数。
+
+    回归背景：导航合并下线时漏删了回退路径里的调用点，全屏 OCR 跑完后
+    NameError → app_error → 设备复位（2026-09-13 20:05 事故）。
+    """
+    import apps.xinyu.steps as steps_module
+
+    ocr_result = {"result": {"bottom_nav": []}, "ocr_items": []}  # 无未回复入口
+    full_result = {
+        "result": {"bottom_nav": []},
+        "ocr_items": [{"text": "未回复", "x": 0.29, "y": 0.115, "w": 0.13, "h": 0.025}],
+    }
+    monkeypatch.setattr(steps_module, "_run_ocr_mode", lambda *_a, **_k: full_result)
+    monkeypatch.setattr(steps_module, "click_image_point", lambda *a, **k: None)
+    monkeypatch.setattr(steps_module, "capture_after_popups", lambda *a, **k: "screen")
+    monkeypatch.setattr(steps_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        steps_module,
+        "_red_pixel_stats",
+        lambda _i, _m: {"has_red": True, "red_pixels": 400, "total_pixels": 7000, "threshold": 14, "region": [0, 0, 1, 1]},
+    )
+    for gone in ("_cache_list_navigation_result", "_merge_list_navigation_result"):
+        assert not hasattr(steps_module, gone)
+
+    image, checked = steps_module.check_unread_button(object(), dict(DEFAULT_CONFIG), image="screen", ocr_result=ocr_result)
+
+    assert checked["_xinyu_unread_tab_has_red"] is True  # 全屏结果里找到入口并确认红色

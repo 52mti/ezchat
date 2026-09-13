@@ -1899,7 +1899,7 @@ def check_unread_button(
         _report(reporter, "unread_button_check", "当前 OCR 未找到未回复入口，回退完整 OCR")
         full_ocr = _run_ocr_mode(current_image, cfg, "list", region=None)
         _cache_bottom_nav_from_ocr_result(cfg, full_ocr)
-        _cache_list_navigation_result(cfg, full_ocr, current_image)
+        _cache_list_compact_region_from_ocr_result(cfg, full_ocr)
         unread_item = _unread_tab_item(full_ocr)
         if unread_item is not None:
             ocr_result = full_ocr
