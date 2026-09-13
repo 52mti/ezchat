@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import copy
 import html
@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import requests
-from PyQt6.QtCore import QPoint, QRect, Qt, QTimer, QUrl, QThread, pyqtSignal
+from PyQt6.QtCore import QPoint, QRect, Qt, QLockFile, QTimer, QUrl, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QFont, QImage, QPainter, QPen, QPixmap, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
@@ -57,12 +57,12 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from apps import get_default_app_name, get_registered_apps, resolve_app_name
 from services.defaults import DEFAULT_RUNTIME_CONFIG, with_app_defaults
 from apps.coordinates import robot_point_with_jitter
-from services.photo_capture import capture_transform_image
+from services.photo_capture import capture_transform_image, ensure_photo_root
 from apps.visual_assets import (
     CHAT_LIST_SCREEN,
     CHAT_WINDOW_SCREEN,
@@ -91,7 +91,8 @@ from apps.visual_assets import (
     template_variant_paths,
     template_path,
 )
-from vision import get_ocr_queue_status, match, run_ocr_mode
+from apps import run_ocr_mode_for
+from vision import get_ocr_queue_status, match
 from lgb.lgb import RobotInterface, scan_devices
 from services import (
     ChatHistoryStore,
@@ -113,16 +114,6 @@ from vision.screen import ensure_portrait_image
 from workers import DeviceWorker, WorkerEvent
 from workers.device_worker import is_stale_worker_event
 
-
-PERSONA_PRESETS: tuple[tuple[str, str], ...] = (
-    ("偶尔开车", "REMOVED-BEARER-TOKEN"),
-    ("特别素", "REMOVED-BEARER-TOKEN"),
-    ("心遇优化版", "REMOVED-BEARER-TOKEN"),
-    ("漂流瓶引诱", "REMOVED-BEARER-TOKEN"),
-    ("引导视频（概率）", "REMOVED-BEARER-TOKEN"),
-    ("引导视频（纯）", "REMOVED-BEARER-TOKEN"),
-)
-CUSTOM_PERSONA_LABEL = "自定义"
 
 
 def _pixmap_from_pil_image(image: Image.Image) -> QPixmap:
@@ -161,6 +152,139 @@ class DeviceScreenshotThread(QThread):
             self.failed.emit(str(exc))
 
 
+class VisionCalibrationThread(QThread):
+    """后台执行一次视觉+OCR 标定；截图与配置由调用方预先准备好。"""
+
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        app_config: dict[str, Any],
+        image: Any | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.app_config = app_config
+        self.image = image
+
+    def run(self) -> None:
+        try:
+            from apps.xinyu import steps as xinyu_steps
+
+            device_ip = str(self.app_config.get("_runtime", {}).get("device_ip", "") or "")
+            result = xinyu_steps.calibrate_dialogue_chat_area(
+                RobotInterface(device_ip),
+                self.app_config,
+                image=self.image,
+            )
+            self.completed.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class VisionCalibrationDialog(QDialog):
+    """实时标定窗口：先显示当前截图与“标定中...”，成功后把学到的范围画上去。"""
+
+    def __init__(self, image: Image.Image, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("视觉+OCR标定")
+        self.resize(560, 880)
+        self._canvas = image.convert("RGB").copy()
+        self._annotated = False
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+
+        self.image_label = QLabel()
+        self._refresh_pixmap()
+        root.addWidget(self.image_label)
+
+        self.status_label = QLabel("标定中...（视觉+OCR 识别约需十几秒，请稍候）")
+        status_font = self.status_label.font()
+        status_font.setBold(True)
+        self.status_label.setFont(status_font)
+        self.status_label.setStyleSheet("color: #b36b00;")
+        self.status_label.setWordWrap(True)
+        root.addWidget(self.status_label)
+
+        self.detail_label = QLabel("")
+        self.detail_label.setWordWrap(True)
+        root.addWidget(self.detail_label)
+
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+        root.addWidget(close_button, 0, Qt.AlignmentFlag.AlignRight)
+
+    def _refresh_pixmap(self) -> None:
+        pixmap = _pixmap_from_pil_image(self._canvas)
+        self.image_label.setPixmap(pixmap.scaledToHeight(680, Qt.TransformationMode.SmoothTransformation))
+
+    def set_result(self, result: dict[str, Any]) -> None:
+        chat_area = result.get("chat_area_dynamic")
+        dialogue_message = result.get("dialogue_message")
+        lines: list[str] = []
+        drew_any = False
+        draw = ImageDraw.Draw(self._canvas)
+        width, height = self._canvas.size
+        for region, color, label in (
+            (chat_area, (232, 32, 32), "红框 聊天识别区域 chat_area_dynamic"),
+            (dialogue_message, (36, 96, 232), "蓝框 消息OCR条带 dialogue_message"),
+        ):
+            if isinstance(region, (list, tuple)) and len(region) >= 4:
+                try:
+                    x, y, w, h = (float(value) for value in region[:4])
+                except (TypeError, ValueError):
+                    lines.append(f"{label}：数值无效")
+                    continue
+                draw.rectangle(
+                    [x * width, y * height, (x + w) * width, (y + h) * height],
+                    outline=color,
+                    width=3,
+                )
+                drew_any = True
+                lines.append(f"{label}：[{x:.3f}, {y:.3f}, {w:.3f}, {h:.3f}]")
+            else:
+                lines.append(f"{label}：未学到")
+        self.detail_label.setText("\n".join(lines))
+        if result.get("ok") and drew_any:
+            self.status_label.setText("标定完成，聊天区域已写入坐标缓存")
+            self.status_label.setStyleSheet("color: #1d7a2e;")
+        else:
+            reason = str(result.get("reason") or "未知原因")
+            self.status_label.setText(f"标定未生效：{reason}")
+            self.status_label.setStyleSheet("color: #c22f2f;")
+        if drew_any:
+            self._refresh_pixmap()
+
+    def set_error(self, message: str) -> None:
+        self.status_label.setText(f"标定失败：{message}")
+        self.status_label.setStyleSheet("color: #c22f2f;")
+
+
+class _PersonaNetworkThread(QThread):
+    """人设 tab 的 DeepSeek 网络调用（连通性测试 / 模型列表）后台执行。
+
+    result_ready 携带 list[str]（成功）或 str（错误信息）；key 为空时回退 .env。
+    """
+
+    result_ready = pyqtSignal(object)
+
+    def __init__(self, api_key: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.api_key = api_key.strip()
+
+    def run(self) -> None:
+        from services.deepseek_client import DeepSeekClient
+
+        try:
+            client = DeepSeekClient(api_key=self.api_key) if self.api_key else DeepSeekClient()
+            models = client.list_models()
+        except Exception as exc:  # noqa: BLE001 - UI 需要把任何失败变成可读文案
+            self.result_ready.emit(str(exc))
+            return
+        self.result_ready.emit([str(model) for model in models])
+
+
 class TemplatePreviewThread(QThread):
     """模板匹配预览在后台执行，避免多模板检测卡住设置窗口。"""
 
@@ -185,16 +309,17 @@ class OcrPreviewThread(QThread):
     completed = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, image: Image.Image, config: dict[str, Any], mode: str, region: Any, parent: QWidget | None = None) -> None:
+    def __init__(self, image: Image.Image, config: dict[str, Any], mode: str, region: Any, app_name: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.image = image.copy()
         self.config = copy.deepcopy(config)
         self.mode = mode
         self.region = copy.deepcopy(region)
+        self.engine = run_ocr_mode_for(app_name)
 
     def run(self) -> None:
         try:
-            self.completed.emit(run_ocr_mode(self.image, self.config, self.mode, region=self.region))
+            self.completed.emit(self.engine(self.image, self.config, self.mode, region=self.region))
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -207,53 +332,6 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             merged[key] = copy.deepcopy(value)
     return merged
-
-
-def _create_request_persona_selector(current_value: str) -> tuple[QWidget, QComboBox, QLineEdit]:
-    current = str(current_value or "").strip()
-    container = QWidget()
-    layout = QHBoxLayout(container)
-    layout.setContentsMargins(0, 0, 0, 0)
-    layout.setSpacing(8)
-
-    combo = QComboBox()
-    for label, persona_id in PERSONA_PRESETS:
-        combo.addItem(label, persona_id)
-    combo.addItem(CUSTOM_PERSONA_LABEL, "")
-
-    custom_input = QLineEdit()
-    custom_input.setPlaceholderText("请输入人设授权 ID")
-
-    matched_index = -1
-    for index, (_label, persona_id) in enumerate(PERSONA_PRESETS):
-        if persona_id == current:
-            matched_index = index
-            break
-    if matched_index >= 0:
-        combo.setCurrentIndex(matched_index)
-        custom_input.setText("")
-    else:
-        combo.setCurrentText(CUSTOM_PERSONA_LABEL)
-        custom_input.setText(current)
-
-    def sync_custom_input() -> None:
-        is_custom = combo.currentText() == CUSTOM_PERSONA_LABEL
-        custom_input.setVisible(is_custom)
-        custom_input.setEnabled(is_custom)
-
-    combo.currentIndexChanged.connect(lambda _index: sync_custom_input())
-    sync_custom_input()
-
-    layout.addWidget(combo, 0)
-    layout.addWidget(custom_input, 1)
-    return container, combo, custom_input
-
-
-def _request_persona_value(combo: QComboBox, custom_input: QLineEdit) -> str:
-    selected = combo.currentData()
-    if combo.currentText() == CUSTOM_PERSONA_LABEL:
-        return custom_input.text().strip()
-    return str(selected or "").strip()
 
 
 def _ocr_device_label_from_backend(backend: object) -> str:
@@ -583,7 +661,10 @@ class MainWindow(QMainWindow):
         self.events: "queue.Queue[WorkerEvent]" = queue.Queue()
         self.update_events: "queue.Queue[tuple[str, dict[str, Any]]]" = queue.Queue()
         self.workers: dict[str, DeviceWorker] = {}
+        self.monitor_wall_window = None
         self._device_scan_running = False
+        self._vision_calibration_thread: VisionCalibrationThread | None = None
+        self._vision_calibration_dialog: VisionCalibrationDialog | None = None
         self.log_events: "deque[tuple[str, str]]" = deque(maxlen=LOG_EVENT_LIMIT)
         self._last_unattended_refresh_at = 0.0
         self.unattended_started_at: dict[str, float] = {}
@@ -617,19 +698,12 @@ class MainWindow(QMainWindow):
         top_bar = QHBoxLayout(top_panel)
         top_bar.setContentsMargins(12, 10, 12, 10)
         top_bar.setSpacing(8)
-        top_bar.addWidget(QLabel("API Key"))
-        self.apikey_input = QLineEdit(mask_secret(self.config_manager.get("global", "apikey", default="")))
-        self.apikey_input.setEchoMode(QLineEdit.EchoMode.Password)
-        top_bar.addWidget(self.apikey_input)
-        self.save_apikey_button = self._button("保存", "primary")
-        self.save_apikey_button.clicked.connect(self._save_apikey)
-        top_bar.addWidget(self.save_apikey_button)
-        top_bar.addSpacing(8)
         top_bar.addWidget(QLabel("OCR并发"))
         self.ocr_concurrency_input = NoWheelSpinBox()
         self.ocr_concurrency_input.setRange(1, 16)
         self.ocr_concurrency_input.setFixedWidth(72)
         self.ocr_concurrency_input.setValue(int(self.config_manager.get("global", "ocr_max_concurrency", default=1) or 1))
+        self.ocr_concurrency_input.valueChanged.connect(self._save_ocr_concurrency)
         top_bar.addWidget(self.ocr_concurrency_input)
         top_bar.addSpacing(12)
         top_bar.addWidget(QLabel("设备 IP"))
@@ -654,6 +728,10 @@ class MainWindow(QMainWindow):
         self.ocr_queue_label.setToolTip("当前等待 OCR 并发槽位的任务数量")
         top_bar.addWidget(self.ocr_queue_label)
         top_bar.addStretch(1)
+        self.monitor_wall_button = self._button("打开监控墙")
+        self.monitor_wall_button.setToolTip("实时查看每台设备 worker 最近一次截图请求的画面")
+        self.monitor_wall_button.clicked.connect(self._open_monitor_wall)
+        top_bar.addWidget(self.monitor_wall_button)
         layout.addWidget(top_panel)
 
         summary_panel = QFrame()
@@ -1399,12 +1477,21 @@ class MainWindow(QMainWindow):
             self._load_devices()
             self._append_log_line(device_ip, f"[{time.strftime('%H:%M:%S')}] [info] {device_ip}: device removed")
 
-    def _save_apikey(self) -> None:
-        value = self.apikey_input.text().strip()
-        if value and not value.startswith("****"):
-            self.config_manager.set("global", "apikey", value=value)
-            self.apikey_input.setText(mask_secret(value))
+    def _save_ocr_concurrency(self) -> None:
         self.config_manager.set("global", "ocr_max_concurrency", value=self.ocr_concurrency_input.value())
+
+    def _open_monitor_wall(self) -> None:
+        """监控墙：吸附在主窗口右侧的独立弹窗（不压缩主界面），按钮切换显示/隐藏。"""
+        from ui.monitor_wall import MonitorWallWindow
+
+        if self.monitor_wall_window is None:
+            self.monitor_wall_window = MonitorWallWindow(self.config_manager.devices, self)
+        visible = not self.monitor_wall_window.isVisible()
+        self.monitor_wall_window.setVisible(visible)
+        if visible:
+            self.monitor_wall_window._sync_position()
+            self.monitor_wall_window.raise_()
+        self.monitor_wall_button.setText("收起监控墙" if visible else "打开监控墙")
 
     def _add_device(self) -> None:
         device_ip = self.device_ip_input.text().strip()
@@ -1417,7 +1504,6 @@ class MainWindow(QMainWindow):
                 "license_expires": "",
                 "selected_app": get_default_app_name(),
                 "persona": {},
-                "contact_personas": {},
                 "app_overrides": self._default_app_overrides(),
             }
         )
@@ -1462,7 +1548,6 @@ class MainWindow(QMainWindow):
                     "license_expires": "",
                     "selected_app": get_default_app_name(),
                     "persona": {},
-                    "contact_personas": {},
                     "app_overrides": self._default_app_overrides(),
                 }
             ):
@@ -1565,12 +1650,14 @@ class MainWindow(QMainWindow):
         dialog_config = _deep_merge(_app_default_config(app_name), self.config_manager.get_app_overrides(app_name))
         dialog_config = _deep_merge(dialog_config, self.config_manager.get_device_runtime_overrides(device_ip))
         dialog_config = _deep_merge(dialog_config, self.config_manager.get_device_app_overrides(device_ip, app_name))
+        dialog_config["persona_chat_model"] = str(self.config_manager.get("global", "persona_chat_model", default="") or "")
         dialog = AppConfigDialog(
             dialog_config,
             device_ip=device_ip,
             app_name=app_name,
             template_root=template_root,
             on_reset_visual_recognition=lambda: self._reset_visual_recognition(device_ip, app_name),
+            on_calibrate_vision=lambda finisher: self._calibrate_vision(device_ip, app_name, finisher),
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1594,18 +1681,32 @@ class MainWindow(QMainWindow):
             for key in ("poll_interval", "step_timeout", "keep_awake_interval_seconds", "exclude_ocr_wait_from_step_timeout")
             if key in values
         }
-        persona = values.get("persona", {})
+        persona_keys = (
+            "persona_profile_json",
+            "greetings_txt",
+            "judge_enabled",
+            "greeting_ai_enabled",
+            "history_turns",
+            "summary_interval",
+        )
         device_app_updates = {
             key: copy.deepcopy(values[key])
-            for key in ("photo_sent_cooldown_seconds", "online_photo_send_count")
+            for key in ("photo_sent_cooldown_seconds", "online_photo_send_count", *persona_keys)
             if key in values
         }
-        if isinstance(persona, dict):
-            device_app_updates["persona"] = copy.deepcopy(persona)
 
         self.config_manager.update_app_config(app_name, app_updates)
         self.config_manager.update_device_runtime(device_ip, runtime_updates)
         self.config_manager.update_device_app_overrides(device_ip, app_name, device_app_updates)
+        # 人设 AI 新链路（docs/13 五节）：模型为机器级（global），key 只写 .env
+        model = str(values.get("persona_chat_model", "") or "").strip()
+        if model:
+            self.config_manager.update_global("persona_chat_model", model)
+        api_key = str(values.get("deepseek_api_key", "") or "").strip()
+        if api_key:
+            from services.deepseek_client import write_local_api_key
+
+            write_local_api_key(None, api_key)
         QMessageBox.information(self, "配置", f"{device_ip} / {app_name} 配置已保存")
 
     def _reset_visual_recognition(self, device_ip: str, app_name: str) -> None:
@@ -1625,6 +1726,107 @@ class MainWindow(QMainWindow):
             f"[{time.strftime('%H:%M:%S')}] [info] {device_ip}: {app_name} 视觉识别已重置",
         )
         QMessageBox.information(self, "重置视觉识别", f"{device_ip} / {app_name} 已重置，可重新启动视觉识别。")
+
+    def _calibrate_vision(self, device_ip: str, app_name: str, on_done: Any = None) -> None:
+        def _release_button() -> None:
+            if callable(on_done):
+                try:
+                    on_done()
+                except RuntimeError:
+                    pass  # 设置窗口可能已被用户关闭
+
+        if self._vision_calibration_thread is not None and self._vision_calibration_thread.isRunning():
+            QMessageBox.information(self, "视觉+OCR识别", "上一次标定还在执行，请稍候。")
+            _release_button()
+            return
+        answer = QMessageBox.question(
+            self,
+            "视觉+OCR识别一次",
+            "请先让设备停留在某个聊天窗口（对话界面）再继续。\n"
+            "将立即执行一次视觉+OCR 识别并把聊天区域写入坐标缓存。\n"
+            "手动标定不消耗视觉识别额度。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            _release_button()
+            return
+        # 用完整配置同步截图（约 1~2 秒）：既拿到弹窗要显示的画面，
+        # 也在此完成透视签名同步与坐标缓存加载，标定结果才能正确落盘。
+        from services.defaults import with_app_defaults
+
+        app_config = with_app_defaults(self.config_manager.get_app_config(device_ip, app_name, {}))
+        app_config["_runtime"] = {"device_ip": device_ip, "app_name": app_name}
+        app_config["_runtime_cache"] = {}
+        self._append_log_line(
+            device_ip,
+            f"[{time.strftime('%H:%M:%S')}] [info] {device_ip}: 开始视觉+OCR标定...",
+        )
+        try:
+            image_bytes = capture_transform_image(
+                RobotInterface(device_ip),
+                app_config,
+                pre_move=True,
+                label="vision_calibration",
+            )
+            calibration_image = ensure_portrait_image(image_bytes)
+        except Exception as exc:
+            self._append_log_line(
+                device_ip,
+                f"[{time.strftime('%H:%M:%S')}] [error] {device_ip}: 视觉标定截图失败：{exc}",
+            )
+            QMessageBox.critical(self, "视觉+OCR识别", f"无法获取设备截图：{exc}")
+            _release_button()
+            return
+        dialog = VisionCalibrationDialog(calibration_image, parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.destroyed.connect(lambda: setattr(self, "_vision_calibration_dialog", None))
+        self._vision_calibration_dialog = dialog
+        dialog.show()
+        thread = VisionCalibrationThread(app_config, image=calibration_image, parent=self)
+        self._vision_calibration_thread = thread
+        thread.completed.connect(lambda result: self._on_vision_calibration_done(device_ip, result))
+        thread.failed.connect(lambda message: self._on_vision_calibration_failed(device_ip, message))
+        thread.finished.connect(lambda: self._finish_vision_calibration(thread))
+        thread.start()
+
+    def _deliver_calibration_result(self, payload: dict[str, Any]) -> None:
+        dialog = self._vision_calibration_dialog
+        if dialog is None:
+            return
+        try:
+            if "reason" in payload and payload.get("is_error"):
+                dialog.set_error(str(payload.get("reason")))
+            else:
+                dialog.set_result(payload)
+        except RuntimeError:
+            pass  # 用户已关闭标定窗口
+
+    def _on_vision_calibration_done(self, device_ip: str, result: dict[str, Any]) -> None:
+        self._deliver_calibration_result(result)
+        if result.get("ok"):
+            self._append_log_line(
+                device_ip,
+                f"[{time.strftime('%H:%M:%S')}] [info] {device_ip}: 视觉标定完成 "
+                f"chat_area={result.get('chat_area_dynamic')} dialogue_message={result.get('dialogue_message')}",
+            )
+        else:
+            self._append_log_line(
+                device_ip,
+                f"[{time.strftime('%H:%M:%S')}] [warning] {device_ip}: 视觉标定未生效：{result.get('reason')}",
+            )
+
+    def _on_vision_calibration_failed(self, device_ip: str, message: str) -> None:
+        self._deliver_calibration_result({"is_error": True, "reason": message})
+        self._append_log_line(
+            device_ip,
+            f"[{time.strftime('%H:%M:%S')}] [error] {device_ip}: 视觉标定失败：{message}",
+        )
+
+    def _finish_vision_calibration(self, thread: VisionCalibrationThread) -> None:
+        if self._vision_calibration_thread is thread:
+            self._vision_calibration_thread = None
+        thread.deleteLater()
 
     def _edit_device_settings(self, row: int) -> None:
         device = self._device_for_row(row)
@@ -1808,83 +2010,12 @@ class MainWindow(QMainWindow):
             contact = str(payload.get("contact", "") or "")
             content = str(payload.get("content", "") or "")
             return f"[{event.level}] {event.device_ip}: 心遇发送后未能返回列表 [{contact}] {content}"
-        if event.message == "huanyou_balance":
-            return f"[{event.level}] {event.device_ip}: 欢友余额 {payload.get('balance', '')}"
-        if event.message == "huanyou_balance_failed":
-            return f"[{event.level}] {event.device_ip}: 欢友余额读取失败 {payload.get('error', '')}"
-        if event.message == "huanyou_message_input":
-            contact = str(payload.get("contact", "") or "")
-            content = str(payload.get("content", "") or "")
-            source = str(payload.get("source", "") or "")
-            return f"[{event.level}] {event.device_ip}: 欢友输入来源 {source} [{contact}] {content}"
-        if event.message == "huanyou_reply_text":
-            contact = str(payload.get("contact", "") or "")
-            reply_text = str(payload.get("reply_text", "") or "")
-            if bool(payload.get("skip")):
-                reason = str(payload.get("reason", "") or "")
-                return f"[{event.level}] {event.device_ip}: 欢友跳过 [{contact}] {reason}"
-            return f"[{event.level}] {event.device_ip}: 欢友回复 [{contact}] {reply_text}"
-        if event.message == "huanyou_round_metrics":
-            reuse_text = ""
-            if payload.get("ocr_cache_hit_count", 0) or payload.get("detection_cache_hit_count", 0):
-                reuse_text = (
-                    f"复用 OCR {payload.get('ocr_cache_hit_count', 0)} 次，"
-                    f"复用检测 {payload.get('detection_cache_hit_count', 0)} 次，"
-                )
-            return (
-                f"[{event.level}] {event.device_ip}: 欢友本轮统计 "
-                f"OCR {payload.get('ocr_count', '')} 次，{reuse_text}截图 {payload.get('capture_count', '')} 次，"
-                f"耗时 {payload.get('seconds', '')} 秒"
-            )
-        if event.message == "huanyou_new_greetings":
-            return f"[{event.level}] {event.device_ip}: 欢友新招呼处理 {payload.get('count', '')} 次"
-        if event.message == "huanyou_chat_window_swipe":
-            start = payload.get("start", {}) if isinstance(payload.get("start", {}), dict) else {}
-            end = payload.get("end", {}) if isinstance(payload.get("end", {}), dict) else {}
-            return (
-                f"[{event.level}] {event.device_ip}: 欢友聊天上滑 "
-                f"({start.get('x', '')}, {start.get('y', '')}) -> ({end.get('x', '')}, {end.get('y', '')})"
-            )
-        if event.message == "huanyou_send_clicks":
-            return f"[{event.level}] {event.device_ip}: 欢友发送点击次数 {payload.get('clicks', '')}"
-        if event.message == "huanyou_contact_send_count":
-            contact = str(payload.get("contact", "") or "")
-            count = payload.get("count", "")
-            return f"[{event.level}] {event.device_ip}: 欢友本次启动已给 [{contact}] 发送 {count} 次"
-        if event.message == "huanyou_next_chat_verified":
-            previous = str(payload.get("previous_name", "") or "")
-            current = str(payload.get("current_name", "") or "")
-            clicks = payload.get("clicks", "")
-            return f"[{event.level}] {event.device_ip}: 欢友下一条已切人 {previous} -> {current}，点击 {clicks} 次"
-        if event.message == "huanyou_next_chat_missing":
-            previous = str(payload.get("previous_name", "") or "")
-            reason = str(payload.get("reason", "") or "")
-            return f"[{event.level}] {event.device_ip}: 欢友未找到下一条 [{previous}] {reason}"
-        if event.message == "huanyou_input_box_retracted":
-            return f"[{event.level}] {event.device_ip}: 欢友已收回输入框 ({payload.get('x', '')}, {payload.get('y', '')})"
-        if event.message == "huanyou_target_selected":
-            name = str(payload.get("name", "") or "")
-            content = str(payload.get("content", "") or "")
-            unread_count = payload.get("unread_count")
-            favorability = payload.get("favorability")
-            return f"[{event.level}] {event.device_ip}: 欢友选中目标 [{name}] 未读 {unread_count} 好感度 {favorability} 内容：{content}"
-        if event.message == "huanyou_startup_back_button_cached":
-            return f"[{event.level}] {event.device_ip}: 欢友启动检查已缓存返回按钮"
-        if event.message == "huanyou_startup_back_button_missing":
-            return f"[{event.level}] {event.device_ip}: 欢友启动检查未找到返回按钮，停止进程 {payload.get('error', '')}"
         if event.message == "no_phone_detected":
             return f"[{event.level}] {event.device_ip}: 检测到无手机 {payload.get('error', '')}"
         if event.message == "black_screen_detected":
             return f"[{event.level}] {event.device_ip}: 检测到黑屏 {payload.get('error', '')}"
         if event.message == "keep_awake_failed":
             return f"[{event.level}] {event.device_ip}: 防熄屏失败 {payload.get('error', '')}"
-        if event.message.startswith("欢友步骤不可用："):
-            count = payload.get("error_count", "")
-            threshold = payload.get("circuit_breaker_threshold", "")
-            if count != "" and threshold != "":
-                return f"[{event.level}] {event.device_ip}: {event.message}（错误计数 {count}/{threshold}）"
-            return f"[{event.level}] {event.device_ip}: {event.message}"
-        if event.message == "app_error":
             label = str(payload.get("label", "") or payload.get("step", "") or "")
             error = str(payload.get("error", "") or "")
             count = payload.get("error_count", "")
@@ -2105,382 +2236,8 @@ class MainWindow(QMainWindow):
                 self._finalize_unattended_timer(event_ip)
             detail = str(payload.get("detail", "") or "")
             self._set_row_status(event_ip, message, detail)
-        elif message in {"xinyu_balance", "huanyou_balance"}:
+        elif message == "xinyu_balance":
             self._set_row_balance(event_ip, str(payload.get("balance", "") or ""))
-
-class _LegacyAppConfigDialog(QDialog):
-    def __init__(
-        self,
-        overrides: dict[str, Any],
-        device_ip: str,
-        app_name: str,
-        template_root: Path,
-        on_reset_visual_recognition: Callable[[], None] | None = None,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.overrides = with_app_defaults(overrides)
-        self.device_ip = device_ip
-        self.app_name = app_name
-        self.template_root = template_root
-        self._on_reset_visual_recognition = on_reset_visual_recognition
-        self.setWindowTitle(f"App 配置 - {device_ip} / {app_name}")
-        self.resize(840, 620)
-        root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
-
-        header_panel = QFrame()
-        header_panel.setObjectName("DialogPanel")
-        header_layout = QVBoxLayout(header_panel)
-        header_layout.setContentsMargins(14, 12, 14, 12)
-        header_layout.setSpacing(4)
-        title = QLabel(f"设备配置 / {device_ip} / {app_name}")
-        title.setObjectName("DialogTitle")
-        header_layout.addWidget(title)
-        scope = QLabel("当前设置只作用于这台设备当前选中的 App，包括运行参数、模板和人设。")
-        scope.setObjectName("HelperLabel")
-        header_layout.addWidget(scope)
-        root.addWidget(header_panel)
-
-        tabs = QTabWidget()
-        tabs.setDocumentMode(True)
-        root.addWidget(tabs)
-
-        config_page = QWidget()
-        config_root = QVBoxLayout(config_page)
-        config_root.setContentsMargins(0, 0, 0, 0)
-        config_root.setSpacing(10)
-        runtime_panel = QFrame()
-        runtime_panel.setObjectName("InsetPanel")
-        runtime_layout = QVBoxLayout(runtime_panel)
-        runtime_layout.setContentsMargins(14, 12, 14, 12)
-        runtime_layout.setSpacing(8)
-        runtime_title = QLabel("运行参数")
-        runtime_title.setObjectName("SectionLabel")
-        runtime_layout.addWidget(runtime_title)
-        runtime_help = QLabel("这些参数只影响当前设备当前 App 的识别轮询和匹配策略。")
-        runtime_help.setObjectName("HelperLabel")
-        runtime_layout.addWidget(runtime_help)
-        coordinate_help = QLabel("OCR、模板匹配、联动测试和实际点击统一使用竖屏归一化坐标，当前调试阶段不再额外转换点击坐标。")
-        coordinate_help.setObjectName("HelperLabel")
-        coordinate_help.setWordWrap(True)
-        runtime_layout.addWidget(coordinate_help)
-        layout = QFormLayout()
-        layout.setContentsMargins(0, 4, 0, 0)
-        layout.setSpacing(10)
-        runtime_layout.addLayout(layout)
-        config_root.addWidget(runtime_panel)
-
-        self.poll_interval = QSpinBox()
-        self.poll_interval.setRange(1, 3600)
-        self.poll_interval.setValue(int(overrides.get("poll_interval", 1)))
-        layout.addRow("轮询间隔（秒）", self.poll_interval)
-
-        self.step_timeout = QSpinBox()
-        self.step_timeout.setRange(1, 300)
-        self.step_timeout.setValue(int(overrides.get("step_timeout", 10)))
-        layout.addRow("单步超时（秒）", self.step_timeout)
-
-        self.photo_sent_cooldown_seconds = QSpinBox()
-        self.photo_sent_cooldown_seconds.setRange(0, 2592000)
-        self.photo_sent_cooldown_seconds.setValue(int(overrides.get("photo_sent_cooldown_seconds", 86400)))
-        layout.addRow("心遇同一用户发图冷却（秒，0不限制）", self.photo_sent_cooldown_seconds)
-
-        self.match_threshold = QDoubleSpinBox()
-        self.match_threshold.setRange(0.1, 1.0)
-        self.match_threshold.setSingleStep(0.01)
-        self.match_threshold.setValue(float(overrides.get("match_threshold", 0.7)))
-        self.popup_match_threshold = QDoubleSpinBox()
-        self.popup_match_threshold.setRange(0.1, 1.0)
-        self.popup_match_threshold.setSingleStep(0.01)
-        self.popup_match_threshold.setValue(float(overrides.get("popup_match_threshold", 0.8)))
-        layout.addRow("\u5f39\u7a97\u9608\u503c", self.popup_match_threshold)
-        layout.addRow("模板阈值", self.match_threshold)
-
-        ocr = overrides.get("ocr", {}) if isinstance(overrides.get("ocr", {}), dict) else {}
-        self.det_db_thresh = QDoubleSpinBox()
-        self.det_db_thresh.setRange(0.0, 1.0)
-        self.det_db_thresh.setSingleStep(0.01)
-        self.det_db_thresh.setValue(float(ocr.get("det_db_thresh", 0.3)))
-        layout.addRow("OCR det_db_thresh", self.det_db_thresh)
-
-        self.rec_thresh = QDoubleSpinBox()
-        self.rec_thresh.setRange(0.0, 1.0)
-        self.rec_thresh.setSingleStep(0.01)
-        self.rec_thresh.setValue(float(ocr.get("rec_thresh", 0.5)))
-        layout.addRow("OCR rec_thresh", self.rec_thresh)
-
-        ocr_modes = overrides.get("ocr_modes", {}) if isinstance(overrides.get("ocr_modes", {}), dict) else {}
-        self.ocr_mode_fields: dict[str, dict[str, Any]] = {}
-        for mode_key, mode_label in [("dialogue", "\u5bf9\u8bdd\u6a21\u5f0f"), ("list", "\u5217\u8868\u6a21\u5f0f"), ("points", "\u79ef\u5206\u6a21\u5f0f")]:
-            mode_config = ocr_modes.get(mode_key, {}) if isinstance(ocr_modes.get(mode_key, {}), dict) else {}
-            preprocess = mode_config.get("preprocess", {}) if isinstance(mode_config.get("preprocess", {}), dict) else {}
-            rules = mode_config.get("rules", {}) if isinstance(mode_config.get("rules", {}), dict) else {}
-
-            mode_panel = QFrame()
-            mode_panel.setObjectName("InsetPanel")
-            mode_panel_layout = QFormLayout(mode_panel)
-            mode_panel_layout.setContentsMargins(12, 10, 12, 10)
-            mode_panel_layout.setSpacing(8)
-
-            preprocess_box = QComboBox()
-            preprocess_box.addItems(["original"])
-            preprocess_box.setCurrentText("original")
-            mode_panel_layout.addRow(f"{mode_label} 预处理", preprocess_box)
-
-            scale_box = QSpinBox()
-            scale_box.setRange(1, 4)
-            scale_box.setValue(int(preprocess.get("scale", 2)))
-            mode_panel_layout.addRow(f"{mode_label} 放大倍数", scale_box)
-
-            min_confidence = QDoubleSpinBox()
-            min_confidence.setRange(0.0, 1.0)
-            min_confidence.setSingleStep(0.01)
-            min_confidence.setValue(float(rules.get("min_confidence", 0.3)))
-            mode_panel_layout.addRow(f"{mode_label} 最低置信度", min_confidence)
-
-            min_height = QDoubleSpinBox()
-            min_height.setRange(0.0, 0.2)
-            min_height.setSingleStep(0.005)
-            min_height.setDecimals(3)
-            min_height.setValue(float(rules.get("min_box_height_ratio", 0.02)))
-            mode_panel_layout.addRow(f"{mode_label} 最小框高比例", min_height)
-
-            fields: dict[str, Any] = {
-                "preprocess": preprocess_box,
-                "scale": scale_box,
-                "min_confidence": min_confidence,
-                "min_box_height_ratio": min_height,
-            }
-            self.ocr_mode_fields[mode_key] = fields
-            runtime_layout.addWidget(mode_panel)
-
-        config_root.addStretch(1)
-        tabs.addTab(config_page, "运行设置")
-
-        template_page = QWidget()
-        template_layout = QVBoxLayout(template_page)
-        template_layout.setContentsMargins(0, 0, 0, 0)
-        self.template_manager = TemplateManagerWidget(
-            template_root,
-            self.device_ip,
-            self.app_name,
-            self.overrides,
-            show_offset_controls=False,
-            parent=template_page,
-        )
-        template_layout.addWidget(self.template_manager)
-        tabs.addTab(template_page, "模板管理")
-
-        persona_page = QWidget()
-        persona_root = QVBoxLayout(persona_page)
-        persona_root.setContentsMargins(0, 0, 0, 0)
-        persona_root.setSpacing(10)
-        persona_panel = QFrame()
-        persona_panel.setObjectName("InsetPanel")
-        persona_panel_layout = QVBoxLayout(persona_panel)
-        persona_panel_layout.setContentsMargins(14, 12, 14, 12)
-        persona_panel_layout.setSpacing(8)
-        persona_title = QLabel("人设参数")
-        persona_title.setObjectName("SectionLabel")
-        persona_panel_layout.addWidget(persona_title)
-        persona_help = QLabel("AI 回复时会优先使用这里的人设，覆盖全局默认值。")
-        persona_help.setObjectName("HelperLabel")
-        persona_panel_layout.addWidget(persona_help)
-        persona_layout = QFormLayout()
-        persona_layout.setContentsMargins(0, 4, 0, 0)
-        persona_layout.setSpacing(10)
-        persona = overrides.get("persona", {}) if isinstance(overrides.get("persona", {}), dict) else {}
-        self.persona_inputs: dict[str, QLineEdit] = {}
-        persona_selector, self.request_persona_combo, self.request_persona_custom_input = _create_request_persona_selector(
-            str(persona.get("requestPersona", ""))
-        )
-        persona_layout.addRow("人设授权 ID", persona_selector)
-        for key, label in [
-            ("name", "名字"),
-            ("age", "年龄"),
-            ("work", "职业"),
-            ("location", "住址"),
-            ("renshe", "自定义人设"),
-        ]:
-            line = QLineEdit(str(persona.get(key, "")))
-            self.persona_inputs[key] = line
-            persona_layout.addRow(label, line)
-        persona_panel_layout.addLayout(persona_layout)
-        persona_root.addWidget(persona_panel)
-        persona_root.addStretch(1)
-        tabs.addTab(persona_page, "人设")
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
-        cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
-        if ok_button:
-            ok_button.setText("保存")
-            ok_button.setObjectName("PrimaryButton")
-        if cancel_button:
-            cancel_button.setText("取消")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
-
-    def values(self) -> dict[str, Any]:
-        values = dict(self.overrides)
-        ocr = dict(values.get("ocr", {}) if isinstance(values.get("ocr", {}), dict) else {})
-        ocr["det_db_thresh"] = self.det_db_thresh.value()
-        ocr["rec_thresh"] = self.rec_thresh.value()
-
-        ocr_modes = dict(values.get("ocr_modes", {}) if isinstance(values.get("ocr_modes", {}), dict) else {})
-        for mode_key, fields in self.ocr_mode_fields.items():
-            mode_config = dict(ocr_modes.get(mode_key, {}) if isinstance(ocr_modes.get(mode_key, {}), dict) else {})
-            preprocess = dict(mode_config.get("preprocess", {}) if isinstance(mode_config.get("preprocess", {}), dict) else {})
-            rules = dict(mode_config.get("rules", {}) if isinstance(mode_config.get("rules", {}), dict) else {})
-            preprocess["mode"] = "original"
-            preprocess["scale"] = fields["scale"].value()
-            preprocess.pop("auxiliary_mode", None)
-            rules["min_confidence"] = fields["min_confidence"].value()
-            rules["min_box_height_ratio"] = fields["min_box_height_ratio"].value()
-            if mode_key == "dialogue":
-                rules["ocr_result_excluded_keywords"] = self._keywords_from_editor(
-                    self.dialogue_ocr_result_excluded_keywords
-                )
-                rules["line_excluded_keywords"] = self._keywords_from_editor(
-                    self.dialogue_line_excluded_keywords
-                )
-            mode_config["preprocess"] = preprocess
-            mode_config["rules"] = rules
-            ocr_modes[mode_key] = mode_config
-
-        values.update({
-            "poll_interval": self.poll_interval.value(),
-            "step_timeout": self.step_timeout.value(),
-            "photo_sent_cooldown_seconds": self.photo_sent_cooldown_seconds.value(),
-            "match_threshold": self.match_threshold.value(),
-            "popup_match_threshold": self.popup_match_threshold.value(),
-            "ocr": ocr,
-            "ocr_modes": ocr_modes,
-            "templates": {
-                "buttons": str(self.template_manager.buttons_dir),
-                "screens": str(self.template_manager.screens_dir),
-            },
-            "persona": {
-                "requestPersona": _request_persona_value(self.request_persona_combo, self.request_persona_custom_input),
-                **{key: field.text().strip() for key, field in self.persona_inputs.items()},
-            },
-        })
-        if self.app_name == "huanyou":
-            values["next_message_click_x_offset"] = self.template_manager.next_message_click_x_offset
-            values["next_message_click_y_offset"] = self.template_manager.next_message_click_y_offset
-        return values
-
-
-class _LegacyTemplateManagerWidget(QWidget):
-    def __init__(self, template_root: Path, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.template_root = template_root
-        self.buttons_dir = template_root / "buttons"
-        self.screens_dir = template_root / "screens"
-        self.buttons_dir.mkdir(parents=True, exist_ok=True)
-        self.screens_dir.mkdir(parents=True, exist_ok=True)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-
-        intro_panel = QFrame()
-        intro_panel.setObjectName("InsetPanel")
-        intro_layout = QVBoxLayout(intro_panel)
-        intro_layout.setContentsMargins(14, 12, 14, 12)
-        intro_layout.setSpacing(4)
-        title = QLabel("模板资源")
-        title.setObjectName("SectionLabel")
-        intro_layout.addWidget(title)
-        subtitle = QLabel("导入的模板只保存在当前设备当前 App 目录，不会影响其他设备。")
-        subtitle.setObjectName("HelperLabel")
-        intro_layout.addWidget(subtitle)
-        coordinate_note = QLabel("模板匹配、弹窗关闭点位、OCR 结果坐标、联动测试输入和当前实际点击，都按竖屏归一化坐标理解。")
-        coordinate_note.setObjectName("HelperLabel")
-        coordinate_note.setWordWrap(True)
-        intro_layout.addWidget(coordinate_note)
-        location = QLabel(f"目录：{self.template_root}")
-        location.setObjectName("HelperLabel")
-        intro_layout.addWidget(location)
-        layout.addWidget(intro_panel)
-
-        import_panel = QFrame()
-        import_panel.setObjectName("InsetPanel")
-        import_layout = QVBoxLayout(import_panel)
-        import_layout.setContentsMargins(14, 12, 14, 12)
-        import_layout.setSpacing(8)
-        import_title = QLabel("导入模板")
-        import_title.setObjectName("SectionLabel")
-        import_layout.addWidget(import_title)
-        buttons = QHBoxLayout()
-        buttons.setSpacing(8)
-        import_layout.addLayout(buttons)
-        layout.addWidget(import_panel)
-
-        list_panel = QFrame()
-        list_panel.setObjectName("InsetPanel")
-        list_layout = QVBoxLayout(list_panel)
-        list_layout.setContentsMargins(14, 12, 14, 12)
-        list_layout.setSpacing(8)
-        list_title = QLabel("当前模板清单")
-        list_title.setObjectName("SectionLabel")
-        list_layout.addWidget(list_title)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["类型", "文件", "匹配范围", "操作"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(40)
-        table_header = self.table.horizontalHeader()
-        table_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        table_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        table_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        table_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        list_layout.addWidget(self.table)
-        layout.addWidget(list_panel)
-
-        for rule in import_template_rules():
-            button = QPushButton(f"导入{rule.label}")
-            button.clicked.connect(lambda checked=False, k=rule.key: self._import_template(k))
-            buttons.addWidget(button)
-        self.reload()
-
-    def reload(self) -> None:
-        files: list[tuple[str, Path]] = []
-        for path in sorted(self.buttons_dir.glob("*.jpg")):
-            kind = "弹窗" if is_popup_template_name(path.name) else "按钮"
-            files.append((kind, path))
-        for path in sorted(self.screens_dir.glob("*.jpg")):
-            files.append(("界面", path))
-        self.table.setRowCount(len(files))
-        for row, (kind, path) in enumerate(files):
-            self.table.setItem(row, 0, QTableWidgetItem(kind))
-            self.table.setItem(row, 1, QTableWidgetItem(path.name))
-            delete_button = QPushButton("删除")
-            delete_button.clicked.connect(lambda checked=False, p=path: self._delete_template(p))
-            self.table.setCellWidget(row, 2, delete_button)
-
-    def _import_template(self, key: str) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择模板图片",
-            "",
-            "Images (*.jpg *.jpeg *.png)",
-        )
-        if not file_path:
-            return
-        source = Path(file_path)
-        target = import_target_path(key, self.buttons_dir, self.screens_dir)
-        Image.open(source).convert("RGB").save(target, format="JPEG", quality=95)
-        self.reload()
-
-    def _delete_template(self, path: Path) -> None:
-        path.unlink(missing_ok=True)
-        self.reload()
-
 
 class PopupCropLabel(QWidget):
     def __init__(self, pixmap: QPixmap, parent: QWidget | None = None) -> None:
@@ -3409,13 +3166,10 @@ class AppConfigDialog(QDialog):
         body_layout.setSpacing(10)
         root.addWidget(body)
 
-        if self.app_name == "huanyou":
-            self._build_huanyou_offset_panel(body_layout)
-        else:
-            empty_label = QLabel("当前 App 暂无可配置的设备级补充项。")
-            empty_label.setObjectName("HelperLabel")
-            empty_label.setWordWrap(True)
-            body_layout.addWidget(empty_label)
+        empty_label = QLabel("当前 App 暂无可配置的设备级补充项。")
+        empty_label.setObjectName("HelperLabel")
+        empty_label.setWordWrap(True)
+        body_layout.addWidget(empty_label)
 
         root.addStretch(1)
 
@@ -3433,41 +3187,6 @@ class AppConfigDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-    def _build_huanyou_offset_panel(self, root: QVBoxLayout) -> None:
-        title = QLabel("欢友偏移")
-        title.setObjectName("SectionLabel")
-        root.addWidget(title)
-        help_label = QLabel("这里分别保存“新招呼”和“下一条”的点击偏移。")
-        help_label.setObjectName("HelperLabel")
-        help_label.setWordWrap(True)
-        root.addWidget(help_label)
-
-        new_greeting_form = QFormLayout()
-        new_greeting_form.setContentsMargins(0, 4, 0, 0)
-        new_greeting_form.setSpacing(10)
-        root.addLayout(new_greeting_form)
-        self.new_greeting_click_x_offset = self._offset_spin(self.overrides.get("new_greeting_click_x_offset", 0.0))
-        self.new_greeting_click_y_offset = self._offset_spin(self.overrides.get("new_greeting_click_y_offset", 0.0))
-        new_greeting_form.addRow("新招呼 X 偏移", self.new_greeting_click_x_offset)
-        new_greeting_form.addRow("新招呼 Y 偏移", self.new_greeting_click_y_offset)
-
-        next_message_title = QLabel("下一条偏移")
-        next_message_title.setObjectName("SectionLabel")
-        root.addWidget(next_message_title)
-        next_message_help = QLabel("用于点击“下一条”按钮时的额外偏移。")
-        next_message_help.setObjectName("HelperLabel")
-        next_message_help.setWordWrap(True)
-        root.addWidget(next_message_help)
-
-        next_message_form = QFormLayout()
-        next_message_form.setContentsMargins(0, 4, 0, 0)
-        next_message_form.setSpacing(10)
-        root.addLayout(next_message_form)
-        self.next_message_click_x_offset = self._offset_spin(self.overrides.get("next_message_click_x_offset", 0.0))
-        self.next_message_click_y_offset = self._offset_spin(self.overrides.get("next_message_click_y_offset", 0.0))
-        next_message_form.addRow("下一条 X 偏移", self.next_message_click_x_offset)
-        next_message_form.addRow("下一条 Y 偏移", self.next_message_click_y_offset)
-
     def _offset_spin(self, value: Any) -> QDoubleSpinBox:
         spin = NoWheelDoubleSpinBox()
         spin.setRange(-0.2, 0.2)
@@ -3477,14 +3196,7 @@ class AppConfigDialog(QDialog):
         return spin
 
     def values(self) -> dict[str, Any]:
-        if self.app_name != "huanyou":
-            return {}
-        return {
-            "new_greeting_click_x_offset": self.new_greeting_click_x_offset.value(),
-            "new_greeting_click_y_offset": self.new_greeting_click_y_offset.value(),
-            "next_message_click_x_offset": self.next_message_click_x_offset.value(),
-            "next_message_click_y_offset": self.next_message_click_y_offset.value(),
-        }
+        return {}
     def __init__(
         self,
         overrides: dict[str, Any],
@@ -3492,6 +3204,7 @@ class AppConfigDialog(QDialog):
         app_name: str,
         template_root: Path,
         on_reset_visual_recognition: Callable[[], None] | None = None,
+        on_calibrate_vision: Callable[[], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -3500,6 +3213,7 @@ class AppConfigDialog(QDialog):
         self.app_name = app_name
         self.template_root = template_root
         self._on_reset_visual_recognition = on_reset_visual_recognition
+        self._on_calibrate_vision = on_calibrate_vision
         self.setWindowTitle(f"App 配置 - {device_ip} / {app_name}")
         self.resize(860, 660)
 
@@ -3569,12 +3283,12 @@ class AppConfigDialog(QDialog):
         form.setSpacing(10)
         panel_root.addLayout(form)
 
-        self.poll_interval = QSpinBox()
+        self.poll_interval = NoWheelSpinBox()
         self.poll_interval.setRange(1, 3600)
         self.poll_interval.setValue(int(overrides.get("poll_interval", 1)))
         form.addRow("轮询间隔（秒）", self.poll_interval)
 
-        self.step_timeout = QSpinBox()
+        self.step_timeout = NoWheelSpinBox()
         self.step_timeout.setRange(1, 300)
         self.step_timeout.setValue(int(overrides.get("step_timeout", 10)))
         form.addRow("单步超时（秒）", self.step_timeout)
@@ -3585,18 +3299,18 @@ class AppConfigDialog(QDialog):
         )
         form.addRow("", self.exclude_ocr_wait_from_step_timeout)
 
-        self.keep_awake_interval_seconds = QSpinBox()
+        self.keep_awake_interval_seconds = NoWheelSpinBox()
         self.keep_awake_interval_seconds.setRange(0, 86400)
         self.keep_awake_interval_seconds.setValue(int(overrides.get("keep_awake_interval_seconds", DEFAULT_RUNTIME_CONFIG["keep_awake_interval_seconds"])))
         form.addRow("防熄屏跳转间隔（秒，0关闭）", self.keep_awake_interval_seconds)
 
-        self.photo_sent_cooldown_seconds = QSpinBox()
+        self.photo_sent_cooldown_seconds = NoWheelSpinBox()
         self.photo_sent_cooldown_seconds.setRange(0, 2592000)
         self.photo_sent_cooldown_seconds.setValue(int(overrides.get("photo_sent_cooldown_seconds", 86400) or 0))
         self.photo_sent_cooldown_seconds.setToolTip("主动照片发送成功后，同一用户在此时间内不会再次收到主动照片。")
         form.addRow("同一用户发图冷却（秒，0不限制）", self.photo_sent_cooldown_seconds)
 
-        self.online_photo_send_count = QSpinBox()
+        self.online_photo_send_count = NoWheelSpinBox()
         self.online_photo_send_count.setRange(0, 50)
         self.online_photo_send_count.setValue(int(overrides.get("online_photo_send_count", 3) or 0))
         self.online_photo_send_count.setToolTip("没有消息进入空闲状态时，主动给多少位在线用户发送照片。0 表示关闭主动发图。")
@@ -3606,6 +3320,14 @@ class AppConfigDialog(QDialog):
         self.reset_visual_recognition_button.setToolTip("清空当前设备当前 App 的视觉调用额度和连续无新增规则计数。")
         self.reset_visual_recognition_button.clicked.connect(self._reset_visual_recognition)
         panel_root.addWidget(self.reset_visual_recognition_button, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.calibrate_vision_button = QPushButton("视觉+OCR识别一次")
+        self.calibrate_vision_button.setToolTip(
+            "让设备停留在某个聊天窗口，点击后立即执行一次视觉+OCR 识别，"
+            "把聊天区域范围学进坐标缓存。手动标定独立于运行额度，不消耗视觉识别次数。"
+        )
+        self.calibrate_vision_button.clicked.connect(self._calibrate_vision)
+        panel_root.addWidget(self.calibrate_vision_button, 0, Qt.AlignmentFlag.AlignLeft)
 
         self.ocr_toggle_button = QPushButton("显示OCR设置")
         self.ocr_toggle_button.clicked.connect(self._toggle_ocr_tab)
@@ -3618,6 +3340,17 @@ class AppConfigDialog(QDialog):
     def _reset_visual_recognition(self) -> None:
         if self._on_reset_visual_recognition is not None:
             self._on_reset_visual_recognition()
+
+    def _calibrate_vision(self) -> None:
+        if self._on_calibrate_vision is None:
+            return
+        self.calibrate_vision_button.setEnabled(False)
+        self.calibrate_vision_button.setText("标定中...")
+        self._on_calibrate_vision(self._finish_calibration_ui)
+
+    def _finish_calibration_ui(self) -> None:
+        self.calibrate_vision_button.setEnabled(True)
+        self.calibrate_vision_button.setText("视觉+OCR识别一次")
 
     def _build_ocr_tab(self, overrides: dict[str, Any]) -> None:
         page = QWidget()
@@ -3825,46 +3558,288 @@ class AppConfigDialog(QDialog):
         self.tabs.addTab(page, "模板管理")
 
     def _build_persona_tab(self, overrides: dict[str, Any]) -> None:
+        """人设 tab 四组（docs/13 第六节 + persona_ui_mockup.svg）：AI 接入 / 人设文件 / 对话记忆 / 招呼语。"""
+        from services.deepseek_client import FALLBACK_MODELS, resolve_api_key
+
         page = QWidget()
         page_root = QVBoxLayout(page)
         page_root.setContentsMargins(0, 0, 0, 0)
         page_root.setSpacing(10)
 
-        panel = QFrame()
-        panel.setObjectName("InsetPanel")
-        panel_root = QVBoxLayout(panel)
-        panel_root.setContentsMargins(14, 12, 14, 12)
-        panel_root.setSpacing(8)
-        title = QLabel("人设参数")
-        title.setObjectName("SectionLabel")
-        panel_root.addWidget(title)
-        help_label = QLabel("AI 回复时会优先使用这里的人设，覆盖全局默认值。")
-        help_label.setObjectName("HelperLabel")
-        panel_root.addWidget(help_label)
+        def _panel(title_text: str, helper_text: str = "") -> tuple[QFrame, QVBoxLayout]:
+            frame = QFrame()
+            frame.setObjectName("InsetPanel")
+            root = QVBoxLayout(frame)
+            root.setContentsMargins(14, 12, 14, 12)
+            root.setSpacing(8)
+            title = QLabel(title_text)
+            title.setObjectName("SectionLabel")
+            root.addWidget(title)
+            if helper_text:
+                helper = QLabel(helper_text)
+                helper.setObjectName("HelperLabel")
+                helper.setWordWrap(True)
+                root.addWidget(helper)
+            return frame, root
 
-        form = QFormLayout()
-        form.setContentsMargins(0, 4, 0, 0)
-        form.setSpacing(10)
-        persona = overrides.get("persona", {}) if isinstance(overrides.get("persona", {}), dict) else {}
-        self.persona_inputs: dict[str, QLineEdit] = {}
-        persona_selector, self.request_persona_combo, self.request_persona_custom_input = _create_request_persona_selector(
-            str(persona.get("requestPersona", ""))
+        # ---------- 组1：AI 接入 ----------
+        ai_panel, ai_root = _panel(
+            "AI 接入（DeepSeek 官方直连）",
+            "key 由客户在 platform.deepseek.com 自行注册充值；保存到 .env/deepseek_api_key.txt，绝不写入 config.json。",
         )
-        form.addRow("人设授权 ID", persona_selector)
-        for key, label in [
-            ("name", "名字"),
-            ("age", "年龄"),
-            ("work", "职业"),
-            ("location", "住址"),
-            ("renshe", "自定义人设"),
-        ]:
-            line = QLineEdit(str(persona.get(key, "")))
-            self.persona_inputs[key] = line
-            form.addRow(label, line)
-        panel_root.addLayout(form)
-        page_root.addWidget(panel)
+        ai_form = QFormLayout()
+        ai_form.setContentsMargins(0, 4, 0, 0)
+        ai_form.setSpacing(10)
+        key_row = QHBoxLayout()
+        self.persona_key_input = QLineEdit()
+        self.persona_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        if resolve_api_key():
+            self.persona_key_input.setPlaceholderText("已配置（留空保持不变）")
+        else:
+            self.persona_key_input.setPlaceholderText("sk-…（DeepSeek API Key）")
+        self.persona_test_button = QPushButton("连通性测试")
+        self.persona_test_button.clicked.connect(self._test_persona_connectivity)
+        key_row.addWidget(self.persona_key_input, 1)
+        key_row.addWidget(self.persona_test_button)
+        ai_form.addRow("API Key", key_row)
+        self.persona_test_result = QLabel("")
+        self.persona_test_result.setObjectName("HelperLabel")
+        ai_form.addRow("", self.persona_test_result)
+        model_row = QHBoxLayout()
+        self.persona_model_combo = QComboBox()
+        current_model = str(overrides.get("persona_chat_model", "") or "").strip() or "deepseek-flash"
+        for model_id in FALLBACK_MODELS:
+            self.persona_model_combo.addItem(model_id)
+        if current_model not in FALLBACK_MODELS:
+            self.persona_model_combo.addItem(current_model)
+        self.persona_model_combo.setCurrentText(current_model)
+        model_row.addWidget(self.persona_model_combo, 0)
+        model_hint = QLabel("列表来自 GET /models，失败回退内置清单")
+        model_hint.setObjectName("HelperLabel")
+        model_row.addWidget(model_hint, 1)
+        ai_form.addRow("模型", model_row)
+        ai_root.addLayout(ai_form)
+        page_root.addWidget(ai_panel)
+        self._persona_model_threads: list[_PersonaNetworkThread] = []
+        self._refresh_persona_models_async()
+
+        # ---------- 组2：人设文件（方案包 JSON） ----------
+        profile_panel, profile_root = _panel(
+            "人设文件（方案包 JSON）",
+            "界面内容直接写回该 JSON 文件（唯一事实源）；未配置或留空回退随包默认 apps/<App>/persona_default.json（四字段）。人设改动即时生效，对话记忆连续不重开场。",
+        )
+        path_row = QHBoxLayout()
+        self.persona_profile_path = QLineEdit(str(overrides.get("persona_profile_json", "") or "").strip())
+        browse_button = QPushButton("浏览…")
+        browse_button.clicked.connect(self._browse_persona_profile)
+        save_as_button = QPushButton("另存为…")
+        save_as_button.clicked.connect(self._save_as_persona_profile)
+        reset_button = QPushButton("恢复默认")
+        reset_button.clicked.connect(self._reset_persona_profile)
+        for widget in (self.persona_profile_path, browse_button, save_as_button, reset_button):
+            path_row.addWidget(widget, 1 if widget is self.persona_profile_path else 0)
+        profile_form = QFormLayout()
+        profile_form.setContentsMargins(0, 4, 0, 0)
+        profile_form.setSpacing(10)
+        profile_form.addRow("JSON 文件", path_row)
+        profile_root.addLayout(profile_form)
+
+        self.persona_text_edits: dict[str, QPlainTextEdit] = {}
+        persona_text_meta = [
+            ("基础设定", "稳定前缀 · 命中缓存 · 改动即时生效"),
+            ("人物信息", "稳定前缀 · 与基础设定拼为同一 System 段"),
+            ("边界条件", "尾部注入，不占缓存前缀，每轮按新内容重复计费，建议 ≤ 200 字"),
+            ("审核标准", "独立请求窗口，建议 ≥ 512 字，稳定长提示词可跨轮命中缓存"),
+        ]
+        for key, hint in persona_text_meta:
+            edit = QPlainTextEdit()
+            edit.setPlaceholderText(f"{key}（留空使用随包默认）" if key != "人物信息" else "人物信息（自由书写，可留空）")
+            edit.setMaximumHeight(84)
+            self.persona_text_edits[key] = edit
+            row = QHBoxLayout()
+            row.addWidget(edit, 1)
+            hint_label = QLabel(hint)
+            hint_label.setObjectName("HelperLabel")
+            hint_label.setWordWrap(True)
+            row.addWidget(hint_label, 0)
+            profile_form.addRow(QLabel(key), row)
+        judge_row = QHBoxLayout()
+        self.persona_judge_checkbox = QCheckBox("启用 AI 审核（默认开；关闭则跳过审核，标准留空时用内置默认）")
+        self.persona_judge_checkbox.setChecked(bool(overrides.get("judge_enabled", True)))
+        judge_row.addWidget(self.persona_judge_checkbox)
+        judge_row.addStretch(1)
+        profile_root.addLayout(profile_form)
+        profile_root.addLayout(judge_row)
+        page_root.addWidget(profile_panel)
+        self._load_persona_texts_into_editors()
+
+        # ---------- 组3：对话记忆 ----------
+        memory_panel, memory_root = _panel("对话记忆")
+        memory_form = QFormLayout()
+        memory_form.setContentsMargins(0, 4, 0, 0)
+        memory_form.setSpacing(10)
+        self.persona_history_turns = NoWheelSpinBox()
+        self.persona_history_turns.setRange(0, 30)
+        self.persona_history_turns.setValue(int(overrides.get("history_turns", 6) or 6))
+        memory_form.addRow("保留对话轮数", self.persona_history_turns)
+        history_hint = QLabel("每轮注入最近 N 轮原始对话；设为 0 = 只靠前情摘要记忆；窗口越大上下文越足、费用越高")
+        history_hint.setObjectName("HelperLabel")
+        memory_form.addRow("", history_hint)
+        self.persona_summary_interval = NoWheelSpinBox()
+        self.persona_summary_interval.setRange(1, 50)
+        self.persona_summary_interval.setValue(int(overrides.get("summary_interval", 10) or 10))
+        memory_form.addRow("总结间隔", self.persona_summary_interval)
+        interval_hint = QLabel("每积累 K 轮触发一次记忆提炼（前情摘要）；建议 ≥ 10，过小会频繁打断缓存前缀、成本上升")
+        interval_hint.setObjectName("HelperLabel")
+        memory_form.addRow("", interval_hint)
+        memory_root.addLayout(memory_form)
+        page_root.addWidget(memory_panel)
+
+        # ---------- 组4：招呼语 ----------
+        greeting_panel, greeting_root = _panel(
+            "招呼语",
+            "每行一条；内容不进界面，运行时直接读取。未配置时用 runtime/greetings/pingtai.txt，缺失回退随包默认。",
+        )
+        greeting_path_row = QHBoxLayout()
+        self.persona_greetings_path = QLineEdit(str(overrides.get("greetings_txt", "") or "").strip())
+        greeting_browse = QPushButton("浏览…")
+        greeting_browse.clicked.connect(self._browse_greetings_file)
+        self.persona_greetings_count = QLabel("")
+        self.persona_greetings_count.setObjectName("HelperLabel")
+        greeting_path_row.addWidget(self.persona_greetings_path, 1)
+        greeting_path_row.addWidget(greeting_browse)
+        greeting_path_row.addWidget(self.persona_greetings_count)
+        greeting_form = QFormLayout()
+        greeting_form.setContentsMargins(0, 4, 0, 0)
+        greeting_form.addRow("招呼语文件", greeting_path_row)
+        greeting_root.addLayout(greeting_form)
+        greeting_switch_row = QHBoxLayout()
+        self.persona_greeting_ai_checkbox = QCheckBox("启用 AI 优化招呼语（默认开：按当前人设改写并自动避开历史开场白；关闭则随机直发）")
+        self.persona_greeting_ai_checkbox.setChecked(bool(overrides.get("greeting_ai_enabled", True)))
+        greeting_switch_row.addWidget(self.persona_greeting_ai_checkbox)
+        greeting_switch_row.addStretch(1)
+        greeting_root.addLayout(greeting_switch_row)
+        page_root.addWidget(greeting_panel)
+        self._refresh_greetings_count()
+
         page_root.addStretch(1)
         self.tabs.addTab(page, "人设")
+
+    # ---------- 人设 tab 辅助 ----------
+    def _persona_apps_dir(self) -> Path:
+        return Path("apps") / self.app_name
+
+    def _read_persona_default(self) -> dict[str, str]:
+        """随包默认人设：apps/<app>/persona_default.json（四字段）。"""
+        try:
+            data = json.loads((self._persona_apps_dir() / "persona_default.json").read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {key: str(data.get(key) or "").strip() for key in ("基础设定", "人物信息", "边界条件", "审核标准")}
+
+    def _effective_persona_profile(self) -> dict[str, str]:
+        path_text = self.persona_profile_path.text().strip()
+        if path_text:
+            try:
+                data = json.loads(Path(path_text).read_text(encoding="utf-8-sig"))
+                if isinstance(data, dict):
+                    return {key: str(data.get(key) or "").strip() for key in ("基础设定", "人物信息", "边界条件", "审核标准")}
+            except (OSError, json.JSONDecodeError):
+                pass
+        return {}
+
+    def _load_persona_texts_into_editors(self) -> None:
+        profile = self._effective_persona_profile()
+        defaults = self._read_persona_default()
+        for key, edit in self.persona_text_edits.items():
+            edit.setPlainText(profile.get(key, "") or defaults.get(key, ""))
+
+    def _collect_persona_texts(self) -> dict[str, str]:
+        return {key: edit.toPlainText().strip() for key, edit in self.persona_text_edits.items()}
+
+    def _browse_persona_profile(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择人设方案包 JSON", "", "JSON (*.json)")
+        if path:
+            self.persona_profile_path.setText(path)
+            self._load_persona_texts_into_editors()
+
+    def _save_as_persona_profile(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "另存人设方案包", "persona.json", "JSON (*.json)")
+        if not path:
+            return
+        payload = self._collect_persona_texts()
+        try:
+            Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, "人设", f"写入失败：{exc}")
+            return
+        self.persona_profile_path.setText(path)
+        QMessageBox.information(self, "人设", "方案包已保存。拷到其它设备后用「浏览…」选中即可复用。")
+
+    def _reset_persona_profile(self) -> None:
+        self.persona_profile_path.clear()
+        self._load_persona_texts_into_editors()
+
+    def _effective_greetings_path(self) -> Path | None:
+        configured = self.persona_greetings_path.text().strip()
+        if configured:
+            return Path(configured)
+        default = Path("runtime/greetings/pingtai.txt")
+        if default.is_file():
+            return default
+        bundled = self._persona_apps_dir() / "greetings_default.txt"
+        return bundled if bundled.is_file() else None
+
+    def _refresh_greetings_count(self) -> None:
+        path = self._effective_greetings_path()
+        count = 0
+        if path is not None:
+            try:
+                count = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip() and not line.strip().startswith("#"))
+            except OSError:
+                count = 0
+        self.persona_greetings_count.setText(f"当前 {count} 条" if path is not None else "未找到招呼语库")
+
+    def _browse_greetings_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "选择招呼语文件（每行一条）", "", "文本 (*.txt)")
+        if path:
+            self.persona_greetings_path.setText(path)
+            self._refresh_greetings_count()
+
+    def _start_persona_network_thread(self, api_key: str, on_result: Callable[[object], None]) -> None:
+        thread = _PersonaNetworkThread(api_key=api_key)
+        thread.result_ready.connect(on_result)
+        self._persona_model_threads.append(thread)
+        thread.finished.connect(lambda t=thread: self._persona_model_threads.remove(t) if t in self._persona_model_threads else None)
+        thread.start()
+
+    def _refresh_persona_models_async(self) -> None:
+        self._start_persona_network_thread(self.persona_key_input.text().strip(), self._on_persona_models_ready)
+
+    def _on_persona_models_ready(self, result: object) -> None:
+        if isinstance(result, list) and result:
+            current = self.persona_model_combo.currentText()
+            self.persona_model_combo.clear()
+            self.persona_model_combo.addItems([str(item) for item in result])
+            if current in result:
+                self.persona_model_combo.setCurrentText(current)
+            self.persona_test_result.setText(f"✓ 模型列表已刷新（{len(result)} 个）")
+
+    def _test_persona_connectivity(self) -> None:
+        self.persona_test_button.setEnabled(False)
+        self.persona_test_result.setText("测试中…")
+
+        def _on_result(result: object) -> None:
+            self.persona_test_button.setEnabled(True)
+            if isinstance(result, list):
+                self._on_persona_models_ready(result)
+                self.persona_test_result.setText(f"✓ 连接正常 · 可用模型 {len(result)} 个（{' / '.join(str(m) for m in result)}）")
+            else:
+                self.persona_test_result.setText(f"✗ 连接失败：{result}")
+
+        self._start_persona_network_thread(self.persona_key_input.text().strip(), _on_result)
 
     def _toggle_ocr_tab(self) -> None:
         is_visible = self.tabs.isTabVisible(self.ocr_tab_index)
@@ -3930,12 +3905,42 @@ class AppConfigDialog(QDialog):
                 "buttons": str(self.template_manager.buttons_dir),
                 "screens": str(self.template_manager.screens_dir),
             },
-            "persona": {
-                "requestPersona": _request_persona_value(self.request_persona_combo, self.request_persona_custom_input),
-                **{key: field.text().strip() for key, field in self.persona_inputs.items()},
-            },
+            # 人设新链路客户设置（docs/13 五/六节）：设备 IP+App 级 + 机器级 key/model
+            "persona_profile_json": self._persist_persona_texts(),
+            "greetings_txt": self.persona_greetings_path.text().strip(),
+            "judge_enabled": self.persona_judge_checkbox.isChecked(),
+            "greeting_ai_enabled": self.persona_greeting_ai_checkbox.isChecked(),
+            "history_turns": self.persona_history_turns.value(),
+            "summary_interval": self.persona_summary_interval.value(),
+            "persona_chat_model": self.persona_model_combo.currentText().strip(),
+            "deepseek_api_key": self.persona_key_input.text().strip(),
         })
         return values
+
+    def _persist_persona_texts(self) -> str:
+        """四个文本编辑框的内容写回方案包 JSON（唯一事实源）。
+
+        无路径但内容相对随包默认有修改时，自动落到引导位
+        runtime/configs/<app>/persona_profiles/，避免编辑静默丢失。
+        """
+        path_text = self.persona_profile_path.text().strip()
+        texts = self._collect_persona_texts()
+        defaults = self._read_persona_default()
+        changed = any(texts.get(key, "") and texts.get(key, "") != defaults.get(key, "") for key in texts)
+        if not path_text:
+            if not changed:
+                return ""
+            guided = Path("runtime/configs") / self.app_name / "persona_profiles"
+            try:
+                guided.mkdir(parents=True, exist_ok=True)
+                path_text = str(guided / f"persona_{time.strftime('%Y%m%d_%H%M%S')}.json")
+            except OSError:
+                return ""
+        try:
+            Path(path_text).write_text(json.dumps(texts, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            return path_text
+        return path_text
 
 
 class DeviceSettingsDialogFixed(QDialog):
@@ -3978,13 +3983,10 @@ class DeviceSettingsDialogFixed(QDialog):
         panel_root.setSpacing(10)
         root.addWidget(panel)
 
-        if self.app_name == "huanyou":
-            self._build_huanyou_offset_panel(panel_root)
-        else:
-            empty_label = QLabel("当前 App 暂无可配置的设备级补充项。")
-            empty_label.setObjectName("HelperLabel")
-            empty_label.setWordWrap(True)
-            panel_root.addWidget(empty_label)
+        empty_label = QLabel("当前 App 暂无可配置的设备级补充项。")
+        empty_label.setObjectName("HelperLabel")
+        empty_label.setWordWrap(True)
+        panel_root.addWidget(empty_label)
 
         root.addStretch(1)
 
@@ -4010,52 +4012,8 @@ class DeviceSettingsDialogFixed(QDialog):
         spin.setValue(float(value or 0.0))
         return spin
 
-    def _build_huanyou_offset_panel(self, root: QVBoxLayout) -> None:
-        new_greeting_title = QLabel("欢友：新招呼偏移")
-        new_greeting_title.setObjectName("SectionLabel")
-        root.addWidget(new_greeting_title)
-        new_greeting_help = QLabel("用于点击“新招呼”按钮时的额外偏移。")
-        new_greeting_help.setObjectName("HelperLabel")
-        new_greeting_help.setWordWrap(True)
-        root.addWidget(new_greeting_help)
-
-        new_greeting_form = QFormLayout()
-        new_greeting_form.setContentsMargins(0, 4, 0, 0)
-        new_greeting_form.setSpacing(10)
-        self.new_greeting_click_x_offset = self._offset_spin(self.overrides.get("new_greeting_click_x_offset", 0.0))
-        self.new_greeting_click_y_offset = self._offset_spin(self.overrides.get("new_greeting_click_y_offset", 0.0))
-        new_greeting_form.addRow("新招呼 X 偏移", self.new_greeting_click_x_offset)
-        new_greeting_form.addRow("新招呼 Y 偏移", self.new_greeting_click_y_offset)
-        root.addLayout(new_greeting_form)
-
-        next_message_title = QLabel("欢友：下一条偏移")
-        next_message_title.setObjectName("SectionLabel")
-        root.addWidget(next_message_title)
-        next_message_help = QLabel("用于点击“下一条”按钮时的额外偏移。")
-        next_message_help.setObjectName("HelperLabel")
-        next_message_help.setWordWrap(True)
-        root.addWidget(next_message_help)
-
-        next_message_form = QFormLayout()
-        next_message_form.setContentsMargins(0, 4, 0, 0)
-        next_message_form.setSpacing(10)
-        self.next_message_click_x_offset = self._offset_spin(self.overrides.get("next_message_click_x_offset", 0.0))
-        self.next_message_click_y_offset = self._offset_spin(self.overrides.get("next_message_click_y_offset", 0.0))
-        next_message_form.addRow("下一条 X 偏移", self.next_message_click_x_offset)
-        next_message_form.addRow("下一条 Y 偏移", self.next_message_click_y_offset)
-        root.addLayout(next_message_form)
-
     def values(self) -> dict[str, Any]:
-        if self.app_name != "huanyou":
-            return {}
-        return {
-            "new_greeting_click_x_offset": self.new_greeting_click_x_offset.value(),
-            "new_greeting_click_y_offset": self.new_greeting_click_y_offset.value(),
-            "next_message_click_x_offset": self.next_message_click_x_offset.value(),
-            "next_message_click_y_offset": self.next_message_click_y_offset.value(),
-        }
-
-
+        return {}
 class DeviceSettingsDialogInteractive(QDialog):
     def __init__(
         self,
@@ -4266,13 +4224,7 @@ class DeviceSettingsDialogInteractive(QDialog):
         root.addWidget(buttons)
 
     def _field_specs(self) -> list[tuple[str, str]]:
-        if self.app_name == "huanyou":
-            return [
-                ("new_greeting", "新招呼"),
-                ("next_message", "下一条"),
-            ]
         return []
-
     def _offset_spin(self, value: Any) -> QDoubleSpinBox:
         spin = NoWheelDoubleSpinBox()
         spin.setRange(-0.2, 0.2)
@@ -4397,7 +4349,7 @@ class DeviceSettingsDialogInteractive(QDialog):
             f"正在执行 {mode} OCR（范围来源：{source}，区域=({self._ocr_preview_region_text})），请稍候..."
         )
         self.ocr_preview_output.clear()
-        thread = OcrPreviewThread(self.current_screenshot, config, mode, region, self)
+        thread = OcrPreviewThread(self.current_screenshot, config, mode, region, app_name=self.app_name, parent=self)
         self._ocr_preview_thread = thread
         thread.completed.connect(self._apply_ocr_preview)
         thread.failed.connect(self._on_ocr_preview_failed)
@@ -4527,7 +4479,7 @@ class DeviceSettingsDialogInteractive(QDialog):
         if self.current_screenshot is None:
             QMessageBox.warning(self, "未刷新截图", "请先刷新截图，再保存当前图片。")
             return
-        error_dir = Path("photo") / "errors"
+        error_dir = ensure_photo_root() / "errors"
         error_dir.mkdir(parents=True, exist_ok=True)
         safe_ip = re.sub(r"[^0-9A-Za-z_.-]+", "_", self.device_ip).replace(".", "_")
         safe_app = re.sub(r"[^0-9A-Za-z_.-]+", "_", self.app_name)
@@ -4625,6 +4577,13 @@ DeviceSettingsDialog = DeviceSettingsDialogInteractive
 
 def run_app(argv: list[str] | None = None, on_ready: Callable[[], Any] | None = None) -> int:
     app = QApplication(argv or sys.argv)
+    # 单实例锁（移植自 douyin）：客户机双开会让两组 worker 抢同一批机械臂。
+    lock_path = str((Path("runtime") / "main_ui.lock").resolve())
+    Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
+    instance_lock = QLockFile(lock_path)
+    instance_lock.setStaleLockTime(0)
+    if not instance_lock.tryLock(100):
+        return 0
     previous_handler = signal.getsignal(signal.SIGINT)
 
     def handle_sigint(signum: int, frame: Any) -> None:
@@ -4646,4 +4605,5 @@ def run_app(argv: list[str] | None = None, on_ready: Callable[[], Any] | None = 
         app.quit()
         return 130
     finally:
+        instance_lock.unlock()
         signal.signal(signal.SIGINT, previous_handler)

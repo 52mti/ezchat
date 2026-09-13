@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import contextlib
 import json
@@ -19,12 +19,13 @@ from services.defaults import with_app_defaults
 from apps.visual_assets import back_button_template_paths
 from lgb.lgb import RobotInterface
 from services import (
-    AIClient,
     ChatHistoryStore,
     ConfigManager,
+    DeepSeekClient,
     LicenseClient,
-    MemoryStore,
     MessageProcessor,
+    PersonaChat,
+    PersonaSessionStore,
     setup_runtime_logging,
     write_error_incident,
 )
@@ -196,24 +197,36 @@ class DeviceWorker(threading.Thread):
         except Exception:
             pass
         self.robot = _RobotCallGuard(self.robot_inner, self._stop_event.is_set)
-        self.ai_client = AIClient(
-            api_base=str(global_config.get("chat_api_base", "http://liaotianbao.icu")),
-            chat_bearer=str(global_config.get("chat_bearer", "")),
-            credits_bearer=str(global_config.get("credits_bearer", "")),
+        # 人设 AI 新链路（docs/13）：DeepSeek 官方直连，会话记忆在本地 persona_sessions
+        workspace_root = str(Path(__file__).resolve().parents[1])
+        self.persona_client = DeepSeekClient(workspace_root=workspace_root)
+        self.persona_store = PersonaSessionStore(root=str(Path(workspace_root) / "runtime" / "persona_sessions"))
+        self.persona_chat = PersonaChat(
+            client=self.persona_client,
+            store=self.persona_store,
+            workspace_root=workspace_root,
+            read_settings=self._read_persona_settings,
+            logger=self._emit,
         )
+        if not self.persona_client.api_key:
+            self._emit("warning", "DeepSeek key 未配置，人设 AI 回复将失败（.env/deepseek_api_key.txt）", {})
+        try:
+            removed_sessions = self.persona_store.cleanup_inactive_sessions(str(device["ip"]), app_name)
+            if removed_sessions:
+                self._emit("info", "清理 30 天未活跃人设会话", {"count": removed_sessions})
+        except Exception:
+            pass
         self.license_client = LicenseClient(
             api_url=str(global_config.get("license_api_url", "")),
             project_uuid=str(global_config.get("project_uuid", "")),
             project_secret=str(global_config.get("project_secret", "")),
         )
-        self.memory_store = MemoryStore()
         self.chat_history_store = ChatHistoryStore()
         self.message_processor = MessageProcessor(
             device=device,
             app_name=app_name,
             config_manager=self.config_manager,
-            ai_client=self.ai_client,
-            memory_store=self.memory_store,
+            persona_chat=self.persona_chat,
             chat_history_store=self.chat_history_store,
             logger=self._emit,
         )
@@ -222,8 +235,11 @@ class DeviceWorker(threading.Thread):
             "reply_provider": self.message_processor.prepare_reply,
             "sent_callback": self.message_processor.mark_sent,
         }
-        if app_name == "xinyu":
+        if getattr(app_cls, "supports_dialogue_continuity", False):
             app_kwargs["continuity_required_provider"] = self.message_processor.needs_continuity_context
+        if getattr(app_cls, "supports_greeting", False):
+            app_kwargs["greeting_provider"] = self._provide_greeting
+            app_kwargs["greeting_sent_notifier"] = self._notify_synthetic_greeting
         self.app = app_cls(self.robot, self.app_config, **app_kwargs)
         if hasattr(self.app, "set_status_callback"):
             self.app.set_status_callback(self._emit_app_status)
@@ -237,6 +253,37 @@ class DeviceWorker(threading.Thread):
         self._incident_sequence = 0
         self._last_error_count_seen = 0
         self._live_config_fingerprint = self._config_fingerprint(self.app_config)
+
+    def _read_persona_settings(self) -> dict[str, Any]:
+        """人设客户设置（docs/13 五/六节）：device.app_overrides[app] + global.persona_chat_model。"""
+        settings: dict[str, Any] = {}
+        try:
+            overrides = (self.device.get("app_overrides") or {}).get(self.app_name) or {}
+            if isinstance(overrides, dict):
+                settings.update(overrides)
+            model = str(self.config_manager.get("global", "persona_chat_model", default="") or "")
+            if model:
+                settings["model"] = model
+        except Exception:
+            return {}
+        return settings
+
+    def _provide_greeting(self, contact_name: str) -> str:
+        return self.persona_chat.generate_greeting(
+            device_ip=str(self.device.get("ip", "")),
+            app_name=self.app_name,
+            contact_name=str(contact_name or ""),
+        )
+
+    def _notify_synthetic_greeting(self, contact_name: str) -> None:
+        try:
+            self.persona_chat.record_synthetic_greeting(
+                device_ip=str(self.device.get("ip", "")),
+                app_name=self.app_name,
+                contact_name=str(contact_name or ""),
+            )
+        except Exception as exc:
+            self._emit("warning", "平台新招呼占位落库失败", {"contact": contact_name, "error": str(exc)})
 
     @staticmethod
     def _config_fingerprint(config: dict[str, Any]) -> str:
