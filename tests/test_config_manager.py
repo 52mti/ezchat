@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor
 
-from apps.xinyu.config import DEFAULT_CONFIG as WECHAT_DEFAULT_CONFIG
 from apps.xinyu.config import DEFAULT_CONFIG as XINYU_DEFAULT_CONFIG
 from services.config_manager import ConfigManager
 
@@ -89,7 +88,7 @@ def test_config_manager_device_helpers_and_app_config(tmp_path):
     )
     manager = ConfigManager(config_path, tmp_path / "outbox.json")
 
-    app_config = manager.get_app_config("1.1.1.1", "wechat", WECHAT_DEFAULT_CONFIG)
+    app_config = manager.get_app_config("1.1.1.1", "wechat", XINYU_DEFAULT_CONFIG)
     manager.update_device("1.1.1.1", {"license_expires": "2099-01-01"})
     device = manager.find_device("1.1.1.1") or {}
 
@@ -121,7 +120,7 @@ def test_config_manager_migrates_legacy_app_override_scopes_on_update(tmp_path):
     assert "dialogue" not in app_saved.get("ocr_modes", {})
     assert dialogue_saved["rules"]["line_gap"] == 1
     assert saved["devices"][0]["app_overrides"] == {}
-    app_config = manager.get_app_config("1.1.1.1", "wechat", WECHAT_DEFAULT_CONFIG)
+    app_config = manager.get_app_config("1.1.1.1", "wechat", XINYU_DEFAULT_CONFIG)
     assert app_config["poll_interval"] == 9
     assert app_config["ocr_modes"]["dialogue"]["rules"]["line_gap"] == 1
 
@@ -203,14 +202,14 @@ def test_config_manager_normalizes_device_template_paths_to_app_scope(tmp_path):
     )
 
     manager = ConfigManager(config_path, tmp_path / "outbox.json")
-    app_config = manager.get_app_config("192.168.1.108", "wechat", WECHAT_DEFAULT_CONFIG)
+    app_config = manager.get_app_config("192.168.1.108", "wechat", XINYU_DEFAULT_CONFIG)
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     app_saved = _read_app_config(tmp_path, "wechat")
 
     # 模板路径属开发域：历史设备层残留的 runtime\templates 路径被清除，
     # 生效值回落到随包/代码默认（本就是规范化目标位置）。
-    assert app_config["templates"]["buttons"] == WECHAT_DEFAULT_CONFIG["templates"]["buttons"]
-    assert app_config["templates"]["screens"] == WECHAT_DEFAULT_CONFIG["templates"]["screens"]
+    assert app_config["templates"]["buttons"] == XINYU_DEFAULT_CONFIG["templates"]["buttons"]
+    assert app_config["templates"]["screens"] == XINYU_DEFAULT_CONFIG["templates"]["screens"]
     assert "apps" not in saved
     assert "templates" not in app_saved
 
@@ -248,7 +247,7 @@ def test_config_manager_updates_app_runtime_and_persona_scopes_independently(tmp
     saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     app_saved = _read_app_config(tmp_path, "wechat")
     device = manager.find_device("1.1.1.1") or {}
-    merged = manager.get_app_config("1.1.1.1", "wechat", WECHAT_DEFAULT_CONFIG)
+    merged = manager.get_app_config("1.1.1.1", "wechat", XINYU_DEFAULT_CONFIG)
 
     assert "apps" not in saved
     # 视觉调参属开发域：客户层与存盘都不保留，生效值回到随包/代码默认。
@@ -259,7 +258,7 @@ def test_config_manager_updates_app_runtime_and_persona_scopes_independently(tmp
     assert saved["devices"][0]["runtime_overrides"]["exclude_ocr_wait_from_step_timeout"] is False
     assert saved["devices"][0]["app_overrides"]["wechat"]["persona"]["name"] == "bot"
     assert device["runtime_overrides"]["poll_interval"] == 6
-    assert merged["match_threshold"] == WECHAT_DEFAULT_CONFIG["match_threshold"]
+    assert merged["match_threshold"] == XINYU_DEFAULT_CONFIG["match_threshold"]
     assert merged["persona"]["name"] == "bot"
 
 

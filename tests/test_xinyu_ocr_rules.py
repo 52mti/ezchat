@@ -8,13 +8,12 @@ import apps.xinyu.ocr_rules as ocr_rules
 import apps.xinyu.ocr_rules as xinyu_ocr_rules
 from apps.xinyu.ocr_config import DIALOGUE_OCR_MODE as XINYU_DIALOGUE_OCR_MODE
 from apps.xinyu.ocr_defaults import DIALOGUE_OCR_DEFAULT as XINYU_DIALOGUE_OCR_DEFAULT
-from apps.xinyu.config import DEFAULT_CONFIG as WECHAT_CONFIG
-from apps.xinyu.ocr_config import DIALOGUE_OCR_MODE as WECHAT_DIALOGUE_OCR_MODE
+from apps.xinyu.config import DEFAULT_CONFIG as XINYU_CONFIG
 from apps.xinyu.ocr_rules import build_dialogue_result, looks_like_time_text, run_ocr_mode
 
 
 def _dialogue_rules(**overrides):
-    rules = copy.deepcopy(WECHAT_DIALOGUE_OCR_MODE["rules"])
+    rules = copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"])
     for key, value in overrides.items():
         if isinstance(value, dict) and isinstance(rules.get(key), dict):
             rules[key].update(value)
@@ -159,7 +158,7 @@ def test_run_ocr_mode_returns_portrait_bounds_for_landscape_input(monkeypatch):
 
     result = run_ocr_mode(
         Image.new("RGB", (200, 100), "white"),
-        copy.deepcopy(WECHAT_CONFIG),
+        copy.deepcopy(XINYU_CONFIG),
         "list",
     )
 

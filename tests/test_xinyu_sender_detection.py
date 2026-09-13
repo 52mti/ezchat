@@ -2,14 +2,13 @@
 
 import copy
 
-from apps.xinyu.ocr_config import DIALOGUE_OCR_MODE as WECHAT_DIALOGUE_OCR_MODE
 from apps.xinyu.ocr_config import DIALOGUE_OCR_MODE as XINYU_DIALOGUE_OCR_MODE
 import apps.xinyu.ocr_rules as xinyu_ocr_rules
 from apps.xinyu.ocr_rules import build_dialogue_result
 
 
 def _dialogue_rules(**overrides):
-    rules = copy.deepcopy(WECHAT_DIALOGUE_OCR_MODE["rules"])
+    rules = copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"])
     for key, value in overrides.items():
         if isinstance(value, dict) and isinstance(rules.get(key), dict):
             rules[key].update(value)
