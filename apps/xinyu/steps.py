@@ -44,9 +44,15 @@ from services.vision_dialogue_client import VisionDialogueClient, VisionDialogue
 from services.rule_learning import RuleLearningStore
 from services.coordinate_cache import persist_from_runtime
 from services.vision_usage import acquire as acquire_vision_usage, record_rule_learning, rule_learning_status
-from vision import match, run_ocr_mode
-from vision.ocr_rules import looks_like_debug_text, looks_like_reward_text, looks_like_time_text
+from vision import match
 from vision.screen import ensure_portrait_image, load_image
+
+from .ocr_rules import (
+    looks_like_debug_text,
+    looks_like_reward_text,
+    looks_like_time_text,
+    run_ocr_mode,
+)
 
 from .config import DEFAULT_CONFIG
 
@@ -57,6 +63,14 @@ LLM_VISION_CALL_LIMIT = 50
 
 class StepUnavailable(RuntimeError):
     pass
+
+
+class DialogueOpponentMessageMissing(StepUnavailable):
+    """聊天界面正常（OCR 有文字）但对方最新消息无可读内容（纯表情/图片等）。
+
+    上层可安全地按「你好」招呼处理；区别于整屏无文字的 StepUnavailable
+    （可能界面不对/黑屏，不能对着错误界面发招呼）。
+    """
 
 
 class BlackScreenError(RuntimeError):
@@ -778,6 +792,42 @@ def _select_list_target_from_ocr_result(
     )
 
 
+def _fallback_unread_view_target(ocr_result: dict[str, Any]) -> dict[str, Any] | None:
+    """未回复视图兜底：行既无角标也无 OCR 可读预览（纯表情/图片消息）时取首行有效会话。
+
+    调用前提：check_unread_button 已确认处于「未回复」过滤视图——该视图内
+    每一行按定义都是待回复会话，行级角标/预览门槛在此是冗余的。
+    """
+    result = ocr_result.get("result", {}) if isinstance(ocr_result, dict) else {}
+    rows = result.get("message_list", []) if isinstance(result, dict) else []
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict) or _is_empty_list_row(row):
+            continue
+        if not _clean_list_text(row.get("name")):
+            continue
+        bounds = row.get("bounds")
+        if not isinstance(bounds, list) or len(bounds) != 4:
+            continue
+        left, top, right, bottom = (float(v) for v in bounds)
+        center_x, center_y = _center_from_bounds([left, top, right, bottom])
+        try:
+            unread_count = int(row.get("unread_count") or 0)
+        except (TypeError, ValueError):
+            unread_count = 0
+        return {
+            "name": row.get("name", ""),
+            "content": row.get("content", ""),
+            "favorability": row.get("favorability"),
+            "unread_count": unread_count,
+            "bounds": row.get("bounds", [left, top, right, bottom]),
+            "x": center_x,
+            "y": center_y,
+        }
+    return None
+
+
 def _photo_contact_key(value: Any) -> str:
     """Normalize a contact name for the per-run photo-send ledger."""
     return re.sub(r"\s+", "", str(value or "")).casefold()
@@ -927,27 +977,46 @@ def _select_online_target_from_ocr_result(
     }
 
 
-def _looks_like_black_screen(image: Any, config: dict[str, Any]) -> bool:
+def _black_screen_stats(image: Any, config: dict[str, Any]) -> dict[str, Any]:
+    """黑屏判定依据（模板 + 亮度启发），供判定与诊断日志共用。"""
+    template_hit = _matches_screen(image, config, BLACK_SCREEN)
     try:
         pixels = np.array(load_image(image).convert("RGB")).astype(np.float32)
     except Exception:
-        return False
-    if pixels.size == 0:
-        return False
+        pixels = None
+    if pixels is None or pixels.size == 0:
+        return {"is_black": bool(template_hit), "template_hit": template_hit, "mean_luma": None, "dark_ratio": None}
     luma = pixels[:, :, 0] * 0.299 + pixels[:, :, 1] * 0.587 + pixels[:, :, 2] * 0.114
     mean_luma = float(luma.mean())
-    dark_ratio = float((luma <= float(config.get("black_screen_dark_luma_threshold", 45))).mean())
-    return (
-        mean_luma <= float(config.get("black_screen_mean_luma_threshold", 38))
-        and dark_ratio >= float(config.get("black_screen_dark_ratio_threshold", 0.88))
-    )
+    dark_threshold = float(config.get("black_screen_dark_luma_threshold", 45))
+    mean_threshold = float(config.get("black_screen_mean_luma_threshold", 38))
+    ratio_threshold = float(config.get("black_screen_dark_ratio_threshold", 0.88))
+    dark_ratio = float((luma <= dark_threshold).mean())
+    luma_black = mean_luma <= mean_threshold and dark_ratio >= ratio_threshold
+    return {
+        "is_black": bool(template_hit or luma_black),
+        "template_hit": template_hit,
+        "mean_luma": mean_luma,
+        "dark_ratio": dark_ratio,
+        "thresholds": (mean_threshold, ratio_threshold),
+    }
 
 
 def _raise_if_black_screen(image: Any, config: dict[str, Any]) -> None:
     if _matches_screen(image, config, NO_PHONE_SCREEN):
         raise NoPhoneScreenError("检测到无手机界面，请先把手机放回支架")
-    if _matches_screen(image, config, BLACK_SCREEN) or _looks_like_black_screen(image, config):
-        raise BlackScreenError("检测到黑屏界面，手机可能已熄屏或关机")
+    # 黑屏判定可配置关闭（enable_black_screen_detection，默认关闭）。
+    if not _optimization_enabled(config, "enable_black_screen_detection"):
+        return
+    stats = _black_screen_stats(image, config)
+    if stats.get("is_black"):
+        mean_threshold, ratio_threshold = stats.get("thresholds", (38, 0.88))
+        raise BlackScreenError(
+            "检测到黑屏界面，手机可能已熄屏或关机"
+            f"（判定依据：模板={bool(stats.get('template_hit'))}，"
+            f"亮度均值={stats.get('mean_luma')}/{mean_threshold}，"
+            f"暗像素占比={stats.get('dark_ratio')}/{ratio_threshold}）"
+        )
 
 
 def wait_for_call_screen_to_disappear(
@@ -1143,6 +1212,11 @@ def _cache_list_compact_region_from_ocr_result(config: dict[str, Any], ocr_resul
     bottom_margin = float(config.get("list_compact_bottom_margin", 0.02) or 0.02)
     first_row_top = min(float(bounds[1]) for bounds in row_bounds)
     list_top = max(float(full_region[1]), first_row_top - top_margin)
+    # 「未回复」Tab 带可能高于配置列表区顶（如 0.092 < 0.1）：
+    # 以 Tab 带顶再上探，不被 full_region 顶卡死，否则条带永远看不到 Tab 排。
+    unread_band = _valid_region(_cache_get(config, "ocr_regions", "unread_tab_band"))
+    if unread_band is not None:
+        list_top = min(list_top, max(0.0, float(unread_band[1]) - 0.01))
     bottom_nav_region = _valid_region(_cache_get(config, "ocr_regions", "bottom_nav"))
     full_bottom = float(full_region[1]) + float(full_region[3])
     bottom_nav_top = float(bottom_nav_region[1]) if bottom_nav_region is not None else full_bottom
@@ -1150,44 +1224,6 @@ def _cache_list_compact_region_from_ocr_result(config: dict[str, Any], ocr_resul
     if list_bottom - list_top < float(config.get("list_compact_min_height", 0.2) or 0.2):
         return
     _cache_set(config, "ocr_regions", "list_compact", [0.0, list_top, 1.0, list_bottom - list_top])
-
-
-def _cache_list_navigation_result(config: dict[str, Any], ocr_result: dict[str, Any], image: Any) -> None:
-    """保存最近一次包含顶部/底部导航的结果，供列表小范围 OCR 合并使用。"""
-    result = ocr_result.get("result", {}) if isinstance(ocr_result, dict) else {}
-    if not isinstance(result, dict):
-        return
-    navigation = {
-        "bottom_nav": copy.deepcopy(result.get("bottom_nav", [])),
-        "ocr_items": copy.deepcopy(ocr_result.get("ocr_items", [])),
-        "signature": _ocr_reuse_signature(image),
-    }
-    if not navigation["bottom_nav"] and not navigation["ocr_items"]:
-        return
-    _runtime_cache(config)["list_navigation_result"] = navigation
-
-
-def _merge_list_navigation_result(config: dict[str, Any], ocr_result: dict[str, Any], image: Any) -> dict[str, Any]:
-    """把导航扫描结果合并到列表小范围 OCR 结果，不改变 message_list。"""
-    cached = _runtime_cache(config).get("list_navigation_result")
-    if not isinstance(cached, dict):
-        return ocr_result
-    if not _same_ocr_signature(_ocr_reuse_signature(image), cached.get("signature"), config):
-        return ocr_result
-    merged = copy.deepcopy(ocr_result)
-    result = merged.setdefault("result", {})
-    if isinstance(result, dict):
-        result["bottom_nav"] = copy.deepcopy(cached.get("bottom_nav", []))
-    # 保留列表 OCR 的文字坐标；只补入导航扫描得到的项目，避免丢失未回复/在线等标签。
-    navigation_items = cached.get("ocr_items", [])
-    current_items = merged.get("ocr_items", [])
-    if isinstance(navigation_items, list) and isinstance(current_items, list):
-        merged["ocr_items"] = current_items + [
-            item for item in copy.deepcopy(navigation_items)
-            if isinstance(item, dict) and item not in current_items
-        ]
-    merged["_navigation_cache_hit"] = True
-    return merged
 
 
 def _list_compact_region(config: dict[str, Any]) -> list[float] | None:
@@ -1203,6 +1239,8 @@ def _run_list_ocr(
     reporter: Reporter | None = None,
     prefer_compact: bool = False,
 ) -> dict[str, Any]:
+    """列表 OCR：条带覆盖「未回复」Tab 带，有行即返回（不依赖导航缓存
+    合并，不再"同帧门槛失败→回退全屏"每轮双 OCR）；Tab 位置永远来自当前帧。"""
     compact_region = _list_compact_region(config)
     if compact_region is not None:
         compact_result = _run_ocr_mode(image, config, "list", region=compact_region)
@@ -1213,11 +1251,7 @@ def _run_list_ocr(
         )
         rows = compact_result.get("result", {}).get("message_list", [])
         if isinstance(rows, list) and rows:
-            merged_result = _merge_list_navigation_result(config, compact_result, image)
-            merged_nav = merged_result.get("result", {}).get("bottom_nav", [])
-            if isinstance(merged_nav, list) and merged_nav:
-                return merged_result
-            _report(reporter, "list_ocr_region", "列表导航缓存已失效，回退完整 OCR")
+            return compact_result
         _report(reporter, "list_ocr_region", "列表主体无有效行，回退完整 OCR")
     ocr_result = _run_ocr_mode(image, config, "list", region=None)
     _report(
@@ -1226,7 +1260,6 @@ def _run_list_ocr(
         "复用上一轮 list OCR 结果" if ocr_result.get("_cache_hit") else "列表 OCR 扫描",
     )
     _cache_bottom_nav_from_ocr_result(config, ocr_result)
-    _cache_list_navigation_result(config, ocr_result, image)
     _cache_list_compact_region_from_ocr_result(config, ocr_result)
     return ocr_result
 
@@ -1299,6 +1332,14 @@ def _cache_unread_tab_band(config: dict[str, Any], bounds: list[float]) -> None:
     band_bottom = min(1.0, bottom + pad)
     if band_bottom > band_top:
         _cache_set(config, "ocr_regions", "unread_tab_band", [0.0, band_top, 1.0, band_bottom - band_top])
+        # 已有列表条带时同步上探上界：下一轮条带 OCR 才能覆盖 Tab 排，
+        # Tab 位置永远取当前帧（未回复条带位置可能随横幅漂移）。
+        compact = _valid_region(_cache_get(config, "ocr_regions", "list_compact"))
+        if compact is not None and band_top < float(compact[1]):
+            new_top = max(0.0, band_top - 0.01)
+            new_height = float(compact[1]) + float(compact[3]) - new_top
+            if new_height >= float(config.get("list_compact_min_height", 0.2) or 0.2):
+                _cache_set(config, "ocr_regions", "list_compact", [0.0, new_top, 1.0, new_height])
 
 
 def _chat_list_title_region(config: dict[str, Any]) -> tuple[float, float, float, float] | None:
@@ -1395,6 +1436,10 @@ def dismiss_popups(
     current_image = image if image is not None else _capture_image(
         robot, config, pre_move=True, label="popup_check"
     )
+    # 聊天界面不做弹窗模板检测：弹窗模板在聊天内容上的模糊命中会误点进聊天区。
+    # 真弹窗浮在聊天界面上时，先经返回键回列表，由下一轮入口检查在列表上关闭。
+    if _is_chat_window_image(current_image, config):
+        return False
     close_point = _popup_close_point(current_image, config)
     if close_point is None:
         return False
@@ -1467,6 +1512,8 @@ def capture_after_popups(
     if skip_popup_detection:
         return image
     for _ in range(max_dismiss):
+        if _is_chat_window_image(image, config):
+            break
         close_point = _popup_close_point(image, config)
         if close_point is None:
             break
@@ -1977,6 +2024,18 @@ def find_unread_target(
     )
     if target is not None:
         return target
+    fallback = _fallback_unread_view_target(checked_ocr_result)
+    if fallback is not None:
+        _report(
+            reporter,
+            "list_target_fallback",
+            "未回复视图内无角标且无可读预览，取首行会话",
+            log_label=(
+                f"未回复视图兜底：进入 {fallback.get('name', '')}"
+                "（预览不可读，可能为表情/图片消息）"
+            ),
+        )
+        return fallback
     return None
 
 
@@ -2495,7 +2554,7 @@ def read_message(
         raise StepUnavailable("聊天详情 OCR 未识别到任何文字")
     if not has_content:
         target_sender = str(cfg["ocr_modes"]["dialogue"]["rules"].get("target_sender", "sender1"))
-        raise StepUnavailable(f"聊天详情 OCR 未识别到对方消息：目标 sender={target_sender}")
+        raise DialogueOpponentMessageMissing(f"聊天详情 OCR 未识别到对方消息：目标 sender={target_sender}")
     return message
 
 
@@ -2543,6 +2602,24 @@ def _cached_quick_reply_bottom(config: dict[str, Any]) -> float | None:
     return value if 0.0 < value < 1.0 else None
 
 
+def _ocr_item_box(item: dict[str, Any]) -> tuple[float | None, float | None, float | None, float | None]:
+    """兼容两种 OCR 条目形态：bounds=[x,y,w,h] 或平铺的 x/y/w/h 键。
+
+    对话模式的 ocr_items 是平铺形态（本 App ocr_rules 输出），历史代码
+    只认 bounds 键导致区域学习从未生效。
+    """
+    bounds = item.get("bounds")
+    if isinstance(bounds, (list, tuple)) and len(bounds) >= 4:
+        try:
+            return float(bounds[0]), float(bounds[1]), float(bounds[2]), float(bounds[3])
+        except (TypeError, ValueError):
+            return None, None, None, None
+    try:
+        return float(item["x"]), float(item["y"]), float(item["w"]), float(item["h"])
+    except (KeyError, TypeError, ValueError):
+        return None, None, None, None
+
+
 def _quick_reply_texts(payload: dict[str, Any]) -> list[str]:
     values = payload.get("quick_replies", [])
     if not isinstance(values, list):
@@ -2568,13 +2645,8 @@ def _quick_reply_ocr_top(
         if not isinstance(item, dict):
             continue
         text = re.sub(r"\s+", "", str(item.get("text", "") or "").strip())
-        bounds = item.get("bounds")
-        if not text or not isinstance(bounds, (list, tuple)) or len(bounds) < 4:
-            continue
-        try:
-            top = float(bounds[1])
-            height = float(bounds[3])
-        except (TypeError, ValueError):
+        left, top, _width, height = _ocr_item_box(item)
+        if not text or left is None or top is None or height is None:
             continue
         if not 0.0 <= top < 1.0 or height <= 0.0:
             continue
@@ -2613,6 +2685,7 @@ def _update_dynamic_chat_area(
     sender1_left: float | None = None
     sender2_right: float | None = None
     used: set[int] = set()
+    paired_count = 0
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -2636,21 +2709,26 @@ def _update_dynamic_chat_area(
         if best_index < 0 or best_score < 0.72:
             continue
         item = items[best_index]
-        bounds = item.get("bounds")
-        if not isinstance(bounds, (list, tuple)) or len(bounds) < 4:
-            continue
-        try:
-            left, top, width, height = (float(bounds[index]) for index in range(4))
-        except (TypeError, ValueError):
-            continue
-        if width <= 0 or height <= 0:
+        left, top, width, height = _ocr_item_box(item)
+        if width is None or height is None or width <= 0 or height <= 0:
             continue
         used.add(best_index)
+        paired_count += 1
         if sender == "sender1":
             sender1_left = left if sender1_left is None else min(sender1_left, left)
         else:
             right = left + width
             sender2_right = right if sender2_right is None else max(sender2_right, right)
+    _set_metric(
+        config,
+        "dialogue_chat_area_pairing",
+        {
+            "messages": len(messages) if isinstance(messages, list) else 0,
+            "paired": paired_count,
+            "sender1_found": sender1_left is not None,
+            "sender2_found": sender2_right is not None,
+        },
+    )
     quick_reply_top = _quick_reply_ocr_top(llm_payload, items)
     quick_reply_bottom = None if quick_reply_top is None else max(0.0, quick_reply_top - 0.01)
     if quick_reply_bottom is not None:
@@ -2681,6 +2759,105 @@ def _update_dynamic_chat_area(
     )
     _set_metric(config, "dialogue_chat_area", updated)
     return True
+
+
+def calibrate_dialogue_chat_area(
+    robot: Any,
+    config: dict[str, Any] | None = None,
+    reporter: Reporter | None = None,
+    image: Any | None = None,
+) -> dict[str, Any]:
+    """手动执行一次「视觉 + OCR」标定，学习并落盘当前透视的聊天区域缓存。
+
+    供 UI 一键调用：截图（同步透视签名与坐标缓存）→ 视觉 parse_dialogue →
+    对话 OCR → _update_dynamic_chat_area → 持久化。要求设备当前停留在
+    聊天界面。手动标定独立于运行额度：不检查、不消耗视觉识别次数。
+
+    image 可传 UI 预先截好的图（此时该次截图已完成透视同步），传 None
+    则由本函数自行截图。
+    """
+    cfg = _config(config)
+    if not isinstance(cfg.get("_runtime"), dict):
+        cfg["_runtime"] = {"device_ip": "", "app_name": "xinyu"}
+    # 外部截图必须带着已同步的 config 来（perspective_signature 在截图中写入），
+    # 否则 persist_from_runtime 会因缺签名而静默不落盘。
+    if image is None or not cfg["_runtime"].get("perspective_signature"):
+        image = capture_transform_image(robot, cfg, pre_move=True, label="vision_calibration")
+    # OCR 先行：预检不单靠聊天模板（偶发假阴性），屏上能读到消息文本也算数。
+    ocr_result = _run_ocr_mode(image, cfg, "dialogue", region=None)
+    if not _is_chat_window_image(image, cfg) and not ocr_result.get("ocr_items"):
+        return {
+            "ok": False,
+            "reason": "当前不是聊天界面：请先让设备停留在某个聊天窗口再标定",
+        }
+    llm_payload: dict[str, Any] | None = None
+    vision_error = ""
+    for attempt in range(2):
+        try:
+            with exclude_ocr_wait_from_step_timeout(cfg):
+                reply = _DIALOGUE_LLM_CLIENT.parse_dialogue(image, cfg)
+        except (VisionDialogueError, RuntimeError) as exc:
+            vision_error = str(exc)
+            _report(
+                reporter,
+                "vision_calibration",
+                "视觉识别返回异常，重试一次" if attempt == 0 else "视觉识别返回异常，放弃",
+                log_label=f"视觉识别返回异常：{exc}",
+            )
+            continue
+        candidate = reply.payload if isinstance(getattr(reply, "payload", None), dict) else None
+        if candidate is not None and candidate.get("messages"):
+            llm_payload = candidate
+            break
+        # 汇总模型偶发清空 messages，自动再试一次。
+        llm_payload = candidate if isinstance(candidate, dict) else llm_payload
+        _report(
+            reporter,
+            "vision_calibration",
+            "视觉未返回双方消息，重试一次" if attempt == 0 else "视觉连续两次未返回双方消息",
+        )
+    if llm_payload is None:
+        reason = f"视觉识别连续失败：{vision_error}" if vision_error else "视觉连续两次未返回双方消息，无法标定"
+        return {"ok": False, "reason": reason}
+    updated = _update_dynamic_chat_area(cfg, llm_payload, ocr_result)
+    _dialogue_message_region(image, cfg)
+    persist_from_runtime(cfg)
+    try:
+        calibration_image = ensure_portrait_image(image)
+    except Exception:
+        calibration_image = None  # 仅供 UI 可视化，失败不影响标定结果
+    pairing = (
+        cfg.get("_runtime_cache", {}).get("metrics", {}).get("dialogue_chat_area_pairing", {})
+        if isinstance(cfg.get("_runtime_cache"), dict)
+        else {}
+    )
+    if not updated:
+        reason = "视觉与 OCR 未匹配到双方消息坐标，区域未更新"
+        if isinstance(pairing, dict):
+            reason += (
+                f"（视觉返回消息 {pairing.get('messages', 0)} 条，"
+                f"配对成功 {pairing.get('paired', 0)} 条，"
+                f"对方边界={'有' if pairing.get('sender1_found') else '无'}，"
+                f"我方边界={'有' if pairing.get('sender2_found') else '无'}）"
+            )
+    else:
+        reason = ""
+    _report(
+        reporter,
+        "vision_calibration",
+        "视觉标定完成，聊天区域已更新" if updated else "视觉标定完成，但未匹配到双方消息坐标",
+        log_label=(
+            f"视觉标定：chat_area_dynamic={_cache_get(cfg, 'ocr_regions', 'chat_area_dynamic')}"
+            f"，dialogue_message={_cache_get(cfg, 'ocr_regions', 'dialogue_message')}"
+        ),
+    )
+    return {
+        "ok": bool(updated),
+        "reason": reason,
+        "chat_area_dynamic": _cache_get(cfg, "ocr_regions", "chat_area_dynamic"),
+        "dialogue_message": _cache_get(cfg, "ocr_regions", "dialogue_message"),
+        "image": calibration_image,
+    }
 
 
 def read_dialogue_continuity(image: Any, config: dict[str, Any] | None = None) -> dict[str, list[str]]:

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -269,6 +269,7 @@ def test_xinyu_app_dialogue_region_filter_is_forced_off(tmp_path):
 
 def test_xinyu_ensure_list_screen_raises_on_black_screen(monkeypatch, tmp_path):
     config = _config(tmp_path)
+    config["enable_black_screen_detection"] = True
     robot = FakeRobot(["black"])
 
     def fake_match(image, template, threshold=0.85):
@@ -284,6 +285,7 @@ def test_xinyu_ensure_list_screen_raises_on_black_screen(monkeypatch, tmp_path):
 
 def test_xinyu_ensure_list_screen_raises_on_pixel_black_screen(monkeypatch, tmp_path):
     config = _config(tmp_path)
+    config["enable_black_screen_detection"] = True
     black_image = Image.new("RGB", (200, 400), (3, 3, 3))
     robot = FakeRobot([black_image])
 
@@ -725,9 +727,14 @@ def test_xinyu_popup_dismiss_ignores_after_two_clicks(monkeypatch, tmp_path):
     assert robot.clicks == [pytest.approx((0.46, 0.23)), pytest.approx((0.46, 0.23))]
 
 
-def test_xinyu_popup_detection_clicks_popup_when_chat_template_also_matches(monkeypatch, tmp_path):
+def test_xinyu_popup_detection_skips_when_chat_window(monkeypatch, tmp_path):
+    """聊天界面不做弹窗检测：即使弹窗模板在聊天内容上模糊命中也不点击。
+
+    回归背景：弹窗模板误命中聊天区导致“关闭弹窗”点进聊天内容里；
+    真弹窗浮在聊天界面上时先回列表、下一轮入口再关。
+    """
     config = _config(tmp_path)
-    robot = FakeRobot(["chat_popup", "chat"])
+    robot = FakeRobot(["chat"])
     checked_templates: list[str] = []
 
     def fake_match(image, template, threshold=0.85):
@@ -735,7 +742,7 @@ def test_xinyu_popup_detection_clicks_popup_when_chat_template_also_matches(monk
         checked_templates.append(template_name)
         if image == "chat" and template_name == "screen_聊天界面.jpg":
             return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
-        if image == "chat_popup" and template_name == "popup_custom_1.jpg":
+        if image == "chat" and template_name == "popup_custom_1.jpg":
             return {"x": 0.1, "y": 0.2, "w": 0.4, "h": 0.3, "score": 0.99}
         return None
 
@@ -744,8 +751,9 @@ def test_xinyu_popup_detection_clicks_popup_when_chat_template_also_matches(monk
     image = steps.capture_after_popups(robot, config)
 
     assert image == "chat"
-    assert robot.clicks == [pytest.approx((0.46, 0.23))]
-    assert "popup_custom_1.jpg" in checked_templates
+    assert robot.clicks == []
+    assert "screen_聊天界面.jpg" in checked_templates
+    assert "popup_custom_1.jpg" not in checked_templates
 
 
 def test_xinyu_popup_detection_stops_when_after_popup_image_is_chat(monkeypatch, tmp_path):
@@ -768,7 +776,8 @@ def test_xinyu_popup_detection_stops_when_after_popup_image_is_chat(monkeypatch,
 
     assert image == "chat"
     assert robot.clicks == [pytest.approx((0.46, 0.23))]
-    assert ("chat", "popup_custom_1.jpg") in checked_templates
+    assert ("chat", "screen_聊天界面.jpg") in checked_templates
+    assert ("chat", "popup_custom_1.jpg") not in checked_templates
 
 
 def test_xinyu_unknown_screen_does_not_click_default_back(monkeypatch, tmp_path):
@@ -1604,6 +1613,10 @@ def test_xinyu_new_greeting_back_secondary_reuses_back_region(monkeypatch, tmp_p
 
     monkeypatch.setattr(steps, "match_template_with_region", fake_match_template_with_region)
     monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
+    # capture_after_popups 的聊天界面豁免会做列表标题 OCR + 模板匹配：
+    # 本测试聚焦返回按钮区域复用，界面判定一律返回“不是列表、不是聊天、无弹窗”。
+    monkeypatch.setattr(steps, "_matches_chat_list_screen", lambda image, config, reporter=None: False)
+    monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
 
     assert steps.send_new_greeting_if_available(robot, config, image="chat") is True
     assert "button.back.secondary" not in used_keys

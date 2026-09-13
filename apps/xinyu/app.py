@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
@@ -25,6 +25,9 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 class XinyuApp(BaseApp):
+    # 能力声明：DeviceWorker 据此注入对应 provider，不再按 App 名字分支。
+    supports_dialogue_continuity = True
+    supports_greeting = True
     name = "心遇"
     description = "Xinyu unread message scan and TTS reply flow"
     REMOTE_FILTER_RULE_SYNC_INTERVAL_SECONDS = 3600.0
@@ -36,6 +39,8 @@ class XinyuApp(BaseApp):
         reply_provider: Callable[[dict[str, str]], str | ReplyAction] | None = None,
         sent_callback: Callable[[ReplyAction, dict[str, str]], None] | None = None,
         continuity_required_provider: Callable[[dict[str, Any]], bool] | None = None,
+        greeting_provider: Callable[[str], str] | None = None,
+        greeting_sent_notifier: Callable[[str], None] | None = None,
     ) -> None:
         merged_config = _deep_merge(DEFAULT_CONFIG, config or {})
         steps._disable_dialogue_region_filter(merged_config)
@@ -51,6 +56,9 @@ class XinyuApp(BaseApp):
         self.reply_provider = reply_provider or (lambda message: "")
         self.sent_callback = sent_callback
         self.continuity_required_provider = continuity_required_provider
+        # 人设 AI 新链路（docs/13 4.4）：招呼改写与平台新招呼占位记录
+        self.greeting_provider = greeting_provider
+        self.greeting_sent_notifier = greeting_sent_notifier
         self.last_activity_at = time.monotonic()
         self.idle_points_checked = False
         self.idle_online_photo_attempted = False
@@ -283,6 +291,12 @@ class XinyuApp(BaseApp):
             chat_image = steps.confirm_chat_window(self.robot, self.config, reporter=reporter)
             if steps.send_new_greeting_if_available(self.robot, self.config, image=chat_image, reporter=reporter):
                 self._mark_activity()
+                # 平台代发的新招呼：文本读不到，写占位轮保证人设知道是自己先开的口（docs/13 4.4）
+                if self.greeting_sent_notifier:
+                    try:
+                        self.greeting_sent_notifier(target_name)
+                    except Exception as exc:
+                        self.emit_runtime_log("warning", "新招呼占位落库失败", {"name": target_name, "error": str(exc)})
                 reporter("wait_next_round", "等待下一轮扫描")
                 self.record_reply_round(time.monotonic() - round_started_at)
                 self._emit_round_metrics(round_started_at)
@@ -333,7 +347,23 @@ class XinyuApp(BaseApp):
                     ),
                 )
             else:
-                message = steps.read_message(self.robot, self.config, target, image=chat_image, reporter=reporter)
+                try:
+                    message = steps.read_message(self.robot, self.config, target, image=chat_image, reporter=reporter)
+                except steps.DialogueOpponentMessageMissing:
+                    # 聊天界面正常但对方新消息是表情/图片等无可读内容：
+                    # 按「你好」招呼处理，从 pingtai.txt 挑招呼语回复。
+                    message = steps.build_list_message(target, "你好")
+                    greeting_reply = self._pick_greeting_reply()
+                    reporter(
+                        "greeting_reply_pick",
+                        "对方消息为表情/图片，按“你好”回招呼语",
+                        log_label=f"对方消息为表情/图片，按“你好”回招呼语：{target_name}",
+                    )
+                    self.emit_runtime_log(
+                        "warning",
+                        "对方消息无可读内容，按招呼处理",
+                        {"name": target_name, "greeting_reply": greeting_reply},
+                    )
 
             if use_list_content and self.continuity_required_provider:
                 try:
@@ -358,10 +388,23 @@ class XinyuApp(BaseApp):
             input_focused = False
             if greeting_reply:
                 reporter("request_ai", "请求 AI 回复")
-                steps.focus_input_box(self.robot, self.config, reporter=reporter)
-                self._mark_activity()
-                input_focused = True
-                action = ReplyAction(text=greeting_reply)
+                if self.greeting_provider:
+                    # 人设 AI 招呼链路：底稿挑选/AI 改写/防重复/回退全部在 provider 内完成（docs/13 4.4）
+                    executor = ThreadPoolExecutor(max_workers=1)
+                    future = executor.submit(self.greeting_provider, str(message.get("contact") or target_name or ""))
+                    try:
+                        steps.focus_input_box(self.robot, self.config, reporter=reporter)
+                        self._mark_activity()
+                        input_focused = True
+                        greeting_text = future.result()
+                    finally:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    action = ReplyAction(text=greeting_text or greeting_reply, reason="greeting_reply")
+                else:
+                    steps.focus_input_box(self.robot, self.config, reporter=reporter)
+                    self._mark_activity()
+                    input_focused = True
+                    action = ReplyAction(text=greeting_reply, reason="greeting_reply")
             else:
                 reporter("request_ai", "请求 AI 回复")
                 executor = ThreadPoolExecutor(max_workers=1)

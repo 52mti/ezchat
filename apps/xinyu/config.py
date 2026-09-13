@@ -1,4 +1,4 @@
-from services.defaults import DEFAULT_PERSONA_CONFIG, DEFAULT_RUNTIME_CONFIG
+﻿from services.defaults import DEFAULT_PERSONA_CONFIG, DEFAULT_RUNTIME_CONFIG
 
 from .ocr_config import LLM_DIALOGUE_CONFIG, OCR_MODES
 
@@ -51,10 +51,13 @@ DEFAULT_CONFIG = {
         "button.new_greeting": [0.011, 0.687, 0.98, 0.171],
         "button.photo": [0.0, 0.55, 0.65, 0.45],
         "button.complete": [0.0, 0.0, 1.0, 0.35],
+        "button.custom.主界面心遇按钮": [0.532, 0.533, 0.147, 0.095],
         "button.send": [0.63, 0.305, 0.367, 0.376],
         "screen.chat_list": [0.0, 0.023, 0.489, 0.127],
         "screen.chat_window": [0.007, 0.476, 0.261, 0.523],
         "screen.my": [0.468, 0.686, 0.488, 0.187],
+        "screen.no_phone": [0.0, 0.0, 1.0, 1.0],
+        "screen.black_screen": [0.0, 0.0, 1.0, 1.0],
         "screen.call_window": [0.004, 0.722, 0.415, 0.278],
         "popup.custom.popup_custom_1": [0.06, 0.292, 0.819, 0.406],
         "popup.custom.popup_custom_2": [0.037, 0.282, 0.954, 0.443],
@@ -64,6 +67,7 @@ DEFAULT_CONFIG = {
         "popup.custom.popup_custom__customer_1": [0.304, 0.696, 0.346, 0.136],
     },
     "template_match_thresholds": {
+        "button.custom.主界面心遇按钮": 0.88,
     },
     **DEFAULT_RUNTIME_CONFIG,
     "idle_poll_interval_seconds": 5,
@@ -74,6 +78,7 @@ DEFAULT_CONFIG = {
     "enable_screenshot_ocr_reuse": True,
     "enable_bottom_nav_anchor_reuse": True,
     "enable_keep_awake_message_anchor": True,
+    "enable_black_screen_detection": False,
     "enable_compact_list_ocr_region": True,
     "enable_compact_dialogue_ocr_region": True,
     "enable_unread_tab_band_cache": True,
