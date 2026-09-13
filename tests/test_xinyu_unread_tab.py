@@ -1,9 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from apps.xinyu import steps
 from apps.xinyu.config import DEFAULT_CONFIG
 from apps.xinyu.ocr_config import LIST_OCR_MODE
-from vision.ocr_rules import build_list_result
+from apps.xinyu.ocr_rules import build_list_result
 
 
 def test_unread_tab_falls_back_to_raw_ocr_when_banner_pushes_filter_down(monkeypatch):

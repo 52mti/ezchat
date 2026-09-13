@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
@@ -8,7 +8,8 @@ from services.photo_capture import capture_transform_image
 from apps.reporting import Reporter, format_point, report_step
 from services.step_timing import exclude_ocr_wait_from_step_timeout
 from apps.utils import play_prepared_tts_input, prepare_tts_input
-from vision import match, run_ocr_mode
+from apps import run_ocr_mode_for
+from vision import match
 
 from .visual_assets import (
     BACK_BUTTON,
@@ -53,7 +54,10 @@ def _popup_threshold(config: dict[str, Any], key: str | None = None) -> float:
 
 def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = None) -> dict[str, Any]:
     with exclude_ocr_wait_from_step_timeout(config):
-        return run_ocr_mode(image, config, mode, region=region)
+        runtime = config.get("_runtime") if isinstance(config, dict) else None
+        app_name = runtime.get("app_name") if isinstance(runtime, dict) else None
+        engine = run_ocr_mode_for(app_name)
+        return engine(image, config, mode, region=region)
 
 
 def _popup_match(image: Any, popup_template: Path, config: dict[str, Any]) -> dict[str, float] | None:

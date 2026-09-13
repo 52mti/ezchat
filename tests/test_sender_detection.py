@@ -1,10 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import copy
 
 from apps.wechat.ocr_config import DIALOGUE_OCR_MODE as WECHAT_DIALOGUE_OCR_MODE
 from apps.xinyu.ocr_config import DIALOGUE_OCR_MODE as XINYU_DIALOGUE_OCR_MODE
-from vision.ocr_rules import build_dialogue_result
+import apps.wechat.ocr_rules as wechat_ocr_rules
+import apps.xinyu.ocr_rules as xinyu_ocr_rules
+from apps.wechat.ocr_rules import build_dialogue_result
 
 
 def _dialogue_rules(**overrides):
@@ -15,6 +17,7 @@ def _dialogue_rules(**overrides):
         else:
             rules[key] = value
     return rules
+
 
 
 def test_dialogue_sender_defaults_to_position_not_color_saturation():
@@ -67,6 +70,7 @@ def test_dialogue_sender_defaults_to_position_not_color_saturation():
     ]
 
 
+
 def test_dialogue_position_method_is_configurable():
     items = [
         {
@@ -107,6 +111,7 @@ def test_dialogue_position_method_is_configurable():
 
     assert default_result["dialogues"] == [{"sender": "sender1", "content": "wide message"}]
     assert center_result["dialogues"] == [{"sender": "sender2", "content": "wide message"}]
+
 
 
 def test_dialogue_bubble_color_method_prefers_purple_bubble_over_position():
@@ -161,6 +166,7 @@ def test_dialogue_bubble_color_method_prefers_purple_bubble_over_position():
     ]
 
 
+
 def test_dialogue_bubble_color_method_accepts_blue_purple_camera_shift():
     items = [
         {
@@ -207,6 +213,7 @@ def test_dialogue_bubble_color_method_accepts_blue_purple_camera_shift():
     )
 
     assert result["dialogues"] == [{"sender": "sender2", "content": "blue shifted purple"}]
+
 
 
 def test_dialogue_bubble_color_method_keeps_low_saturation_blue_card_as_sender1():
@@ -257,6 +264,7 @@ def test_dialogue_bubble_color_method_keeps_low_saturation_blue_card_as_sender1(
     assert result["dialogues"] == [{"sender": "sender1", "content": "blue image card"}]
 
 
+
 def test_xinyu_dialogue_bubble_color_method_marks_red_bubble_as_sender2():
     item = {
         "text": "红色气泡",
@@ -277,13 +285,14 @@ def test_xinyu_dialogue_bubble_color_method_marks_red_bubble_as_sender2():
         "background_blue_red_ratio": 0.92,
     }
 
-    result = build_dialogue_result(
+    result = xinyu_ocr_rules.build_dialogue_result(
         [item],
         (200, 300),
         copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"]),
     )
 
     assert result["dialogues"] == [{"sender": "sender2", "content": "红色气泡"}]
+
 
 
 def test_xinyu_dialogue_bubble_color_method_marks_wraparound_red_bubble_as_sender2():
@@ -306,13 +315,14 @@ def test_xinyu_dialogue_bubble_color_method_marks_wraparound_red_bubble_as_sende
         "background_blue_red_ratio": 0.49,
     }
 
-    result = build_dialogue_result(
+    result = xinyu_ocr_rules.build_dialogue_result(
         [item],
         (200, 300),
         copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"]),
     )
 
     assert result["dialogues"] == [{"sender": "sender2", "content": "深红气泡"}]
+
 
 
 def test_xinyu_dialogue_bubble_color_method_keeps_low_saturation_pink_bubble_as_sender1():
@@ -335,13 +345,14 @@ def test_xinyu_dialogue_bubble_color_method_keeps_low_saturation_pink_bubble_as_
         "background_blue_red_ratio": 0.92,
     }
 
-    result = build_dialogue_result(
+    result = xinyu_ocr_rules.build_dialogue_result(
         [item],
         (200, 300),
         copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"]),
     )
 
     assert result["dialogues"] == [{"sender": "sender1", "content": "浅粉气泡"}]
+
 
 
 def test_xinyu_dialogue_sender_fusion_records_color_position_conflict():
@@ -364,7 +375,7 @@ def test_xinyu_dialogue_sender_fusion_records_color_position_conflict():
         "background_blue_red_ratio": 0.92,
     }
 
-    result = build_dialogue_result(
+    result = xinyu_ocr_rules.build_dialogue_result(
         [item],
         (200, 300),
         copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"]),
@@ -376,6 +387,7 @@ def test_xinyu_dialogue_sender_fusion_records_color_position_conflict():
     assert item["sender_conflict"] is True
     assert item["sender_method"] == "color_position_fusion"
     assert 0.0 < item["sender_confidence"] < 1.0
+
 
 
 def test_xinyu_dialogue_bubble_color_method_keeps_white_blue_bubble_as_sender1():
@@ -398,7 +410,7 @@ def test_xinyu_dialogue_bubble_color_method_keeps_white_blue_bubble_as_sender1()
         "background_blue_red_ratio": 1.34,
     }
 
-    result = build_dialogue_result(
+    result = xinyu_ocr_rules.build_dialogue_result(
         [item],
         (200, 300),
         copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"]),
@@ -406,6 +418,7 @@ def test_xinyu_dialogue_bubble_color_method_keeps_white_blue_bubble_as_sender1()
 
     assert result["dialogues"] == [{"sender": "sender1", "content": "浅色气泡"}]
     assert "stats" not in result["debug"]
+
 
 
 def test_xinyu_dialogue_bubble_color_method_does_not_treat_dark_blue_header_as_sender2():
@@ -428,10 +441,67 @@ def test_xinyu_dialogue_bubble_color_method_does_not_treat_dark_blue_header_as_s
         "background_blue_red_ratio": 9.5,
     }
 
-    result = build_dialogue_result(
+    result = xinyu_ocr_rules.build_dialogue_result(
         [item],
         (200, 300),
         copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"]),
     )
 
     assert result["dialogues"] == [{"sender": "sender1", "content": "顶部标题"}]
+
+
+def test_xinyu_dialogue_wrap_line_inherits_first_line_sender():
+    """换行续行按几何合并，sender 继承首行——续行自身判定不作门槛。
+
+    回归背景：「哪？」这类我方消息的换行短续行，位置中心落在对方领地
+    （sender1），旧逻辑要求续行 sender 判对才肯合并，颜色采样一旦失灵
+    续行就会带着错的 sender 脱落成独立消息。
+    """
+    first_line = {
+        "text": "我还没能去过呢，你最喜欢",
+        "raw_text": "我还没能去过呢，你最喜欢",
+        "confidence": 0.99,
+        "min_x": 154,
+        "max_x": 446,
+        "min_y": 268,
+        "max_y": 298,
+        "center_x": 300,
+        "center_y": 283,
+        "width": 292,
+        "height": 30,
+        # 红气泡 → 首行可靠判为 sender2
+        "background_saturation": 0.42,
+        "background_hue": 4.0,
+        "background_value": 0.78,
+        "background_blue_green_delta": -8.0,
+        "background_blue_red_ratio": 0.92,
+    }
+    wrap_line = {
+        "text": "哪？",
+        "raw_text": "哪？",
+        "confidence": 0.99,
+        "min_x": 154,
+        "max_x": 198,
+        "min_y": 318,
+        "max_y": 346,
+        "center_x": 176,
+        "center_y": 332,
+        "width": 44,
+        "height": 28,
+        # 无色采样（hue=None）→ 位置回退：中心 0.294 屏宽 → 会被独立判成 sender1
+        "background_saturation": 0.02,
+        "background_hue": None,
+        "background_value": 0.9,
+        "background_blue_green_delta": 0.0,
+        "background_blue_red_ratio": 1.0,
+    }
+
+    result = xinyu_ocr_rules.build_dialogue_result(
+        [first_line, wrap_line],
+        (598, 1290),
+        copy.deepcopy(XINYU_DIALOGUE_OCR_MODE["rules"]),
+    )
+
+    assert result["dialogues"] == [
+        {"sender": "sender2", "content": "我还没能去过呢，你最喜欢哪？"}
+    ]

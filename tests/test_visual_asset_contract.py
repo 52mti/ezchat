@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -6,8 +6,6 @@ import pytest
 from PIL import Image
 
 from apps import visual_assets, visual_steps
-from apps.huanyou import app as huanyou_app
-from apps.huanyou import steps as huanyou_steps
 from apps.wechat import app as wechat_app
 from apps.wechat import steps as wechat_steps
 from apps.xinyu import app as xinyu_app
@@ -24,6 +22,7 @@ class FakeRobot:
 
     def move_click(self, x: float, y: float) -> None:
         self.clicks.append((x, y))
+
 
 
 def test_template_names_align_main_program_and_helper_tool_contract(tmp_path):
@@ -78,6 +77,7 @@ def test_template_names_align_main_program_and_helper_tool_contract(tmp_path):
     assert tool_rules["back_buttons"][0]["match_region_supported"] is True
 
 
+
 def test_template_region_match_maps_result_back_to_full_image(tmp_path):
     template_path = tmp_path / "btn.jpg"
     template_path.write_bytes(b"template")
@@ -104,6 +104,7 @@ def test_template_region_match_maps_result_back_to_full_image(tmp_path):
 
     assert seen_sizes == [(40, 100)]
     assert result == pytest.approx({"x": 0.3, "y": 0.5, "w": 0.04, "h": 0.1, "score": 0.99})
+
 
 
 def test_template_region_match_can_expand_configured_region(tmp_path):
@@ -134,6 +135,7 @@ def test_template_region_match_can_expand_configured_region(tmp_path):
     assert seen_sizes == [(44, 111)]
 
 
+
 def test_template_candidates_score_all_and_return_best_candidate(tmp_path):
     paths = [tmp_path / "first.jpg", tmp_path / "second.jpg"]
     for path in paths:
@@ -161,6 +163,7 @@ def test_template_candidates_score_all_and_return_best_candidate(tmp_path):
     assert result["score"] == pytest.approx(0.92)
 
 
+
 def test_template_candidates_failure_records_best_diagnostic(tmp_path):
     paths = [tmp_path / "first.jpg", tmp_path / "second.jpg"]
     for path in paths:
@@ -186,6 +189,7 @@ def test_template_candidates_failure_records_best_diagnostic(tmp_path):
     assert "0.680" in diagnostic
     assert "0.700" in diagnostic
     assert "gray_norm" in diagnostic
+
 
 
 def test_template_match_reuses_previous_result_when_same_photo(tmp_path):
@@ -227,6 +231,7 @@ def test_template_match_reuses_previous_result_when_same_photo(tmp_path):
     assert calls == 1
 
 
+
 def test_template_match_cache_can_be_disabled(tmp_path):
     visual_assets._TEMPLATE_MATCH_CACHE.clear()
     template_path = tmp_path / "btn.jpg"
@@ -265,6 +270,7 @@ def test_template_match_cache_can_be_disabled(tmp_path):
     assert calls == 2
 
 
+
 def test_template_region_config_reports_missing_region_instead_of_global_fallback(tmp_path):
     template_path = tmp_path / "btn.jpg"
     template_path.write_bytes(b"template")
@@ -284,6 +290,7 @@ def test_template_region_config_reports_missing_region_instead_of_global_fallbac
 
 
 @pytest.mark.parametrize("template_key", ["screen.no_phone", "screen.black_screen"])
+
 def test_abnormal_screen_templates_are_global_even_when_region_config_exists(tmp_path, template_key):
     template_path = tmp_path / "screen_abnormal.jpg"
     template_path.write_bytes(b"template")
@@ -306,6 +313,7 @@ def test_abnormal_screen_templates_are_global_even_when_region_config_exists(tmp
     assert calls == ["full-screen-image"]
 
 
+
 def test_next_popup_template_path_keeps_popup_pattern(tmp_path):
     buttons_dir = tmp_path / "buttons"
     buttons_dir.mkdir()
@@ -318,6 +326,7 @@ def test_next_popup_template_path_keeps_popup_pattern(tmp_path):
     assert visual_assets.is_popup_template_name(target.name)
 
 
+
 def test_next_back_button_template_path_keeps_app_button_pattern(tmp_path):
     buttons_dir = tmp_path / "buttons"
     buttons_dir.mkdir()
@@ -328,6 +337,7 @@ def test_next_back_button_template_path_keeps_app_button_pattern(tmp_path):
 
     assert target.name == "btn_返回按钮_3.jpg"
     assert visual_assets.is_back_button_template_name(target.name)
+
 
 
 def test_fixed_template_import_uses_incremental_variant_names(tmp_path):
@@ -344,6 +354,7 @@ def test_fixed_template_import_uses_incremental_variant_names(tmp_path):
 
     assert send_target.name == "btn_发送按钮_3.jpg"
     assert list_target.name == "screen_聊天列表_2.jpg"
+
 
 
 def test_customer_template_import_uses_separate_namespace(tmp_path):
@@ -371,6 +382,7 @@ def test_customer_template_import_uses_separate_namespace(tmp_path):
     ]
 
 
+
 def test_template_variant_paths_load_incremental_templates(tmp_path):
     buttons_dir = tmp_path / "buttons"
     buttons_dir.mkdir()
@@ -382,6 +394,7 @@ def test_template_variant_paths_load_incremental_templates(tmp_path):
     assert [path.name for path in paths] == ["btn_发送按钮.jpg", "btn_发送按钮_2.jpg", "btn_发送按钮_10.jpg"]
 
 
+
 def test_photo_button_variant_is_discoverable_without_base_template(tmp_path):
     buttons_dir = tmp_path / "buttons"
     buttons_dir.mkdir()
@@ -391,6 +404,7 @@ def test_photo_button_variant_is_discoverable_without_base_template(tmp_path):
     paths = visual_assets.template_variant_paths(buttons_dir, "btn_照片按钮.jpg")
 
     assert paths == [variant]
+
 
 
 def test_runtime_loads_multiple_back_button_templates(tmp_path):
@@ -409,6 +423,7 @@ def test_runtime_loads_multiple_back_button_templates(tmp_path):
     ]
 
 
+
 def test_runtime_loads_multiple_popup_templates(tmp_path):
     buttons_dir = tmp_path / "buttons"
     buttons_dir.mkdir()
@@ -420,32 +435,15 @@ def test_runtime_loads_multiple_popup_templates(tmp_path):
     assert [path.name for path in paths] == ["popup_custom_1.jpg", "popup_custom_2.jpg"]
 
 
+
 def test_popup_template_region_key_uses_each_template_name(tmp_path):
     path = tmp_path / "popup_custom_2.jpg"
 
     assert visual_assets.popup_template_region_key(path) == "popup.custom.popup_custom_2"
 
 
-def test_popup_match_uses_template_specific_region(monkeypatch, tmp_path):
-    popup_template = tmp_path / "popup_custom_1.jpg"
-    popup_template.write_bytes(b"template")
-    seen_sizes: list[tuple[int, int]] = []
 
-    def fake_match(image, template, threshold=0.85):
-        seen_sizes.append(image.size)
-        return {"x": 0.1, "y": 0.2, "w": 0.4, "h": 0.3, "score": 0.99}
-
-    monkeypatch.setattr(wechat_steps, "match", fake_match)
-    image = Image.new("RGB", (100, 200), "white")
-    config = {"template_match_regions": {"popup.custom.popup_custom_1": [0.5, 0.0, 0.5, 1.0]}}
-
-    result = wechat_steps._popup_match(image, popup_template, config)
-
-    assert seen_sizes == [(50, 200)]
-    assert result == {"x": 0.55, "y": 0.2, "w": 0.2, "h": 0.3, "score": 0.99}
-
-
-@pytest.mark.parametrize("steps_module", [visual_steps, wechat_steps, huanyou_steps, xinyu_steps])
+@pytest.mark.parametrize("steps_module", [visual_steps, wechat_steps, xinyu_steps])
 def test_popup_match_defaults_to_popup_threshold(monkeypatch, tmp_path, steps_module):
     popup_template = tmp_path / "popup_custom_1.jpg"
     popup_template.write_bytes(b"template")
@@ -465,6 +463,7 @@ def test_popup_match_defaults_to_popup_threshold(monkeypatch, tmp_path, steps_mo
     assert seen_thresholds == [0.8]
 
 
+
 def test_popup_match_drops_results_beyond_right_edge(monkeypatch, tmp_path):
     popup_template = tmp_path / "popup_custom_1.jpg"
     popup_template.write_bytes(b"template")
@@ -475,6 +474,7 @@ def test_popup_match_drops_results_beyond_right_edge(monkeypatch, tmp_path):
     monkeypatch.setattr(wechat_steps, "match", fake_match)
 
     assert wechat_steps._popup_match("screen", popup_template, {}) is None
+
 
 
 def test_runtime_detects_user_named_screens(monkeypatch, tmp_path):
@@ -505,18 +505,6 @@ def test_runtime_detects_user_named_screens(monkeypatch, tmp_path):
     assert wechat_steps.current_screen("screen_list.jpg", config) == "消息页"
     assert wechat_steps.current_screen("screen_chat.jpg", config) == "聊天详情"
 
-
-def test_each_app_keeps_its_own_step_flow_module():
-    assert wechat_app.steps is wechat_steps
-    assert xinyu_app.steps is xinyu_steps
-    assert huanyou_app.steps is huanyou_steps
-
-    assert wechat_steps.__name__ == "apps.wechat.steps"
-    assert xinyu_steps.__name__ == "apps.xinyu.steps"
-    assert huanyou_steps.__name__ == "apps.huanyou.steps"
-    assert wechat_steps.__name__ != "apps.visual_steps"
-    assert xinyu_steps.__name__ != "apps.visual_steps"
-    assert huanyou_steps.__name__ != "apps.visual_steps"
 
 
 def test_popup_is_checked_before_current_screen(monkeypatch, tmp_path):

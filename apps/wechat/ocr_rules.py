@@ -1,3 +1,9 @@
+"""微信(遗留) App 专属 OCR 规则引擎（自 vision/ocr_rules.py 独立演化）。
+
+每个 App 独立维护自己的识别规则应用层：算法改动只影响本 App，
+vision/ 只保留 Paddle 执行器、模板匹配、图像工具等基础服务。
+"""
+
 from __future__ import annotations
 
 import copy
@@ -11,8 +17,8 @@ from typing import Any
 import cv2
 import numpy as np
 
-from .ocr import OcrItem, ocr
-from .screen import ImageInput, ensure_portrait_image, load_image
+from vision.ocr import OcrItem, ocr
+from vision.screen import ImageInput, ensure_portrait_image, load_image
 
 
 _OCR_RESULT_CACHE_LOCK = threading.Lock()
@@ -647,7 +653,11 @@ def build_dialogue_result(
             previous_center_x = (previous["min_x"] + previous["max_x"]) / 2
             center_gap = abs(previous_center_x - item["center_x"])
             same_bubble_column = horizontal_overlap > -image_width * 0.08 or center_gap <= image_width * 0.24
-            if previous["sender"] == item["sender"] and vertical_gap <= name_gap and same_bubble_column:
+            # 换行续行按几何判定合并，sender 继承首行：短续行的独立判定
+            # （位置中心落在对方领地、颜色采样面积小）是最不可靠的场景，
+            # 消息内行距（≈line_gap）与相邻消息间距（隔头像行）之间有巨大
+            # 空档，name_gap 阈值足以单独区分，无需续行 sender 投票一致。
+            if vertical_gap <= name_gap and same_bubble_column:
                 previous["segments"].append((item["min_y"], item["min_x"], item["text"]))
                 previous["max_y"] = max(previous["max_y"], item["max_y"])
                 previous["max_x"] = max(previous["max_x"], item["max_x"])
@@ -1293,9 +1303,22 @@ def _is_list_header_line(line: dict[str, Any], image_width: int, rules: dict[str
     text = line["left_text"]
     if not text or looks_like_time_text(text) or not line["main_items"]:
         return False
-    first_x = min(item["min_x"] for item in line["main_items"])
+    # 时间戳列会以两种方式混入主体条目并顶爆 name 右界，导致整行被判非
+    # 表头而静默丢行（曾表现为列表 0 行 → 「暂无消息」时好时坏）：
+    # 1) 时间框 min_x 随 OCR 抖动落在 right_meta 阈值左侧不足 1px；
+    # 2) 时间文字被误读（如「凌晨」→「凌层」），文本形态判定失效。
+    # 因此表头边界同时按文本形态和右列起点（min_x 靠近右缘）双重剔除。
+    right_column_min = image_width * float(rules["right_meta_min_ratio"]) - image_width * 0.05
+    name_items = [
+        item
+        for item in line["main_items"]
+        if not looks_like_time_text(item["text"]) and item["min_x"] < right_column_min
+    ]
+    if not name_items:
+        return False
+    first_x = min(item["min_x"] for item in name_items)
     name_max_x = image_width * float(rules.get("name_max_x_ratio", rules["text_right_max_ratio"]))
-    name_right_x = max(item["max_x"] for item in line["main_items"])
+    name_right_x = max(item["max_x"] for item in name_items)
     if first_x < image_width * float(rules["text_left_min_ratio"]) or name_right_x > name_max_x:
         return False
     name = _strip_list_name_suffixes(_extract_list_name(text), rules)
@@ -1355,7 +1378,15 @@ def build_list_result(
             and item["text"] in _keywords(rules["top_nav_keywords"])
         ]
         if top_nav_items:
-            top = max(top, max(item["max_y"] for item in top_nav_items))
+            # 只允许与最高导航项连成一行的条目下推列表上界：列表首行
+            # 头像的「在线」角标等偶发命中导航关键词时，若取全量最大
+            # max_y 会把整段首行会话划出列表区域（曾导致 0 行→暂无消息）。
+            ordered_nav = sorted(top_nav_items, key=lambda item: item["center_y"])
+            cluster_bottom = ordered_nav[0]["max_y"]
+            for nav_item in ordered_nav[1:]:
+                if nav_item["min_y"] <= cluster_bottom + line_gap:
+                    cluster_bottom = max(cluster_bottom, nav_item["max_y"])
+            top = max(top, cluster_bottom)
     image_array = np.array(load_image(source_image).convert("RGB")) if source_image is not None else None
     excluded_entries: list[dict[str, Any]] = []
 

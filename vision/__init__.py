@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 
 def match(*args, **kwargs):
@@ -11,12 +11,6 @@ def ocr(*args, **kwargs):
     from .ocr import ocr as _ocr
 
     return _ocr(*args, **kwargs)
-
-
-def run_ocr_mode(*args, **kwargs):
-    from .ocr_rules import run_ocr_mode as _run_ocr_mode
-
-    return _run_ocr_mode(*args, **kwargs)
 
 
 def crop_region(*args, **kwargs):
@@ -42,4 +36,4 @@ def get_ocr_queue_status():
 
     return _get_ocr_queue_status()
 
-__all__ = ["crop_region", "load_image", "match", "ocr", "run_ocr_mode", "screen_matches", "get_ocr_queue_status"]
+__all__ = ["crop_region", "load_image", "match", "ocr", "screen_matches", "get_ocr_queue_status"]

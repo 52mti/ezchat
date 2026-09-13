@@ -27,7 +27,9 @@ from apps.visual_assets import (
     template_path,
     template_root,
 )
-from vision import match, run_ocr_mode
+from vision import match
+
+from .ocr_rules import run_ocr_mode
 
 from .config import DEFAULT_CONFIG
 
