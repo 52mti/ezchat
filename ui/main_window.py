@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import requests
-from PyQt6.QtCore import QPoint, QRect, Qt, QLockFile, QTimer, QUrl, QThread, pyqtSignal
+from PyQt6.QtCore import QPoint, QRect, Qt, QLockFile, QTimer, QUrl, QThread, pyqtSignal, qInstallMessageHandler
 from PyQt6.QtGui import QColor, QDesktopServices, QFont, QImage, QPainter, QPen, QPixmap, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
@@ -1401,6 +1401,7 @@ class MainWindow(QMainWindow):
             action(row)
 
     def _start_worker(self, row: int) -> None:
+        _ui_lifecycle_log("START_CLICKED")
         device = self._device_for_row(row)
         if not device:
             return
@@ -4593,7 +4594,45 @@ class DeviceSettingsDialogInteractive(QDialog):
 DeviceSettingsDialog = DeviceSettingsDialogInteractive
 
 
+def _ui_lifecycle_log(event: str) -> None:
+    """客户机启动期原生崩溃（0xC0000409 fail-fast，绕过一切异常处理）定位用。"""
+    try:
+        from datetime import datetime
+
+        path = Path("runtime") / "logs" / "ui_lifecycle.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.now().isoformat(timespec='milliseconds')} {event}\n")
+    except Exception:
+        pass
+
+
+def _install_qt_message_log() -> None:
+    """qFatal（Qt 跨线程操作等致命违规）死前只进调试输出，无调试器不可见；
+    装消息钩子把它落到 runtime/logs/qt_messages.log——崩溃真凶的遗言。"""
+    try:
+        from PyQt6.QtCore import QtMsgType
+
+        path = Path("runtime") / "logs" / "qt_messages.log"
+
+        def _handler(mode, context, message) -> None:
+            try:
+                from datetime import datetime
+
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(f"{datetime.now().isoformat(timespec='milliseconds')} [{mode}] {message}\n")
+            except Exception:
+                pass
+
+        qInstallMessageHandler(_handler)
+    except Exception:
+        pass
+
+
 def run_app(argv: list[str] | None = None, on_ready: Callable[[], Any] | None = None) -> int:
+    _install_qt_message_log()
+    _ui_lifecycle_log("QAPP_CREATING")
     app = QApplication(argv or sys.argv)
     # 单实例锁（移植自 douyin）：客户机双开会让两组 worker 抢同一批机械臂。
     lock_path = str((Path("runtime") / "main_ui.lock").resolve())
@@ -4601,7 +4640,9 @@ def run_app(argv: list[str] | None = None, on_ready: Callable[[], Any] | None = 
     instance_lock = QLockFile(lock_path)
     instance_lock.setStaleLockTime(0)
     if not instance_lock.tryLock(100):
+        _ui_lifecycle_log("LOCK_FAILED_ANOTHER_INSTANCE")
         return 0
+    _ui_lifecycle_log("LOCK_OK")
     previous_handler = signal.getsignal(signal.SIGINT)
 
     def handle_sigint(signum: int, frame: Any) -> None:
@@ -4612,11 +4653,15 @@ def run_app(argv: list[str] | None = None, on_ready: Callable[[], Any] | None = 
     signal_timer.timeout.connect(lambda: None)
     signal_timer.start(200)
 
+    _ui_lifecycle_log("WINDOW_CONSTRUCTING")
     window = MainWindow()
+    _ui_lifecycle_log("WINDOW_CONSTRUCTED")
     window.show()
+    _ui_lifecycle_log("WINDOW_SHOWN")
     if on_ready is not None:
         # 让窗口先完成首帧绘制，再执行可能加载大型 OCR runtime 的初始化。
         QTimer.singleShot(0, on_ready)
+    _ui_lifecycle_log("EXEC_ENTERED")
     try:
         return app.exec()
     except KeyboardInterrupt:
