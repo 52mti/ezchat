@@ -307,7 +307,6 @@ def test_template_manager_test_keeps_below_threshold_candidate_visible(qtbot, tm
     }
 
 
-@pytest.mark.xfail(reason="依赖的功能源码随 2026-09-13 误操作丢失（git checkout），待用户处置")
 def test_template_manager_popup_capture_uses_second_region_as_match_range(qtbot, tmp_path, monkeypatch):
     image = Image.new("RGB", (200, 400), "white")
     buffer = BytesIO()
@@ -470,7 +469,6 @@ def test_template_manager_groups_variants_into_families_and_drives_buttons(qtbot
     assert manager._parse_variant_key("variant::icons::btn_x.jpg") is None
 
 
-@pytest.mark.xfail(reason="依赖的功能源码随 2026-09-13 误操作丢失（git checkout），待用户处置")
 def test_template_manager_variant_capture_uses_customer_mac_namespace(qtbot, tmp_path, monkeypatch):
     image = Image.new("RGB", (200, 400), "white")
     buffer = BytesIO()
@@ -624,7 +622,6 @@ def test_device_settings_refresh_screenshot_handles_display_errors(qtbot, monkey
     assert dialog.refresh_screenshot_button.isEnabled()
 
 
-@pytest.mark.xfail(reason="依赖的功能源码随 2026-09-13 误操作丢失（git checkout），待用户处置")
 def test_device_settings_can_save_current_screenshot_to_error_path(qtbot, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main_window_module.QMessageBox, "information", lambda *args, **kwargs: None)

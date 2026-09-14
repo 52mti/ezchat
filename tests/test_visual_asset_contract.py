@@ -371,13 +371,22 @@ def test_customer_template_import_uses_separate_namespace(tmp_path):
         owner="customer",
     )
 
-    assert target.name == "screen_聊天界面__customer_2.jpg"
+    # 客户模板带本机 MAC 命名空间：即使族里已有旧格式客户文件也不冲突，
+    # 且永不占用官方基础名/_N 编号。
+    machine = visual_assets.machine_template_id()
+    assert target.name == f"screen_聊天界面__customer_{machine}_1.jpg"
     paths = visual_assets.template_variant_paths(screens_dir, "screen_聊天界面.jpg")
     assert [path.name for path in paths] == [
         "screen_聊天界面.jpg",
         "screen_聊天界面_2.jpg",
         "screen_聊天界面__customer_1.jpg",
     ]
+    # 采集落盘后，MAC 命名的新客户变体同样被运行时候选收集（跨机器分发场景）。
+    target.write_bytes(b"new-customer")
+    other = screens_dir / f"screen_聊天界面__customer_{'f' * 12}_3.jpg"
+    other.write_bytes(b"foreign-machine")
+    names = [path.name for path in visual_assets.template_variant_paths(screens_dir, "screen_聊天界面.jpg")]
+    assert target.name in names and other.name in names
 
 
 

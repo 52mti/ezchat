@@ -814,6 +814,12 @@ def _template_variant_pattern(filename: str) -> tuple[str, str]:
 CUSTOM_TEMPLATE_MARKER = "__customer"
 DEVELOPER_TEMPLATE_MARKER = "__developer"
 
+# 客户模板的 MAC 命名段：__customer_{12位小写hex}_{序号}。多台客户机的
+# 模板汇总到开发侧不会重名，可直接复制进更新包向其他机器分发；旧格式
+# __customer_{序号}（无 MAC 段）继续兼容识别。
+_MACHINE_ID_PATTERN = r"[0-9a-f]{12}"
+_VARIANT_TAIL_RE = rf"(?:_(?:{_MACHINE_ID_PATTERN}))?_\d+"
+
 
 def _template_variant_sort_key(path: Path, base_filename: str) -> tuple[int, str]:
     base_stem, suffix = _template_variant_pattern(base_filename)
@@ -823,12 +829,12 @@ def _template_variant_sort_key(path: Path, base_filename: str) -> tuple[int, str
     if match:
         return (int(match.group(1)), path.name)
     match = re.fullmatch(
-        rf"{re.escape(base_stem)}__(customer|developer)_(\d+){re.escape(suffix)}",
+        rf"{re.escape(base_stem)}__(customer|developer){_VARIANT_TAIL_RE}{re.escape(suffix)}",
         path.name,
     )
     if match:
         # 旧的开发编号先保持原顺序，客户命名空间排在其后。
-        return (1000 + int(match.group(2)), path.name)
+        return (1000 + int(path.stem.rsplit("_", 1)[-1]), path.name)
     return (9999, path.name)
 
 
@@ -842,7 +848,7 @@ def template_variant_paths(root: Path, filename: str) -> list[Path]:
         if path.name == filename
         or re.fullmatch(rf"{re.escape(base_stem)}_\d+{re.escape(suffix)}", path.name)
         or re.fullmatch(
-            rf"{re.escape(base_stem)}__(?:customer|developer)_\d+{re.escape(suffix)}",
+            rf"{re.escape(base_stem)}__(?:customer|developer){_VARIANT_TAIL_RE}{re.escape(suffix)}",
             path.name,
         )
     ]
@@ -850,21 +856,31 @@ def template_variant_paths(root: Path, filename: str) -> list[Path]:
 
 
 def next_template_variant_path(root: Path, filename: str, *, owner: str = "legacy") -> Path:
+    base_stem, suffix = _template_variant_pattern(filename)
+    if owner == "customer":
+        # 客户模板一律带本机 MAC 命名空间，即使族里还没有基础文件也
+        # 不占用基础名——更新包里的官方基础文件永远不会和客户文件互相
+        # 覆盖；多台机器采集的文件汇总/分发也不重名。
+        machine = machine_template_id()
+        index = 1
+        while True:
+            target = root / f"{base_stem}{CUSTOM_TEMPLATE_MARKER}_{machine}_{index}{suffix}"
+            if not target.exists():
+                return target
+            index += 1
     first = root / filename
     if not first.exists():
         return first
-    base_stem, suffix = _template_variant_pattern(filename)
-    if owner not in {"customer", "developer"}:
+    if owner != "developer":
         index = 2
         while True:
             target = root / f"{base_stem}_{index}{suffix}"
             if not target.exists():
                 return target
             index += 1
-    marker = CUSTOM_TEMPLATE_MARKER if owner == "customer" else DEVELOPER_TEMPLATE_MARKER
     index = 1
     while True:
-        target = root / f"{base_stem}{marker}_{index}{suffix}"
+        target = root / f"{base_stem}{DEVELOPER_TEMPLATE_MARKER}_{index}{suffix}"
         if not target.exists():
             return target
         index += 1
@@ -872,9 +888,10 @@ def next_template_variant_path(root: Path, filename: str, *, owner: str = "legac
 
 def next_popup_template_path(buttons_dir: Path, *, owner: str = "legacy") -> Path:
     if owner == "customer":
+        machine = machine_template_id()
         index = 1
         while True:
-            target = buttons_dir / f"popup_custom{CUSTOM_TEMPLATE_MARKER}_{index}.jpg"
+            target = buttons_dir / f"popup_custom{CUSTOM_TEMPLATE_MARKER}_{machine}_{index}.jpg"
             if not target.exists():
                 return target
             index += 1
@@ -888,9 +905,10 @@ def next_popup_template_path(buttons_dir: Path, *, owner: str = "legacy") -> Pat
 
 def next_back_button_template_path(buttons_dir: Path, *, owner: str = "legacy") -> Path:
     if owner == "customer":
+        machine = machine_template_id()
         index = 1
         while True:
-            target = buttons_dir / f"btn_返回按钮{CUSTOM_TEMPLATE_MARKER}_{index}.jpg"
+            target = buttons_dir / f"btn_返回按钮{CUSTOM_TEMPLATE_MARKER}_{machine}_{index}.jpg"
             if not target.exists():
                 return target
             index += 1
@@ -913,7 +931,7 @@ def is_back_button_template_name(filename: str) -> bool:
     return (
         filename == "btn_返回按钮.jpg"
         or re.fullmatch(r"btn_返回按钮_\d+\.jpg", filename) is not None
-        or re.fullmatch(r"btn_返回按钮__(?:customer|developer)_\d+\.jpg", filename) is not None
+        or re.fullmatch(rf"btn_返回按钮__(?:customer|developer){_VARIANT_TAIL_RE}\.jpg", filename) is not None
     )
 
 
