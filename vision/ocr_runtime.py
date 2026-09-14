@@ -394,8 +394,79 @@ def _detect_display_gpu() -> tuple[str, str, bool]:
     return "unknown", "", False
 
 
+def _probe_cache_path() -> Path | None:
+    """探测结果磁盘缓存只在打包环境启用（JIXIEBI_PACKAGE_ROOT 已设），
+    开发机与测试保持每次真实探测，行为不变。"""
+    configured = str(os.environ.get("JIXIEBI_PACKAGE_ROOT", "") or "").strip()
+    if not configured:
+        return None
+    return Path(configured) / "runtime" / "ocr_probe_cache.json"
+
+
+def _load_cached_probe() -> HardwareProbeResult | None:
+    path = _probe_cache_path()
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return None
+    if payload.get("platform") != platform.platform():
+        return None
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return None
+    try:
+        return HardwareProbeResult(
+            platform=str(result["platform"]),
+            gpu_vendor=str(result["gpu_vendor"]),
+            gpu_name=str(result["gpu_name"]),
+            nvidia_detected=bool(result["nvidia_detected"]),
+            directml_available=bool(result["directml_available"]),
+            recommended_backend=str(result["recommended_backend"]),
+            detail=dict(result.get("detail") or {}),
+        )
+    except (KeyError, TypeError):
+        return None
+
+
+def _save_cached_probe(result: HardwareProbeResult) -> None:
+    path = _probe_cache_path()
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "platform": platform.platform(),
+            "result": result.to_dict(),
+        }
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        # 缓存写入失败只影响下次启动多探测一次，不影响本次结果。
+        pass
+
+
 @lru_cache(maxsize=1)
 def probe_hardware() -> HardwareProbeResult:
+    """硬件探测结果磁盘缓存优先：命中后启动不再创建任何探测子进程。
+
+    客户机 pythonw 环境下，GPU/显卡探测子进程（nvidia-smi/wmic）曾被卷入
+    0x8001010d 原生崩溃现场；能少起的子进程一律少起。
+    """
+    cached = _load_cached_probe()
+    if cached is not None:
+        return cached
+    result = _probe_hardware_uncached()
+    _save_cached_probe(result)
+    return result
+
+
+def _probe_hardware_uncached() -> HardwareProbeResult:
     gpu_report = detect_gpu_environment()
     if gpu_report.gpu_names:
         return HardwareProbeResult(
