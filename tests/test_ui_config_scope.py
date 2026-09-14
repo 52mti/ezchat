@@ -253,6 +253,37 @@ def test_template_manager_maps_numbered_screen_variant_to_shared_category(qtbot,
     assert manager._template_region_text(path) == "0.100, 0.200, 0.300, 0.400"
 
 
+def test_template_manager_maps_state_screen_files_to_region_keys(qtbot, tmp_path):
+    """回归（20260914）：无手机/黑屏/通话三个状态屏不在 FIXED_TEMPLATE_RULES，
+    模板管理表的范围列与"测试当前图"因键推导落空一直显示为空；
+    config.json 里 [0,0,1,1] 的规范值本身没有问题。"""
+    manager = TemplateManagerWidget(
+        tmp_path / "templates",
+        device_ip="192.168.1.108",
+        app_name="xinyu",
+        overrides={
+            "template_match_regions": {
+                "screen.no_phone": [0.0, 0.0, 1.0, 1.0],
+                "screen.black_screen": [0.0, 0.0, 1.0, 1.0],
+                "screen.call_window": [0.004, 0.722, 0.415, 0.278],
+            }
+        },
+    )
+    qtbot.addWidget(manager)
+
+    no_phone = manager.screens_dir / "screen_无手机界面.jpg"
+    assert manager._template_region_key(no_phone) == "screen.no_phone"
+    assert manager._template_region_text(no_phone) == "0.000, 0.000, 1.000, 1.000"
+    call_window = manager.screens_dir / "screen_通话界面.jpg"
+    assert manager._template_region_key(call_window) == "screen.call_window"
+    assert manager._template_region_text(call_window) == "0.004, 0.722, 0.415, 0.278"
+    black_screen = manager.screens_dir / "screen_黑屏异常.jpg"
+    assert manager._template_region_key(black_screen) == "screen.black_screen"
+    # 客户 MAC 命名空间变体归到同一键，范围列才不会因换名显示为空。
+    variant = manager.screens_dir / f"screen_无手机界面__customer_{machine_template_id()}_1.jpg"
+    assert manager._template_region_key(variant) == "screen.no_phone"
+
+
 def test_template_manager_test_keeps_below_threshold_candidate_visible(qtbot, tmp_path, monkeypatch):
     manager = TemplateManagerWidget(
         tmp_path / "templates",

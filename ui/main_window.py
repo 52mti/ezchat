@@ -587,6 +587,14 @@ UI_EVENT_DRAIN_SECONDS = 0.02
 UPDATE_EVENT_DRAIN_LIMIT = 50
 UNATTENDED_REFRESH_SECONDS = 1.0
 
+# 状态类屏幕模板（不在 FIXED_TEMPLATE_RULES 内，运行匹配走 steps 专属键）：
+# 模板管理表的范围列/测试按钮与"检测模板"视图共用这份清单，防止两处漂移。
+SCREEN_STATE_TEMPLATE_FILES: tuple[tuple[str, str, str], ...] = (
+    ("screen.no_phone", "无手机界面", "screen_无手机界面.jpg"),
+    ("screen.black_screen", "黑屏界面", "screen_黑屏异常.jpg"),
+    ("screen.call_window", "通话界面", "screen_通话界面.jpg"),
+)
+
 
 def mask_secret(value: str) -> str:
     if not value:
@@ -2921,6 +2929,19 @@ class TemplateManagerWidget(QWidget):
                 path.name,
             ):
                 return rule.key
+        # 状态类屏幕模板不在固定规则表里，单独按共享清单识别；
+        # 范围列与"测试当前图"依赖这个键查 template_match_regions。
+        for key, _label, filename in SCREEN_STATE_TEMPLATE_FILES:
+            base_stem = Path(filename).stem
+            suffix = Path(filename).suffix or ".jpg"
+            if path.name == filename or re.fullmatch(
+                rf"{re.escape(base_stem)}_\d+{re.escape(suffix)}",
+                path.name,
+            ) or re.fullmatch(
+                rf"{re.escape(base_stem)}__(?:customer|developer)(?:_[0-9a-f]{{12}})?_\d+{re.escape(suffix)}",
+                path.name,
+            ):
+                return key
         # 固定规则之外的按钮模板（如心遇的主界面心遇按钮等自定义按钮）：
         # 按 template_match_regions 的 button.custom.* 配置反查，主文件与
         # 变体都归到同一键，范围列才能显示出来。
@@ -4431,7 +4452,7 @@ class DeviceSettingsDialogInteractive(QDialog):
             if paths:
                 groups.append((rule.key, rule.label, paths, False))
         screens_root = Path(config.get("templates", {}).get("screens", ""))
-        for key, label, filename in (("screen.no_phone", "无手机界面", "screen_无手机界面.jpg"), ("screen.black_screen", "黑屏界面", "screen_黑屏异常.jpg"), ("screen.call_window", "通话界面", "screen_通话界面.jpg")):
+        for key, label, filename in SCREEN_STATE_TEMPLATE_FILES:
             paths = template_variant_paths(screens_root, filename)
             if paths:
                 groups.append((key, label, paths, False))
