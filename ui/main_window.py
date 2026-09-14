@@ -3216,6 +3216,14 @@ class AppConfigDialog(QDialog):
         self._on_calibrate_vision = on_calibrate_vision
         self.setWindowTitle(f"App 配置 - {device_ip} / {app_name}")
         self.resize(860, 660)
+        # 小屏适配：窗口绝不超出当前屏幕可用区域（任务栏之外），内容靠各页滚动区兜底。
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            self.resize(
+                min(860, int(available.width() * 0.95)),
+                min(660, int(available.height() * 0.92)),
+            )
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -3335,7 +3343,7 @@ class AppConfigDialog(QDialog):
 
         page_root.addWidget(panel)
         page_root.addStretch(1)
-        self.tabs.addTab(page, "运行设置")
+        self.tabs.addTab(self._wrap_in_scroll(page), "运行设置")
 
     def _reset_visual_recognition(self) -> None:
         if self._on_reset_visual_recognition is not None:
@@ -3555,7 +3563,7 @@ class AppConfigDialog(QDialog):
             parent=page,
         )
         page_root.addWidget(self.template_manager)
-        self.tabs.addTab(page, "模板管理")
+        self.tabs.addTab(self._wrap_in_scroll(page), "模板管理")
 
     def _build_persona_tab(self, overrides: dict[str, Any]) -> None:
         """人设 tab 四组（docs/13 第六节 + persona_ui_mockup.svg）：AI 接入 / 人设文件 / 对话记忆 / 招呼语。"""
@@ -3723,7 +3731,17 @@ class AppConfigDialog(QDialog):
         self._refresh_greetings_count()
 
         page_root.addStretch(1)
-        self.tabs.addTab(page, "人设")
+        self.tabs.addTab(self._wrap_in_scroll(page), "人设")
+
+    @staticmethod
+    def _wrap_in_scroll(page: QWidget) -> QScrollArea:
+        """把设置页包进滚动区：小屏上内容超高时可滚动查看，不再被屏幕截断。"""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        return scroll
 
     # ---------- 人设 tab 辅助 ----------
     def _persona_apps_dir(self) -> Path:
