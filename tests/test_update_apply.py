@@ -5,24 +5,32 @@ import json
 import update_apply
 
 
-def test_update_keeps_app_config_assets_from_copy_and_removal(tmp_path):
-    """App 级配置三件套是客户界面数据：不覆盖、不删除（与 build 排除互为镜像）。"""
+def test_update_overwrites_app_config_defaults_but_keeps_customer_layer(tmp_path):
+    """App 级配置三件套是开发端随包默认值（docs/11 L1）：随更新正常覆盖；
+    客户自己的设定在 runtime/configs/<app>/，由 runtime/ 不可触碰规则保护。"""
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
     for root in (source_root, target_root):
         (root / "apps" / "xinyu").mkdir(parents=True)
     (source_root / "apps" / "xinyu" / "config.json").write_text('{"match_threshold": 0.7}', encoding="utf-8")
+    (source_root / "apps" / "xinyu" / "dialogue_ocr_config.json").write_text('{"mode": "new"}', encoding="utf-8")
     (target_root / "apps" / "xinyu" / "config.json").write_text('{"match_threshold": 0.82}', encoding="utf-8")
-    (target_root / "apps" / "xinyu" / "dialogue_ocr_config.json").write_text("{}", encoding="utf-8")
+    customer_layer = target_root / "runtime" / "configs" / "xinyu" / "config.json"
+    customer_layer.parent.mkdir(parents=True)
+    customer_layer.write_text('{"match_threshold": 0.9}', encoding="utf-8")
 
     update_apply._copy_update_tree(source_root, target_root, full_payload=False)
     merged = json.loads((target_root / "apps" / "xinyu" / "config.json").read_text(encoding="utf-8"))
-    assert merged["match_threshold"] == 0.82
+    assert merged["match_threshold"] == 0.7
+    assert json.loads((target_root / "apps" / "xinyu" / "dialogue_ocr_config.json").read_text(encoding="utf-8"))["mode"] == "new"
+    assert json.loads(customer_layer.read_text(encoding="utf-8"))["match_threshold"] == 0.9
 
+    # 三件套随包收录后存在于新清单中，不会被判定为 obsolete 删除；
+    # 真正被移除的是不在新包里的陈旧文件。
     update_apply._remove_obsolete_files(
         target_root,
         {"apps/xinyu/config.json", "apps/xinyu/dialogue_ocr_config.json", "apps/xinyu/old.py"},
-        set(),
+        {"apps/xinyu/config.json", "apps/xinyu/dialogue_ocr_config.json"},
         full_payload=False,
     )
     assert (target_root / "apps" / "xinyu" / "config.json").exists()
@@ -146,9 +154,10 @@ def test_is_full_payload_detects_engine_or_legacy_layout(tmp_path):
 
 
 def test_preserved_scopes_unit_assertions():
-    assert update_apply._is_preserved("apps/xinyu/config.json")
-    assert update_apply._is_preserved("apps/huanyou/dialogue_ocr_config.json")
-    assert update_apply._is_preserved("apps/huanyou/list_ocr_config.json")
+    # 三件套随更新正常覆盖，不再进保护清单；客户模板/根 config 仍受保护。
+    assert not update_apply._is_preserved("apps/xinyu/config.json")
+    assert not update_apply._is_preserved("apps/huanyou/dialogue_ocr_config.json")
+    assert not update_apply._is_preserved("apps/huanyou/list_ocr_config.json")
     assert update_apply._is_preserved("apps/xinyu/templates/buttons/btn_test__customer_1.jpg")
     assert update_apply._is_preserved("config.json")
     assert update_apply._is_preserved("photo/1.jpg")

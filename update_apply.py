@@ -29,13 +29,8 @@ PRESERVE_PREFIXES = (
     "jiekou/",
 )
 # 客户自己的 App 设置在 runtime/configs/<app>/ 下，已随 runtime/ 不可触碰
-# 规则整体保护；apps/<app>/ 下的三个配置文件是客户界面的历史数据
-# （新装机默认值回归代码层 DEFAULT_CONFIG 随包分发），同样不进包、不删、不覆盖。
-PRESERVED_APP_CONFIG_FILES = (
-    "apps/{app}/config.json",
-    "apps/{app}/dialogue_ocr_config.json",
-    "apps/{app}/list_ocr_config.json",
-)
+# 规则整体保护；apps/<app>/ 下的三个配置文件是开发端随包默认值（docs/11
+# L1 下发通道），随更新包正常落地、正常覆盖，客户层按键遮蔽它。
 PRESERVED_LAUNCHERS = {"机械臂脚本.exe", "jixiebijiaoben_launcher.exe"}
 # 模块 ZIP 可能被残留子进程的 zipimport 句柄占用，替换需要带重试。
 ATOMIC_REPLACE_RELATIVES = {"app_modules.zip", "ocr_bridge_modules.zip"}
@@ -57,21 +52,11 @@ def _is_customer_template(relative: str) -> bool:
     return any("__customer_" in part for part in parts[3:])
 
 
-def _is_app_config_asset(relative: str) -> bool:
-    normalized = _normalize(relative)
-    parts = normalized.split("/")
-    if len(parts) != 3 or parts[0] != "apps" or not parts[1]:
-        return False
-    return normalized in tuple(
-        pattern.format(app=parts[1]) for pattern in PRESERVED_APP_CONFIG_FILES
-    )
-
-
 def _is_preserved(relative: str) -> bool:
     normalized = _normalize(relative)
     if normalized in PRESERVED_LAUNCHERS:
         return True
-    if _is_app_config_asset(normalized) or _is_customer_template(normalized):
+    if _is_customer_template(normalized):
         return True
     return any(
         normalized == prefix.rstrip("/") or normalized.startswith(prefix)

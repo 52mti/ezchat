@@ -190,7 +190,7 @@ def test_write_archives_can_include_timestamp_suffix(tmp_path):
     assert archive_path.is_file()
 
 
-def test_write_customer_update_archive_keeps_app_json_configs_and_templates(tmp_path):
+def test_write_customer_update_archive_includes_app_json_config_defaults(tmp_path):
     package_root = tmp_path / build.PACKAGE_NAME
     dist_root = tmp_path / "dist"
     app_root = package_root / "apps" / "xinyu"
@@ -212,12 +212,13 @@ def test_write_customer_update_archive_keeps_app_json_configs_and_templates(tmp_
     assert f"{build.PACKAGE_NAME}/apps/xinyu/app.py" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/steps.py" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/config.py" in names
-    # App 级配置三件套是客户界面数据，不进任何归档（默认值走代码层）。
+    # App 级配置三件套是开发端默认值的下发通道（docs/11 L1），必须进归档，
+    # 客户机经更新正常落地；客户自己的设定在 runtime/configs/<app>/（更新保护）。
     # .py 不由归档排除；真实构建中源码在编译阶段已被移除进 app_modules.zip。
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/config.json" not in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/config.json" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/ocr_config.py" in names
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/dialogue_ocr_config.json" not in names
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/list_ocr_config.json" not in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/dialogue_ocr_config.json" in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/list_ocr_config.json" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/templates/buttons/btn_返回按钮.jpg" in names
 
 
@@ -240,7 +241,7 @@ def test_write_full_package_archive_includes_runtime_state_and_photo_dir(tmp_pat
     assert f"{build.PACKAGE_NAME}/runtime/install_state.json" in names
 
 
-def test_write_full_package_archive_includes_app_customer_config_assets(tmp_path):
+def test_write_full_package_archive_includes_app_json_config_defaults(tmp_path):
     package_root = tmp_path / build.PACKAGE_NAME
     dist_root = tmp_path / "dist"
     app_root = package_root / "apps" / "xinyu"
@@ -257,11 +258,12 @@ def test_write_full_package_archive_includes_app_customer_config_assets(tmp_path
     with zipfile.ZipFile(archive_path) as archive:
         names = set(archive.namelist())
 
-    # 三件套客户配置不进归档；代码层默认(ocr_defaults.py)随包分发。
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/config.json" not in names
+    # 三件套是开发端默认值下发通道（docs/11 L1），全量包同样收录；
+    # 代码层默认(ocr_defaults.py)继续随包分发作为兜底。
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/config.json" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/ocr_config.py" in names
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/dialogue_ocr_config.json" not in names
-    assert f"{build.PACKAGE_NAME}/apps/xinyu/list_ocr_config.json" not in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/dialogue_ocr_config.json" in names
+    assert f"{build.PACKAGE_NAME}/apps/xinyu/list_ocr_config.json" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/ocr_defaults.py" in names
     assert f"{build.PACKAGE_NAME}/apps/xinyu/templates/buttons/btn_返回按钮.jpg" in names
 

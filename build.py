@@ -873,20 +873,12 @@ def _relative_matches_prefix(relative: str, prefix: str) -> bool:
     return relative == normalized or relative.startswith(normalized + "/")
 
 
-def _is_app_customer_config_asset(relative: str) -> bool:
-    """App 级配置是客户界面数据：不进任何归档（新装机默认值由代码层
-    DEFAULT_CONFIG 提供），也不由更新器删除/覆盖（update_apply 镜像保留）。"""
-    parts = relative.split("/")
-    if len(parts) != 3 or parts[0] != "apps" or not parts[1]:
-        return False
-    return parts[2] in {"config.json", "dialogue_ocr_config.json", "list_ocr_config.json"}
-
-
 def _archive_excludes(relative: str, *, update_payload: bool) -> bool:
     # package_manifest.json 由归档内容现场生成，不作为普通文件收录。
+    # apps/<app>/ 三件套 json 是开发端默认值的下发通道（docs/11 L1），
+    # 随全量包与更新包正常收录；客户自己的设定在 runtime/configs/<app>/，
+    # 已由更新器 runtime/ 不可触碰规则整体保护。
     if relative == "package_manifest.json":
-        return True
-    if _is_app_customer_config_asset(relative):
         return True
     if update_payload:
         # 更新包结构隔离：engine/、models/、runtime/ 只随全量包变化，
