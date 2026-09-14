@@ -4630,7 +4630,31 @@ def _install_qt_message_log() -> None:
         pass
 
 
+def _install_slot_exception_guard() -> None:
+    """PyQt 对槽内未处理异常的默认行为是 qFatal→abort（退出码 0xC0000409，
+    无声闪退）。安装自定义 excepthook 后 PyQt 只调用钩子、不再杀进程：
+    槽异常落盘 runtime/logs/ui_slot_exceptions.log 并保留默认控制台输出。"""
+    previous = sys.excepthook
+
+    def _hook(exc_type, exc, tb) -> None:
+        try:
+            import traceback
+            from datetime import datetime
+
+            path = Path("runtime") / "logs" / "ui_slot_exceptions.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"--- {datetime.now().isoformat(timespec='seconds')} ---\n")
+                traceback.print_exception(exc_type, exc, tb, file=handle)
+        except Exception:
+            pass
+        previous(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+
+
 def run_app(argv: list[str] | None = None, on_ready: Callable[[], Any] | None = None) -> int:
+    _install_slot_exception_guard()
     _install_qt_message_log()
     _ui_lifecycle_log("QAPP_CREATING")
     app = QApplication(argv or sys.argv)

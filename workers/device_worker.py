@@ -154,6 +154,10 @@ class DeviceWorker(threading.Thread):
         self.device = device
         self.config_manager = config_manager or ConfigManager()
         self.events = events or queue.Queue()
+        # 日志缓冲/事故上下文必须先于任何 _emit 初始化：构造早期的 DeepSeek key
+        # 警告曾在客户机触发 AttributeError → Qt 槽内未处理异常 → PyQt qFatal 闪退。
+        self._recent_logs: deque[dict[str, Any]] = deque(maxlen=RECENT_LOG_BUFFER_LIMIT)
+        self._active_incident: dict[str, Any] | None = None
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()
@@ -248,8 +252,6 @@ class DeviceWorker(threading.Thread):
         self._last_license_check = 0.0
         self._last_progress_event_key: tuple[str, str, str] | None = None
         self._last_progress_event_at = 0.0
-        self._recent_logs: deque[dict[str, Any]] = deque(maxlen=RECENT_LOG_BUFFER_LIMIT)
-        self._active_incident: dict[str, Any] | None = None
         self._incident_sequence = 0
         self._last_error_count_seen = 0
         self._live_config_fingerprint = self._config_fingerprint(self.app_config)

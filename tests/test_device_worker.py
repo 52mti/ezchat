@@ -71,6 +71,43 @@ class CountingApp(DummyApp):
         return {"is_circuit_open": False, "current_step": "counting", "current_step_label": "Counting"}
 
 
+def test_worker_init_survives_missing_deepseek_key(tmp_path, monkeypatch):
+    """回归：客户机未配置 DeepSeek key 时，构造期的 warning emit 曾因
+    _recent_logs/_active_incident 尚未初始化而 AttributeError，经 Qt 槽
+    触发 PyQt qFatal 无声闪退（退出码 0xC0000409）。"""
+    monkeypatch.setattr(device_worker_module, "get_registered_apps", lambda: {"dummy": DummyApp})
+    monkeypatch.setattr(
+        device_worker_module, "DeepSeekClient",
+        lambda **kwargs: SimpleNamespace(api_key=""),
+    )
+    monkeypatch.setattr(
+        device_worker_module, "PersonaSessionStore",
+        lambda **kwargs: SimpleNamespace(
+            cleanup_inactive_sessions=lambda *args, **kwargs: 0,
+        ),
+    )
+    monkeypatch.setattr(
+        device_worker_module, "PersonaChat",
+        lambda **kwargs: None,
+    )
+    events: "queue.Queue" = queue.Queue()
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+
+    worker = DeviceWorker(
+        {"ip": "192.168.1.108", "selected_app": "dummy"},
+        app_config={"poll_interval": 1},
+        events=events,
+        config_manager=manager,
+        robot=object(),
+    )
+
+    emitted = []
+    while not events.empty():
+        emitted.append(events.get())
+    assert any(event.level == "warning" and "DeepSeek key" in event.message for event in emitted)
+    assert worker._recent_logs is not None
+
+
 def test_worker_suppresses_app_status_after_stop(tmp_path, monkeypatch):
     monkeypatch.setattr(device_worker_module, "get_registered_apps", lambda: {"dummy": DummyApp})
     events: "queue.Queue" = queue.Queue()
