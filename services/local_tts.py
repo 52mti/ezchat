@@ -122,6 +122,9 @@ class LocalTtsServer:
                 errors="ignore",  # netstat 输出是本地码页文本；UTF-8 模式下强解码会炸
                 timeout=5,
                 check=False,
+                # 同 ocr_runtime：pythonw 下子进程必须 CREATE_NO_WINDOW，避免 conhost
+                # COM 调用与 GUI 消息泵并发触发 0x8001010d 原生崩溃。
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             ).stdout
         except (OSError, subprocess.SubprocessError):
             return
@@ -149,6 +152,7 @@ class LocalTtsServer:
                     capture_output=True,
                     timeout=5,
                     check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
 
     def _stop_posix_port_processes(self) -> None:

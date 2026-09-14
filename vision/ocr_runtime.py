@@ -223,6 +223,9 @@ def _run_command(command: list[str], timeout_seconds: int = 8) -> subprocess.Com
             encoding="utf-8",
             errors="ignore",
             check=False,
+            # pythonw 无控制台：不带此标志的子进程会走 conhost 窗口分配，与主线程
+            # 消息泵并发时触发 RPC_E_CANTCALLOUTINASYNCCALL（0x8001010d）原生崩溃。
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform.startswith("win") else 0,
             startupinfo=startupinfo,
             timeout=timeout_seconds,
         )
