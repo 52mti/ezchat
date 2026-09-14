@@ -3601,9 +3601,10 @@ class AppConfigDialog(QDialog):
         ai_form.setSpacing(10)
         key_row = QHBoxLayout()
         self.persona_key_input = QLineEdit()
-        self.persona_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        if resolve_api_key():
-            self.persona_key_input.setPlaceholderText("已配置（留空保持不变）")
+        existing_key = resolve_api_key()
+        if existing_key:
+            # 已配置的 key 直接显示当前值（本机自用界面）；修改后保存覆盖，清空保存保持不变。
+            self.persona_key_input.setText(existing_key)
         else:
             self.persona_key_input.setPlaceholderText("sk-…（DeepSeek API Key）")
         self.persona_test_button = QPushButton("连通性测试")
@@ -3651,6 +3652,10 @@ class AppConfigDialog(QDialog):
         profile_form.setContentsMargins(0, 4, 0, 0)
         profile_form.setSpacing(10)
         profile_form.addRow("JSON 文件", path_row)
+        self.persona_profile_effective = QLabel("")
+        self.persona_profile_effective.setObjectName("HelperLabel")
+        profile_form.addRow("", self.persona_profile_effective)
+        self._refresh_persona_profile_effective()
         profile_root.addLayout(profile_form)
 
         self.persona_text_edits: dict[str, QPlainTextEdit] = {}
@@ -3721,6 +3726,9 @@ class AppConfigDialog(QDialog):
         greeting_form = QFormLayout()
         greeting_form.setContentsMargins(0, 4, 0, 0)
         greeting_form.addRow("招呼语文件", greeting_path_row)
+        self.persona_greetings_effective = QLabel("")
+        self.persona_greetings_effective.setObjectName("HelperLabel")
+        greeting_form.addRow("", self.persona_greetings_effective)
         greeting_root.addLayout(greeting_form)
         greeting_switch_row = QHBoxLayout()
         self.persona_greeting_ai_checkbox = QCheckBox("启用 AI 优化招呼语（默认开：按当前人设改写并自动避开历史开场白；关闭则随机直发）")
@@ -3778,11 +3786,18 @@ class AppConfigDialog(QDialog):
     def _collect_persona_texts(self) -> dict[str, str]:
         return {key: edit.toPlainText().strip() for key, edit in self.persona_text_edits.items()}
 
+    def _refresh_persona_profile_effective(self) -> None:
+        configured = self.persona_profile_path.text().strip()
+        effective = configured or str(self._persona_apps_dir() / "persona_default.json")
+        suffix = "（自定义方案包）" if configured else "（随包默认，未配置时自动回退）"
+        self.persona_profile_effective.setText(f"当前调用：{effective} {suffix}")
+
     def _browse_persona_profile(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "选择人设方案包 JSON", "", "JSON (*.json)")
         if path:
             self.persona_profile_path.setText(path)
             self._load_persona_texts_into_editors()
+            self._refresh_persona_profile_effective()
 
     def _save_as_persona_profile(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "另存人设方案包", "persona.json", "JSON (*.json)")
@@ -3795,11 +3810,13 @@ class AppConfigDialog(QDialog):
             QMessageBox.warning(self, "人设", f"写入失败：{exc}")
             return
         self.persona_profile_path.setText(path)
+        self._refresh_persona_profile_effective()
         QMessageBox.information(self, "人设", "方案包已保存。拷到其它设备后用「浏览…」选中即可复用。")
 
     def _reset_persona_profile(self) -> None:
         self.persona_profile_path.clear()
         self._load_persona_texts_into_editors()
+        self._refresh_persona_profile_effective()
 
     def _effective_greetings_path(self) -> Path | None:
         configured = self.persona_greetings_path.text().strip()
@@ -3820,6 +3837,9 @@ class AppConfigDialog(QDialog):
             except OSError:
                 count = 0
         self.persona_greetings_count.setText(f"当前 {count} 条" if path is not None else "未找到招呼语库")
+        self.persona_greetings_effective.setText(
+            f"当前调用：{path}" if path is not None else "当前调用：未找到招呼语库（未配置且无默认文件）"
+        )
 
     def _browse_greetings_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "选择招呼语文件（每行一条）", "", "文本 (*.txt)")

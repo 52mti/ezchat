@@ -41,8 +41,28 @@ def test_app_config_dialog_returns_device_app_template_paths(qtbot, tmp_path):
     assert "192.168.1.108 / wechat" in dialog.windowTitle()
 
 
-def test_app_config_persona_tab_emits_new_chain_settings(qtbot, tmp_path):
+def test_app_config_persona_tab_shows_effective_paths_and_key(qtbot, tmp_path, monkeypatch):
+    """人设页显示改进：已配置 key 明文回显；人设/招呼语显示当前实际调用路径。"""
+    monkeypatch.setattr("services.deepseek_client.resolve_api_key", lambda *a, **k: "sk-test-key")
+    dialog = AppConfigDialog(
+        {"persona_profile_json": "", "greetings_txt": ""},
+        device_ip="192.168.1.108",
+        app_name="xinyu",
+        template_root=tmp_path / "templates",
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.persona_key_input.text() == "sk-test-key"
+    assert dialog.persona_key_input.echoMode().name == "Normal"
+    assert "persona_default.json" in dialog.persona_profile_effective.text()
+    assert "当前调用" in dialog.persona_greetings_effective.text()
+
+
+def test_app_config_persona_tab_emits_new_chain_settings(qtbot, tmp_path, monkeypatch):
     """人设 tab 四组（docs/13 六节）：values() 输出新链路客户设置键。"""
+    # key 输入框会回显已配置的 DeepSeek key（人设页显示改进），
+    # 固定为空保证"未配置"分支的断言确定性。
+    monkeypatch.setattr("services.deepseek_client.resolve_api_key", lambda *a, **k: "")
     dialog = AppConfigDialog(
         {
             "persona_profile_json": "",
