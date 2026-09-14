@@ -58,6 +58,7 @@ def main() -> int:
     root = _resolve_root()
     os.environ["JIXIEBI_PACKAGE_ROOT"] = str(root)
     os.chdir(root)
+    _enable_faulthandler(root)
     modules = root / "app_modules.zip"
     if modules.is_file() and str(modules) not in sys.path:
         sys.path.insert(0, str(modules))
@@ -71,6 +72,27 @@ def main() -> int:
         log_path = _write_crash_log(root, exc)
         _show_crash(exc, log_path)
         return 1
+
+
+_FAULT_LOG_HANDLE = None
+
+
+def _enable_faulthandler(root: Path) -> None:
+    """原生层崩溃（abort/Qt fatal 等，退出码 0xC0000409）时打印全部线程栈。
+
+    pythonw 无控制台且此类崩溃不走 Python 异常机制，客户机上此前表现为
+    无声闪退；faulthandler 对 SIGABRT/SEGV 类能在进程咽气前落盘。
+    """
+    global _FAULT_LOG_HANDLE
+    try:
+        import faulthandler
+
+        log_dir = root / "runtime" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        _FAULT_LOG_HANDLE = (log_dir / "python_crash.log").open("a", encoding="utf-8")
+        faulthandler.enable(_FAULT_LOG_HANDLE, all_threads=True)
+    except Exception:
+        _FAULT_LOG_HANDLE = None
 
 
 if __name__ == "__main__":
