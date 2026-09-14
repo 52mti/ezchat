@@ -98,7 +98,35 @@ def test_copy_sources_excludes_deprecated_wechat_app(tmp_path):
     assert (package_root / "apps" / "xinyu" / "app.py").is_file()
 
 
-def _write_vision_key(root, key: str) -> None:
+def test_copy_sources_ships_customer_templates_and_strips_developer_calibration(tmp_path):
+    """客户模板（开发机本机 MAC 采集 + 外来 MAC 收集 + 旧格式共享资产）随包
+    分发，__developer_ 开发标定不进包；目标机侧保护由 update_apply 精确执行。"""
+    from apps.visual_assets import machine_template_id
+
+    root = tmp_path / "repo"
+    package_root = tmp_path / "package"
+    buttons = root / "apps" / "xinyu" / "templates" / "buttons"
+    buttons.mkdir(parents=True)
+    machine = machine_template_id()
+    own = buttons / f"btn_主界面心遇按钮__customer_{machine}_1.jpg"
+    own.write_bytes(b"own-machine")
+    foreign = buttons / "btn_主界面心遇按钮__customer_aaaaaaaaaaaa_1.jpg"
+    foreign.write_bytes(b"collected")
+    legacy = buttons / "popup_custom__customer_1.jpg"
+    legacy.write_bytes(b"legacy")
+    dev = buttons / "btn_发送按钮__developer_1.jpg"
+    dev.write_bytes(b"calibration")
+
+    build._copy_sources(root, package_root)
+
+    target = package_root / "apps" / "xinyu" / "templates" / "buttons"
+    assert (target / own.name).read_bytes() == b"own-machine"
+    assert (target / foreign.name).read_bytes() == b"collected"
+    assert (target / legacy.name).read_bytes() == b"legacy"
+    assert not (target / dev.name).exists()
+
+
+def _write_vision_key(root: Path, key: str) -> None:
     (root / ".env").mkdir(exist_ok=True)
     (root / ".env" / "vision_dialogue_keys.json").write_text(
         json.dumps({"openrouter_key": key}, ensure_ascii=False), encoding="utf-8"

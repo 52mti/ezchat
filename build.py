@@ -1017,15 +1017,12 @@ def _copy_sources(root: Path, package_root: Path) -> None:
         if not source.exists():
             continue
         _copy_item(source, package_root / relative)
-    # 模板变体按 MAC 命名空间区分所有权：开发机标定（__developer_）与
-    # 本机 UI 采集（__customer_{本机MAC}_）不属于发布内容；从客户机收集
-    # 来的外来 MAC 客户模板保留在包里，用于向其他机器分发。无 MAC 段的
-    # 历史 __customer_ 模板（如 popup_custom__customer_1）是共享资产，保留。
-    from apps.visual_assets import machine_template_id
-
-    own_customer_pattern = f"*__customer_{machine_template_id()}_*"
+    # 模板变体按 MAC 命名空间区分所有权：开发机标定（__developer_）不属于
+    # 发布内容，剔除。__customer_{MAC}_ 模板（含本机 UI 采集与从客户机收集
+    # 来的外来 MAC）随包分发——客户机上更新落地时由 update_apply 按目标机
+    # 本机 MAC 精确保护，打包侧不再剔除。
     for templates_dir in (package_root / "apps").glob("*/templates"):
-        for variant in list(templates_dir.rglob("*__developer_*")) + list(templates_dir.rglob(own_customer_pattern)):
+        for variant in list(templates_dir.rglob("*__developer_*")):
             _remove_path(variant)
     for relative in DEPRECATED_PACKAGE_PATHS:
         deprecated_path = package_root / relative

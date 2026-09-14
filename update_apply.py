@@ -5,10 +5,12 @@ import contextlib
 import ctypes
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -45,11 +47,46 @@ def _is_untouchable(relative: str) -> bool:
     return any(normalized.startswith(prefix) for prefix in UNTOUCHABLE_PREFIXES)
 
 
+_LOCAL_MACHINE_ID: str | None = None
+
+
+def _local_machine_id() -> str:
+    """与 apps.visual_assets.machine_template_id 同口径：本机 MAC 12 位小写 hex。
+
+    更新器是纯标准库的隔离进程，不导入应用包，就地复算这 3 行。
+    """
+    global _LOCAL_MACHINE_ID
+    if _LOCAL_MACHINE_ID is None:
+        node = uuid.getnode()
+        _LOCAL_MACHINE_ID = "local" if (node >> 40) & 0x01 else f"{node:012x}"
+    return _LOCAL_MACHINE_ID
+
+
+def _customer_template_owner(part: str) -> str | None:
+    """从文件名提取 __customer_ 段的归属：返回 12 位 hex MAC，旧格式（无 MAC）返回 None。"""
+    marker = part.split("__customer_", 1)[1]
+    segments = marker.split("_")
+    if len(segments) >= 2 and re.fullmatch(r"[0-9a-f]{12}", segments[0]):
+        return segments[0]
+    return None
+
+
 def _is_customer_template(relative: str) -> bool:
     parts = _normalize(relative).split("/")
     if len(parts) < 4 or parts[0] != "apps" or parts[2] != "templates":
         return False
-    return any("__customer_" in part for part in parts[3:])
+    for part in parts[3:]:
+        if "__customer_" not in part:
+            continue
+        owner = _customer_template_owner(part)
+        if owner is None:
+            # 旧格式 __customer_{序号}：老客户机的本地采集可能同名，保持保护。
+            return True
+        # 带 MAC 段：只有目标机本机 MAC 名下才保护；外来 MAC（开发机采集、
+        # 跨机收集分发）随更新正常落地，否则开发侧模板永远到不了存量客户。
+        if owner == _local_machine_id():
+            return True
+    return False
 
 
 def _is_preserved(relative: str) -> bool:

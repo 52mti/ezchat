@@ -61,6 +61,39 @@ def test_update_preserves_customer_templates_and_does_not_overwrite_them(tmp_pat
     assert customer_file.read_bytes() == b"customer"
 
 
+def test_update_protects_only_local_mac_customer_templates(tmp_path):
+    """__customer_ 保护按 MAC 精确到目标机：本机 MAC 名下的不覆盖、不清理；
+    外来 MAC（开发机采集/跨机分发）随更新正常落地覆盖——否则开发侧模板
+    永远到不了存量客户。"""
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_tpl = source_root / "apps" / "xinyu" / "templates" / "buttons"
+    target_tpl = target_root / "apps" / "xinyu" / "templates" / "buttons"
+    source_tpl.mkdir(parents=True)
+    target_tpl.mkdir(parents=True)
+    local = update_apply._local_machine_id()
+    own = f"btn_主界面心遇按钮__customer_{local}_1.jpg"
+    foreign = "btn_主界面心遇按钮__customer_aaaaaaaaaaaa_1.jpg"
+    (target_tpl / own).write_bytes(b"customer-local")
+    (target_tpl / foreign).write_bytes(b"stale-foreign")
+    (source_tpl / own).write_bytes(b"update-payload")
+    (source_tpl / foreign).write_bytes(b"update-payload")
+
+    update_apply._copy_update_tree(source_root, target_root, full_payload=False)
+    assert (target_tpl / own).read_bytes() == b"customer-local"
+    assert (target_tpl / foreign).read_bytes() == b"update-payload"
+
+    # 本机 MAC 名下的文件即使从新清单消失也不清理；外来 MAC 随清单正常清理。
+    update_apply._remove_obsolete_files(
+        target_root,
+        {f"apps/xinyu/templates/buttons/{own}", f"apps/xinyu/templates/buttons/{foreign}"},
+        set(),
+        full_payload=False,
+    )
+    assert (target_tpl / own).exists()
+    assert not (target_tpl / foreign).exists()
+
+
 def test_update_replaces_existing_app_modules_archive_atomically(tmp_path):
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
