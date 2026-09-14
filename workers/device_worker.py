@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import os
 import queue
 import sys
 import threading
@@ -201,8 +202,15 @@ class DeviceWorker(threading.Thread):
         except Exception:
             pass
         self.robot = _RobotCallGuard(self.robot_inner, self._stop_event.is_set)
-        # 人设 AI 新链路（docs/13）：DeepSeek 官方直连，会话记忆在本地 persona_sessions
-        workspace_root = str(Path(__file__).resolve().parents[1])
+        # 人设 AI 新链路（docs/13）：DeepSeek 官方直连，会话记忆在本地 persona_sessions。
+        # 打包环境模块经 zipimport 导入，__file__ 落在 app_modules.zip 内：直接
+        # parents[1] 会把 workspace_root 指向 zip 文件，persona_sessions 首次落库
+        # mkdir 时触发 WinError 183（文件已存在），AI 回复整轮失败（客户机
+        # 20260914 事故）。必须优先取 JIXIEBI_PACKAGE_ROOT。
+        configured_root = str(os.environ.get("JIXIEBI_PACKAGE_ROOT", "") or "").strip()
+        workspace_root = (
+            str(Path(configured_root).resolve()) if configured_root else str(Path(__file__).resolve().parents[1])
+        )
         self.persona_client = DeepSeekClient(workspace_root=workspace_root)
         self.persona_store = PersonaSessionStore(root=str(Path(workspace_root) / "runtime" / "persona_sessions"))
         self.persona_chat = PersonaChat(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -106,6 +107,64 @@ def test_worker_init_survives_missing_deepseek_key(tmp_path, monkeypatch):
         emitted.append(events.get())
     assert any(event.level == "warning" and "DeepSeek key" in event.message for event in emitted)
     assert worker._recent_logs is not None
+
+
+def test_worker_persona_paths_follow_package_root_in_zipimport_env(tmp_path, monkeypatch):
+    """回归（客户机 WinError 183，20260914）：打包环境模块经 zipimport 导入，
+    __file__ 落在 app_modules.zip 内；workspace_root 若直接取 parents[1] 会指向
+    zip 文件，persona_sessions 首次落库 mkdir 时在同名文件上建目录触发
+    WinError 183，AI 回复整轮失败（报错步骤显示为 input_box_click）。"""
+    package_root = tmp_path / "pkg"
+    env_dir = package_root / ".env"
+    env_dir.mkdir(parents=True)
+    (env_dir / "deepseek_api_key.txt").write_text("sk-test-key-123", encoding="utf-8")
+    (package_root / "app_modules.zip").write_bytes(b"PK-fake-archive")
+
+    monkeypatch.setenv("JIXIEBI_PACKAGE_ROOT", str(package_root))
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    # 模拟 zipimport 下的模块路径：<包根>/app_modules.zip/workers/device_worker.pyc
+    monkeypatch.setattr(
+        device_worker_module,
+        "__file__",
+        str(package_root / "app_modules.zip" / "workers" / "device_worker.pyc"),
+    )
+    monkeypatch.setattr(device_worker_module, "get_registered_apps", lambda: {"dummy": DummyApp})
+
+    captured: dict[str, Path] = {}
+
+    class _FakeStore:
+        def __init__(self, *, root):
+            captured["store_root"] = Path(root)
+            # 真实 store 首次落库前会 mkdir 父目录：根指向 zip 时这里就是 WinError 183。
+            captured["store_root"].mkdir(parents=True, exist_ok=True)
+
+        def cleanup_inactive_sessions(self, *args, **kwargs):
+            return 0
+
+    def _fake_persona_chat(**kwargs):
+        captured["chat_workspace_root"] = Path(str(kwargs.get("workspace_root", "")))
+        return None
+
+    monkeypatch.setattr(device_worker_module, "PersonaSessionStore", _FakeStore)
+    monkeypatch.setattr(device_worker_module, "PersonaChat", _fake_persona_chat)
+
+    events: "queue.Queue" = queue.Queue()
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+    worker = DeviceWorker(
+        {"ip": "192.168.1.108", "selected_app": "dummy"},
+        app_config={"poll_interval": 1},
+        events=events,
+        config_manager=manager,
+        robot=object(),
+    )
+
+    expected_root = package_root / "runtime" / "persona_sessions"
+    assert captured["store_root"] == expected_root
+    assert "app_modules.zip" not in str(captured["store_root"])
+    assert captured["chat_workspace_root"] == package_root
+    assert expected_root.is_dir()
+    # DeepSeek key 必须从包根 .env 解析成功（修复前会在 zip 内找不到 key）。
+    assert worker.persona_client.api_key == "sk-test-key-123"
 
 
 def test_worker_suppresses_app_status_after_stop(tmp_path, monkeypatch):
