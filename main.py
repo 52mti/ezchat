@@ -6,7 +6,6 @@ import logging
 import os
 import shutil
 import sys
-import threading
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -130,23 +129,6 @@ def _preload_ocr_runtime() -> str:
         return str(engine.preload() or "")
 
 
-def _start_ocr_preload_in_background() -> threading.Thread:
-    """在主窗口显示后预热 OCR，避免第三方运行时阻塞启动界面。"""
-
-    def preload() -> None:
-        try:
-            device = _preload_ocr_runtime()
-            if device:
-                logging.getLogger(__name__).info("OCR runtime preloaded: %s", device)
-        except Exception:
-            # 预热失败不应阻止主程序启动；首次业务调用仍会按运行时策略处理。
-            logging.getLogger(__name__).exception("OCR runtime preload failed; continuing startup")
-
-    thread = threading.Thread(target=preload, name="ocr-preload", daemon=True)
-    thread.start()
-    return thread
-
-
 def main() -> int:
     _configure_quiet_native_runtime()
     _prune_legacy_engine_layout()
@@ -155,8 +137,10 @@ def main() -> int:
     cleanup_old_logs(retention_days=_log_retention_days(config_manager))
     cleanup_old_error_captures(retention_days=_log_retention_days(config_manager), max_files=200)
     try:
-        # run_app 会先 show 主窗口，再通过 Qt 事件循环调用这个回调。
-        return run_app(sys.argv, on_ready=_start_ocr_preload_in_background)
+        # OCR 引擎改为首次业务调用时懒加载：启动期后台预热曾在客户机
+        # pythonw 环境把原生引擎加载与 UI 打开叠在一起（崩溃提前到 UI 阶段），
+        # 预热只是提速优化，不值得为此冒险。_preload_ocr_runtime 保留供调试。
+        return run_app(sys.argv)
     except KeyboardInterrupt:
         return 130
     except Exception as exc:

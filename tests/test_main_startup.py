@@ -89,7 +89,8 @@ def test_main_starts_ui_without_waiting_for_ocr_preload(monkeypatch):
     monkeypatch.setattr(main, "_preload_ocr_runtime", lambda: calls.append("preload") or "cpu")
     def fake_run_app(argv, *, on_ready=None):
         calls.append("run_app")
-        assert callable(on_ready)
+        # 2026-09-14：启动期后台预热已移除（客户机原生崩溃），引擎改懒加载。
+        assert on_ready is None
         return 0
 
     monkeypatch.setattr(main, "run_app", fake_run_app)
@@ -117,7 +118,7 @@ def test_main_continues_when_ocr_preload_fails(monkeypatch):
     monkeypatch.setattr(main, "_preload_ocr_runtime", fail_preload)
     def fake_run_app(argv, *, on_ready=None):
         calls.append("run_app")
-        assert callable(on_ready)
+        assert on_ready is None
         return 0
 
     monkeypatch.setattr(main, "run_app", fake_run_app)
@@ -126,12 +127,7 @@ def test_main_continues_when_ocr_preload_fails(monkeypatch):
     assert calls == ["run_app"]
 
 
-def test_background_ocr_preload_isolated_from_startup(monkeypatch):
-    calls: list[str] = []
-
-    monkeypatch.setattr(main, "_preload_ocr_runtime", lambda: calls.append("preload") or "cpu")
-    thread = main._start_ocr_preload_in_background()
-    thread.join(timeout=2)
-
-    assert not thread.is_alive()
-    assert calls == ["preload"]
+def test_startup_no_longer_wires_background_preload():
+    """启动期后台预热在客户机把原生引擎加载与 UI 打开叠并发（崩溃提前），
+    已整体移除；OCR 引擎由首次业务调用懒加载。"""
+    assert not hasattr(main, "_start_ocr_preload_in_background")
