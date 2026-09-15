@@ -49,19 +49,29 @@ def app(monkeypatch):
     monkeypatch.setattr(steps, "step_deadline", lambda cfg, seconds: _FakeDeadline())
     monkeypatch.setattr(steps, "go_back", lambda robot, cfg, reporter=None, **k: 0)
     monkeypatch.setattr(steps, "classify_screen", lambda image, cfg: "chat")
+    monkeypatch.setattr(steps, "enter_chat", lambda robot, x, y: None)
+    monkeypatch.setattr(steps, "confirm_chat_window", lambda robot, cfg, reporter=None: object())
     monkeypatch.setattr("time.sleep", lambda seconds: None)
     application._test_monkeypatch = monkeypatch
     return application
 
 
-def _run_reply_segment(application, *, mic_match=None, screen="chat"):
+def _run_reply_segment(application, *, mic_match=None, screen="chat", reenter_ok=True):
     mp = application._test_monkeypatch
     mp.setattr(steps, "_template_match", lambda image, cfg, key, group=None: mic_match)
     mp.setattr(steps, "classify_screen", lambda image, cfg: screen)
     mp.setattr(steps, "send_reply", lambda robot, cfg, reporter=None: 1)
-    message = {"contact": "月光", "content": "在吗"}
-    application._reply_segment_flow(
-        message,
+    if not reenter_ok:
+        def _cannot_reenter(robot, cfg, reporter=None):
+            raise steps.StepUnavailable("重进会话失败：未匹配到聊天界面模板")
+
+        mp.setattr(steps, "confirm_chat_window", _cannot_reenter)
+
+
+def _reply_args(application):
+    return (
+        {"contact": "月光", "content": "在吗"},
+        {"name": "月光", "x": 0.3, "y": 0.4, "unread_count": 1},
         "月光",
         "",
         0.0,
@@ -71,6 +81,7 @@ def _run_reply_segment(application, *, mic_match=None, screen="chat"):
 
 def test_flow_happy_path_marks_sent_and_success(app):
     _run_reply_segment(app, mic_match={"x": 0.1, "y": 0.5, "w": 0.05, "h": 0.05})
+    app._reply_segment_flow(*_reply_args(app))
 
     assert len(app._test_sent) == 1
     assert app._test_sent[0][0].text == "你好呀"
@@ -79,19 +90,54 @@ def test_flow_happy_path_marks_sent_and_success(app):
     assert app._abandon_streak == 0
 
 
-def test_flow_mic_missing_back_at_list_abandons_gracefully(app):
-    _run_reply_segment(app, mic_match=None, screen="list")
+def test_flow_mic_missing_reenters_then_succeeds(app):
+    """死局正解：麦克风找不到+已回列表 → 重进会话 → 重点输入框 → 找到麦克风发送。"""
+    state = {"mic_found": False}
+    mp = app._test_monkeypatch
+
+    mp.setattr(steps, "send_reply", lambda robot, cfg, reporter=None: 1)
+
+    def _mic(image, cfg, key, group=None):
+        if not state["mic_found"]:
+            # 第一次搜索（重进前）判列表触发重进；实际场景由感知分类负责，
+            # 此处直接让 _template_match 永不命中，靠 classify 路由。
+            return None
+        return {"x": 0.1, "y": 0.5, "w": 0.05, "h": 0.05}
+
+    def _screen(image, cfg):
+        return "chat" if state["mic_found"] else "list"
+
+    def _reenter(robot, x, y):
+        state["mic_found"] = True  # 重进成功后麦克风出现
+
+    mp.setattr(steps, "_template_match", _mic)
+    mp.setattr(steps, "classify_screen", _screen)
+    mp.setattr(steps, "enter_chat", _reenter)
+
+    app._reply_segment_flow(*_reply_args(app))
+
+    assert len(app._test_sent) == 1
+    assert app.status.error_count == 0
+    assert app._abandon_streak == 0
+    assert any(message == "心遇麦克风缺失且已回列表，准备重进会话" for _l, message, _p in app._test_logs)
+
+
+def test_flow_reenter_failure_abandons_gracefully(app):
+    _run_reply_segment(app, mic_match=None, screen="list", reenter_ok=False)
+    app._reply_segment_flow(*_reply_args(app))
 
     assert app._test_sent == []                      # 未发送
     assert app.status.error_count == 0               # 不计熔断
     assert app.status.is_circuit_open is False
     assert app._abandon_streak == 1
     assert any(message == "心遇流程优雅放弃本轮" for _level, message, _payload in app._test_logs)
+    assert any(message == "心遇重进会话失败" for _level, message, _payload in app._test_logs)
 
 
 def test_flow_abandon_streak_escalates_at_threshold(app):
     for _ in range(4):
-        _run_reply_segment(app, mic_match=None, screen="list")
+        _run_reply_segment(app, mic_match=None, screen="list", reenter_ok=False)
+        app._reply_segment_flow(*_reply_args(app))
     assert app._abandon_streak == 4
     warnings = [
         (level, payload)
@@ -101,15 +147,18 @@ def test_flow_abandon_streak_escalates_at_threshold(app):
     assert warnings[-1][0] == "warning"  # 第 3 次起升为 warning
 
     with pytest.raises(RuntimeError, match="连续优雅放弃"):
-        _run_reply_segment(app, mic_match=None, screen="list")
+        _run_reply_segment(app, mic_match=None, screen="list", reenter_ok=False)
+        app._reply_segment_flow(*_reply_args(app))
     assert app._abandon_streak == 5
 
 
 def test_flow_success_resets_abandon_streak(app):
-    _run_reply_segment(app, mic_match=None, screen="list")
-    _run_reply_segment(app, mic_match=None, screen="list")
+    for _ in range(2):
+        _run_reply_segment(app, mic_match=None, screen="list", reenter_ok=False)
+        app._reply_segment_flow(*_reply_args(app))
     assert app._abandon_streak == 2
     _run_reply_segment(app, mic_match={"x": 0.1, "y": 0.5, "w": 0.05, "h": 0.05})
+    app._reply_segment_flow(*_reply_args(app))
     assert app._abandon_streak == 0
 
 
@@ -121,8 +170,7 @@ def test_flow_ai_failure_counts_one_error_without_circuit(app, monkeypatch):
     monkeypatch.setattr(steps, "_template_match", lambda image, cfg, key, group=None: {"x": 0.1, "y": 0.5, "w": 0.05, "h": 0.05})
     monkeypatch.setattr(steps, "send_reply", lambda robot, cfg, reporter=None: 1)
 
-    message = {"contact": "月光", "content": "在吗"}
-    app._reply_segment_flow(message, "月光", "", 0.0, lambda step, label, **kw: None)
+    app._reply_segment_flow(*_reply_args(app))
 
     assert app.status.error_count == 1
     assert app.status.is_circuit_open is False

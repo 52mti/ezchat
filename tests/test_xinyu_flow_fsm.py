@@ -66,12 +66,22 @@ def test_every_state_has_exit():
 # 关键行为语义
 # ---------------------------------------------------------------------------
 
-def test_voice_input_dead_loop_resolves_to_graceful_abandon():
-    """客户机 20260915 死局解药：麦克风找不到 + 已回列表 = 优雅放弃。"""
+def test_voice_input_list_event_reenters_conversation_instead_of_abandon():
+    """死局正解：掉回列表=会话被退出 → 重进会话续做；放弃只是重进失败的兜底。"""
     transition = resolve(FlowState.VOICE_INPUT, "screen:list")
-    assert transition.target is FlowState.SCANNING
-    assert transition.action == "abandon_round_keep_pending"
+    assert transition.target is FlowState.REENTERING_CHAT
+    assert transition.action == "reenter_conversation"
     assert transition.counts_error is False
+
+    retry = resolve(FlowState.REENTERING_CHAT, "screen:chat")
+    assert retry.target is FlowState.VOICE_INPUT
+    assert retry.action == "retry_microphone"
+    assert retry.counts_error is False
+
+    give_up = resolve(FlowState.REENTERING_CHAT, "reenter:exhausted")
+    assert give_up.target is FlowState.SCANNING
+    assert give_up.action == "abandon_round_keep_pending"
+    assert give_up.counts_error is False
 
 
 def test_preparing_reply_focus_loss_abandons_without_error():

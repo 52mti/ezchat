@@ -251,6 +251,7 @@ class XinyuApp(BaseApp):
     def _reply_segment_flow(
         self,
         message: dict[str, str],
+        target: dict[str, Any],
         target_name: str,
         greeting_reply: str,
         round_started_at: float,
@@ -260,10 +261,12 @@ class XinyuApp(BaseApp):
 
         ctx: dict[str, Any] = {
             "message": message,
+            "target": target,
             "target_name": target_name,
             "greeting_reply": greeting_reply,
             "round_started_at": round_started_at,
             "reporter": reporter,
+            "reenter_attempts": 0,
             "next": None,
         }
 
@@ -367,7 +370,7 @@ class XinyuApp(BaseApp):
         return "ai:ready", Perception.of("chat")
 
     def _flow_prepare_tts(self, ctx: dict[str, Any]) -> tuple[str, Any] | None:
-        """TTS 合成 + 麦克风搜索（带感知门，替代 20 秒干等死局）。"""
+        """TTS 合成后进入麦克风搜索（带感知门，替代 20 秒干等死局）。"""
         from apps.xinyu.flow import Perception
 
         action = ctx["action"]
@@ -390,7 +393,15 @@ class XinyuApp(BaseApp):
                 reporter("tts_retry", "TTS 合成失败，准备重试", log_label=f"TTS 合成失败，准备重试：{exc}")
         if prepared_chunks is None:
             return "mic:exhausted", Perception.of("chat")
+        ctx["prepared_chunks"] = prepared_chunks
+        return self._flow_mic_search(ctx)
 
+    def _flow_mic_search(self, ctx: dict[str, Any]) -> tuple[str, Any] | None:
+        """麦克风搜索 + 播放：找不到先扫弹窗，再感知路由（重进/放弃/耗尽）。"""
+        from apps.xinyu.flow import Perception
+
+        reporter = ctx["reporter"]
+        cfg = self.config
         deadline = steps.step_deadline(cfg, steps._step_timeout(cfg))
         miss_limit = max(1, int(cfg.get("flow_mic_miss_limit", 6) or 6))
         misses = 0
@@ -419,7 +430,7 @@ class XinyuApp(BaseApp):
                 if screen == "list":
                     self.emit_runtime_log(
                         "warning",
-                        "心遇麦克风缺失且已回列表",
+                        "心遇麦克风缺失且已回列表，准备重进会话",
                         {"contact": ctx["message"].get("contact", "")},
                     )
                     return "screen:list", Perception.of("list")
@@ -434,10 +445,50 @@ class XinyuApp(BaseApp):
 
         reporter("microphone_click", "点击麦克风", log_label=f"点击麦克风：{steps.format_point(*microphone)}")
         steps.click_image_point(self.robot, *microphone)
-        steps.play_prepared_tts_input(self.robot, prepared_chunks)
+        steps.play_prepared_tts_input(self.robot, ctx["prepared_chunks"])
         time.sleep(steps.TTS_POST_DELAY_SECONDS)
         self._mark_activity()
         return "tts:done", Perception.of("chat")
+
+    def _flow_reenter_conversation(self, ctx: dict[str, Any]) -> tuple[str, Any] | None:
+        """掉回列表后重进会话：优先续做本轮，重进两次失败才放弃。"""
+        from apps.xinyu.flow import Perception
+
+        reporter = ctx["reporter"]
+        target = ctx.get("target") or {}
+        limit = max(1, int(self.config.get("flow_reenter_limit", 2) or 2))
+        while ctx["reenter_attempts"] < limit:
+            ctx["reenter_attempts"] += 1
+            try:
+                reporter("reenter_chat", "重新进入会话", log_label=f"重新进入会话（第 {ctx['reenter_attempts']} 次）")
+                steps.enter_chat(self.robot, float(target["x"]), float(target["y"]))
+                self._mark_activity()
+                steps.confirm_chat_window(self.robot, self.config, reporter=reporter)
+                return "screen:chat", Perception.of("chat")
+            except Exception as exc:  # noqa: BLE001 - 重进失败按次数兜底
+                self.emit_runtime_log(
+                    "warning",
+                    "心遇重进会话失败",
+                    {"attempt": ctx["reenter_attempts"], "error": str(exc)},
+                )
+        return "reenter:exhausted", Perception.of("list")
+
+    def _flow_retry_microphone(self, ctx: dict[str, Any]) -> tuple[str, Any] | None:
+        """重进成功后的续跑：重点输入框，直接找麦克风（复用已合成 TTS）。"""
+        from apps.xinyu.flow import Perception
+
+        reporter = ctx["reporter"]
+        if "prepared_chunks" not in ctx:
+            return "mic:exhausted", Perception.of("chat")
+        try:
+            steps.focus_input_box(self.robot, self.config, reporter=reporter)
+            self._mark_activity()
+        except steps.StepUnavailable:
+            screen = self._flow_perceive_fresh()
+            if screen == "list":
+                return "screen:list", Perception.of("list")
+            raise
+        return self._flow_mic_search(ctx)
 
     def _flow_click_send(self, ctx: dict[str, Any]) -> tuple[str, Any] | None:
         from apps.xinyu.flow import Perception
@@ -581,6 +632,9 @@ class XinyuApp(BaseApp):
     _FLOW_ACTION_HANDLERS: dict[str, Callable[..., Any]] = {
         "submit_reply_and_focus_input": _flow_submit_reply_and_focus_input,
         "prepare_tts": _flow_prepare_tts,
+        "click_microphone_and_play": _flow_prepare_tts,
+        "reenter_conversation": _flow_reenter_conversation,
+        "retry_microphone": _flow_retry_microphone,
         "click_send": _flow_click_send,
         "click_back": _flow_click_back,
         "mark_round_success": _flow_mark_round_success,
@@ -878,7 +932,7 @@ class XinyuApp(BaseApp):
             )
 
             if self._flow_engine_enabled():
-                self._reply_segment_flow(message, target_name, greeting_reply, round_started_at, reporter)
+                self._reply_segment_flow(message, target, target_name, greeting_reply, round_started_at, reporter)
             else:
                 self._reply_segment_pipeline(message, target_name, greeting_reply, round_started_at, reporter)
         except steps.NoPhoneScreenError as exc:

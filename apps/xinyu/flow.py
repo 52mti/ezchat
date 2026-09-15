@@ -26,6 +26,7 @@ class FlowState(str, Enum):
     ENTERING_CHAT = "entering_chat"      # 点进会话、确认到聊天页
     PREPARING_REPLY = "preparing_reply"  # AI 生成(异步) + 聚焦输入框
     VOICE_INPUT = "voice_input"          # 找麦克风 + 点麦克风 + TTS 播放
+    REENTERING_CHAT = "reentering_chat"  # 回复中途掉回列表，重进会话续做
     SENDING = "sending"                  # 点发送 + 确认发出
     RETURNING = "returning"              # 返回列表 + 确认
     RECOVERING_SOFT = "recovering_soft"  # 软恢复：软件导航回列表
@@ -123,9 +124,12 @@ _ROWS: list[tuple[tuple[FlowState, str], Transition]] = [
     _t(FlowState.VOICE_INPUT, "tts:done", FlowState.SENDING, "click_send"),
     _t(FlowState.VOICE_INPUT, "mic:missing", FlowState.VOICE_INPUT, "close_popup_and_retry_mic", note="SEARCH 循环内先关弹窗再重找（吸收 skip_popup_detection=True 盲区）"),
     _t(FlowState.VOICE_INPUT, "mic:exhausted", FlowState.RETURNING, "abort_round_go_back", counts_error=True, note="确在聊天页但始终无麦克风：返回重试整轮"),
-    _t(FlowState.VOICE_INPUT, "screen:list", FlowState.SCANNING, "abandon_round_keep_pending", counts_error=False, note="死局解药：麦克风找不到+已回列表=优雅放弃，不进熔断"),
+    _t(FlowState.VOICE_INPUT, "screen:list", FlowState.REENTERING_CHAT, "reenter_conversation", counts_error=False, note="死局正解：掉回列表=会话被退出，重进会话续做而不是放弃"),
     _t(FlowState.VOICE_INPUT, "screen:my", FlowState.RECOVERING_SOFT, "recover_navigate"),
     _t(FlowState.VOICE_INPUT, "screen:unknown", FlowState.RECOVERING_SOFT, "recover_navigate"),
+    # ---- REENTERING_CHAT：重进会话，续跑语音输入（复用已合成 TTS 与回复）----
+    _t(FlowState.REENTERING_CHAT, "screen:chat", FlowState.VOICE_INPUT, "retry_microphone", counts_error=False, note="重进成功：重点输入框后直接找麦克风，不重做 AI/TTS"),
+    _t(FlowState.REENTERING_CHAT, "reenter:exhausted", FlowState.SCANNING, "abandon_round_keep_pending", counts_error=False, note="重进两次仍失败才优雅放弃，待发回复留 outbox 下轮复用"),
     # ---- SENDING ----
     _t(FlowState.SENDING, "send:sent", FlowState.RETURNING, "click_back"),
     _t(FlowState.SENDING, "send:failed", FlowState.SENDING, "retry_click_send", note="发送重试（上限在引擎计数器）"),
@@ -195,6 +199,8 @@ REGISTERED_ACTIONS: frozenset[str] = frozenset(
         "prepare_tts",
         "click_microphone_and_play",
         "close_popup_and_retry_mic",
+        "reenter_conversation",
+        "retry_microphone",
         "click_send",
         "retry_click_send",
         "finish_round_from_list",
