@@ -725,7 +725,14 @@ def test_log_panel_shows_xinyu_send_summary_in_chinese(qtbot, tmp_path):
             "192.168.1.108",
             "info",
             "xinyu_round_metrics",
-            {"ocr_count": 2, "capture_count": 5, "dialogue_compact_fallback_count": 1, "seconds": 6.7},
+            {
+                "ocr_count": 2,
+                "capture_count": 5,
+                "dialogue_compact_fallback_count": 1,
+                "seconds": 6.7,
+                "ocr_seconds_total": 15.2,
+                "ocr_seconds_max": 12.8,
+            },
         )
     )
     _show_logs(window)
@@ -737,7 +744,7 @@ def test_log_panel_shows_xinyu_send_summary_in_chinese(qtbot, tmp_path):
     assert "心遇发送摘要 [清雅如茶] 输入框=cache" in logs_text
     assert "麦克风=btn_麦克风按钮.jpg" in logs_text
     assert "TTS=成功，重试 1 次，发送点击 1 次，补点 0 次，返回 2 次" in logs_text
-    assert "心遇本轮统计 OCR 2 次，截图 5 次，详情回退 1 次，耗时 6.7 秒" in logs_text
+    assert "心遇本轮统计 OCR 2 次，OCR 耗时 15.2 秒（单次最长 12.8 秒），截图 5 次，详情回退 1 次，耗时 6.7 秒" in logs_text
 
 
 def test_log_panel_filters_by_selected_device_ip(qtbot, tmp_path):

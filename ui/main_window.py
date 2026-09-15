@@ -1986,9 +1986,13 @@ class MainWindow(QMainWindow):
                     f"复用 OCR {payload.get('ocr_cache_hit_count', 0)} 次，"
                     f"复用检测 {payload.get('detection_cache_hit_count', 0)} 次，"
                 )
+            ocr_seconds_total = payload.get("ocr_seconds_total")
+            ocr_seconds_text = ""
+            if ocr_seconds_total not in (None, "", 0, 0.0):
+                ocr_seconds_text = f"，OCR 耗时 {ocr_seconds_total} 秒（单次最长 {payload.get('ocr_seconds_max', 0)} 秒）"
             return (
                 f"[{event.level}] {event.device_ip}: 心遇本轮统计 "
-                f"OCR {payload.get('ocr_count', '')} 次，{reuse_text}截图 {payload.get('capture_count', '')} 次，"
+                f"OCR {payload.get('ocr_count', '')} 次{ocr_seconds_text}，{reuse_text}截图 {payload.get('capture_count', '')} 次，"
                 f"详情回退 {payload.get('dialogue_compact_fallback_count', 0)} 次，"
                 f"耗时 {payload.get('seconds', '')} 秒"
             )

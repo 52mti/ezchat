@@ -99,6 +99,8 @@ class XinyuApp(BaseApp):
             {
                 "ocr_count": int(metrics.get("ocr_count", 0) or 0),
                 "ocr_cache_hit_count": int(metrics.get("ocr_cache_hit_count", 0) or 0),
+                "ocr_seconds_total": round(float(metrics.get("ocr_seconds_total", 0.0) or 0.0), 3),
+                "ocr_seconds_max": round(float(metrics.get("ocr_seconds_max", 0.0) or 0.0), 3),
                 "detection_cache_hit_count": int(metrics.get("detection_cache_hit_count", 0) or 0),
                 "capture_count": int(metrics.get("capture_count", 0) or 0),
                 "dialogue_compact_fallback_count": int(metrics.get("dialogue_compact_fallback_count", 0) or 0),

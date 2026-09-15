@@ -492,8 +492,13 @@ def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = N
     with exclude_ocr_wait_from_step_timeout(config):
         result = run_ocr_mode(image, config, mode, region=region)
     _store_ocr_reuse_result(config, key=reuse_key, signature=signature, result=result)
+    elapsed = time.monotonic() - started_at
     metrics = _runtime_cache(config).get("metrics", {})
     if isinstance(metrics, dict):
+        # OCR 耗时观测（客户机性能定位）：run_ocr_mode 内含角标数字等追加
+        # pass，这里记的是整个调用的墙钟时间。
+        metrics["ocr_seconds_total"] = round(float(metrics.get("ocr_seconds_total", 0.0) or 0.0) + elapsed, 4)
+        metrics["ocr_seconds_max"] = round(max(float(metrics.get("ocr_seconds_max", 0.0) or 0.0), elapsed), 4)
         if result.get("_cache_hit"):
             metrics["ocr_cache_hit_count"] = int(metrics.get("ocr_cache_hit_count", 0) or 0) + 1
         else:
@@ -501,7 +506,7 @@ def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = N
         metrics["last_ocr"] = {
             "mode": mode,
             "region": region,
-            "seconds": round(time.monotonic() - started_at, 4),
+            "seconds": round(elapsed, 4),
             "cache_hit": bool(result.get("_cache_hit")),
             "cache_source": result.get("_cache_source", ""),
         }
