@@ -1,0 +1,274 @@
+{
+  "match_threshold": 0.7,
+  "popup_match_threshold": 0.8,
+  "templates": {
+    "buttons": "apps/xinyu/templates/buttons",
+    "screens": "apps/xinyu/templates/screens"
+  },
+  "template_match_regions": {
+    "button.back": [
+      0.0,
+      0.911,
+      0.993,
+      0.089
+    ],
+    "button.input_box": [
+      0.651,
+      0.737,
+      0.349,
+      0.188
+    ],
+    "button.microphone": [
+      0.012,
+      0.555,
+      0.984,
+      0.168
+    ],
+    "button.new_greeting": [
+      0.011,
+      0.687,
+      0.98,
+      0.171
+    ],
+    "button.photo": [
+      0.0,
+      0.55,
+      0.65,
+      0.45
+    ],
+    "button.complete": [
+      0.0,
+      0.0,
+      1.0,
+      0.35
+    ],
+    "button.send": [
+      0.63,
+      0.305,
+      0.367,
+      0.376
+    ],
+    "button.custom.主界面心遇按钮": [
+      0.532,
+      0.533,
+      0.147,
+      0.095
+    ],
+    "screen.chat_list": [
+      0.0,
+      0.023,
+      0.489,
+      0.127
+    ],
+    "screen.chat_window": [
+      0.005,
+      0.816,
+      0.518,
+      0.184
+    ],
+    "screen.my": [
+      0.468,
+      0.686,
+      0.488,
+      0.187
+    ],
+    "screen.call_window": [
+      0.004,
+      0.722,
+      0.415,
+      0.278
+    ],
+    "screen.no_phone": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+    ],
+    "screen.black_screen": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+    ],
+    "popup.custom.popup_custom_1": [
+      0.06,
+      0.292,
+      0.819,
+      0.406
+    ],
+    "popup.custom.popup_custom_2": [
+      0.037,
+      0.282,
+      0.954,
+      0.443
+    ],
+    "popup.custom.popup_custom_3": [
+      0.037,
+      0.282,
+      0.954,
+      0.443
+    ],
+    "popup.custom.popup_custom_4": [
+      0.084,
+      0.278,
+      0.786,
+      0.462
+    ],
+    "popup.custom.popup_custom_5": [
+      0.319,
+      0.422,
+      0.48,
+      0.285
+    ],
+    "popup.custom.popup_custom__customer_1": [
+      0.304,
+      0.696,
+      0.346,
+      0.136
+    ]
+  },
+  "template_match_thresholds": {
+    "button.back": 0.7,
+    "button.complete": 0.8,
+    "button.custom.主界面心遇按钮": 0.88,
+    "button.input_box": 0.8,
+    "button.microphone": 0.8,
+    "button.new_greeting": 0.8,
+    "button.photo": 0.8,
+    "button.send": 0.8,
+    "popup.custom.popup_custom_1": 0.8,
+    "popup.custom.popup_custom_2": 0.8,
+    "popup.custom.popup_custom_3": 0.8,
+    "popup.custom.popup_custom_4": 0.8,
+    "popup.custom.popup_custom_5": 0.8,
+    "popup.custom.popup_custom__customer_1": 0.8,
+    "screen.call_window": 0.8,
+    "screen.chat_list": 0.8,
+    "screen.chat_window": 0.8,
+    "screen.my": 0.8
+  },
+  "screen_detection_rules": [
+    {
+      "screen": "xinyu-缘分",
+      "condition": {
+        "type": "ocr_raw",
+        "region": [
+          0.0,
+          0.865,
+          0.18,
+          0.1
+        ],
+        "text": "缘分",
+        "match_mode": "contains",
+        "min_confidence": 0.5
+      }
+    },
+    {
+      "screen": "xinyu-动态",
+      "condition": {
+        "type": "ocr_raw",
+        "region": [
+          0.2,
+          0.865,
+          0.18,
+          0.1
+        ],
+        "text": "动态",
+        "match_mode": "contains",
+        "min_confidence": 0.5
+      }
+    },
+    {
+      "screen": "xinyu-娱乐交友",
+      "condition": {
+        "type": "ocr_raw",
+        "region": [
+          0.4,
+          0.865,
+          0.18,
+          0.1
+        ],
+        "text": "娱乐",
+        "match_mode": "contains",
+        "min_confidence": 0.5
+      }
+    },
+    {
+      "screen": "xinyu-消息",
+      "condition": {
+        "type": "ocr_raw",
+        "region": [
+          0.6,
+          0.865,
+          0.18,
+          0.1
+        ],
+        "text": "消息",
+        "match_mode": "contains",
+        "min_confidence": 0.5
+      }
+    },
+    {
+      "screen": "xinyu-我的",
+      "condition": {
+        "type": "ocr_raw",
+        "region": [
+          0.8,
+          0.865,
+          0.18,
+          0.1
+        ],
+        "text": "我的",
+        "match_mode": "contains",
+        "min_confidence": 0.5
+      }
+    }
+  ],
+  "ocr": {
+    "lang": "ch",
+    "runtime_enabled": true,
+    "backend": "auto",
+    "model_tier": "lite",
+    "use_gpu": true,
+    "text_detection_model_name": "PP-OCRv5_mobile_det",
+    "text_recognition_model_name": "PP-OCRv5_mobile_rec",
+    "det_db_thresh": 0.3,
+    "rec_thresh": 0.5,
+    "regions": {
+      "message_list": [
+        0.0,
+        0.1,
+        1.0,
+        0.9
+      ],
+      "chat_area": [
+        0.0,
+        0.1,
+        1.0,
+        0.8
+      ]
+    }
+  },
+  "ocr_modes": {
+    "points": {
+      "preprocess": {
+        "mode": "original",
+        "scale": 2,
+        "rotate_to_portrait": true
+      },
+      "rules": {
+        "min_confidence": 0.3,
+        "min_box_height_ratio": 0.01,
+        "line_gap": 24,
+        "keywords": [
+          "我的积分",
+          "积分"
+        ],
+        "neighbor_y_ratio": 0.06,
+        "neighbor_x_ratio": 0.45
+      }
+    }
+  },
+  "enable_black_screen_detection": false,
+  "enable_flow_engine": true
+}

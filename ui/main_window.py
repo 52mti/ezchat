@@ -2025,6 +2025,7 @@ class MainWindow(QMainWindow):
             return f"[{event.level}] {event.device_ip}: 检测到黑屏 {payload.get('error', '')}"
         if event.message == "keep_awake_failed":
             return f"[{event.level}] {event.device_ip}: 防熄屏失败 {payload.get('error', '')}"
+        if event.message == "app_error":
             label = str(payload.get("label", "") or payload.get("step", "") or "")
             error = str(payload.get("error", "") or "")
             count = payload.get("error_count", "")

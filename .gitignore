@@ -16,6 +16,8 @@ wheelhouse/
 
 config.json
 *_ocr_config.json
+!apps/*/config.json
+!apps/*/*_ocr_config.json
 !apps/xinyu/dialogue_ocr_config.json
 outbox.json
 .env

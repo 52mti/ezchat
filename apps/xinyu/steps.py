@@ -1412,6 +1412,31 @@ def _is_chat_window_image(image: Any, config: dict[str, Any]) -> bool:
     return False
 
 
+_FLOW_SCREEN_NAMES: dict[str, str] = {
+    CHAT_LIST_SCREEN: "list",
+    CHAT_WINDOW_SCREEN: "chat",
+    MY_SCREEN: "my",
+    CALL_SCREEN: "call",
+    NO_PHONE_SCREEN: "no_phone",
+    BLACK_SCREEN: "black",
+}
+
+
+def classify_screen(image: Any, config: dict[str, Any]) -> str:
+    """流程状态机的感知入口：返回 flow.ScreenEvent 语义的短名。
+
+    无手机/黑屏在 current_screen 的模板轮询之外单独优先判定，
+    保证状态机外部异常语义（等待人工，不熔断）先行。
+    """
+    if _matches_screen(image, config, NO_PHONE_SCREEN):
+        return _FLOW_SCREEN_NAMES[NO_PHONE_SCREEN]
+    if _optimization_enabled(config, "enable_black_screen_detection") and _matches_screen(
+        image, config, BLACK_SCREEN
+    ):
+        return _FLOW_SCREEN_NAMES[BLACK_SCREEN]
+    return _FLOW_SCREEN_NAMES.get(current_screen(image, config), "unknown")
+
+
 def _popup_close_point(image: Any, config: dict[str, Any]) -> tuple[float, float] | None:
     for popup_template in popup_template_paths(config):
         result = _popup_match(image, popup_template, config)

@@ -24,6 +24,12 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return merged
 
 
+# flow 引擎参数：单轮迁移上限防呆；优雅放弃连续计数（3 次留痕/5 次升级）。
+_FLOW_MAX_TICKS = 24
+_FLOW_ABANDON_WARN_AT = 3
+_FLOW_ABANDON_ESCALATE_AT = 5
+
+
 class XinyuApp(BaseApp):
     # 能力声明：DeviceWorker 据此注入对应 provider，不再按 App 名字分支。
     supports_dialogue_continuity = True
@@ -64,6 +70,7 @@ class XinyuApp(BaseApp):
         self.idle_online_photo_attempted = False
         self._last_selected_signature: tuple[str, str, int] | None = None
         self._last_remote_filter_rule_sync_at = 0.0
+        self._abandon_streak = 0
 
     def _sync_remote_filter_rules_if_due(self) -> None:
         now = time.monotonic()
@@ -99,6 +106,491 @@ class XinyuApp(BaseApp):
                 "last_ocr": metrics.get("last_ocr"),
             },
         )
+
+    def _reply_segment_pipeline(
+        self,
+        message: dict[str, str],
+        target_name: str,
+        greeting_reply: str,
+        round_started_at: float,
+        reporter: Callable[..., None],
+    ) -> None:
+        """原线性流水线回复段（保留为双轨回退路径，行为与历史版本一致）。"""
+        input_focused = False
+        if greeting_reply:
+            reporter("request_ai", "请求 AI 回复")
+            if self.greeting_provider:
+                # 人设 AI 招呼链路：底稿挑选/AI 改写/防重复/回退全部在 provider 内完成（docs/13 4.4）
+                executor = ThreadPoolExecutor(max_workers=1)
+                future = executor.submit(self.greeting_provider, str(message.get("contact") or target_name or ""))
+                try:
+                    steps.focus_input_box(self.robot, self.config, reporter=reporter)
+                    self._mark_activity()
+                    input_focused = True
+                    greeting_text = future.result()
+                finally:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                action = ReplyAction(text=greeting_text or greeting_reply, reason="greeting_reply")
+            else:
+                steps.focus_input_box(self.robot, self.config, reporter=reporter)
+                self._mark_activity()
+                input_focused = True
+                action = ReplyAction(text=greeting_reply, reason="greeting_reply")
+        else:
+            reporter("request_ai", "请求 AI 回复")
+            executor = ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(self.reply_provider, message)
+            try:
+                steps.focus_input_box(self.robot, self.config, reporter=reporter)
+                self._mark_activity()
+                input_focused = True
+                raw_action = future.result()
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+            action = raw_action if isinstance(raw_action, ReplyAction) else ReplyAction(text=str(raw_action))
+            if action.reason == "pending_send":
+                self.emit_runtime_log(
+                    "warning",
+                    "心遇复用待发送回复",
+                    {
+                        "contact": message.get("contact", ""),
+                        "content": message.get("content", ""),
+                    },
+                )
+
+        self.emit_runtime_log(
+            "info",
+            "xinyu_reply_text",
+            {
+                "contact": message.get("contact", ""),
+                "reply_text": action.text,
+                "skip": action.skip,
+                "reason": action.reason,
+            },
+        )
+        if action.skip:
+            reporter("skip_reply", "跳过本轮回复")
+            steps.go_back(self.robot, self.config, reporter=reporter)
+            self._mark_activity()
+            self._emit_round_metrics(round_started_at)
+            self.mark_success()
+            return
+        if not action.text:
+            raise RuntimeError("回复内容为空，未生成可发送文本")
+
+        if not input_focused:
+            steps.focus_input_box(self.robot, self.config, reporter=reporter)
+            self._mark_activity()
+        steps.play_voice_reply(self.robot, action.text, self.config, reporter=reporter)
+        self._mark_activity()
+        send_clicks = steps.send_reply(self.robot, self.config, reporter=reporter)
+        self.emit_runtime_log("info", "xinyu_send_clicks", {"clicks": send_clicks})
+        self._mark_recovered_progress()
+        if send_clicks > 1:
+            self.emit_runtime_log(
+                "warning",
+                "心遇发送按钮被连续点击",
+                {
+                    "contact": message.get("contact", ""),
+                    "clicks": send_clicks,
+                },
+            )
+        self._mark_activity()
+        if self.sent_callback:
+            reporter("mark_sent", "记录发送结果")
+            self.sent_callback(action, message)
+        try:
+            return_clicks = steps.go_back(
+                self.robot,
+                self.config,
+                double_click_on_first_attempt=True,
+                reporter=reporter,
+            )
+        except Exception:
+            self.emit_runtime_log(
+                "warning",
+                "心遇发送后未能返回列表",
+                {
+                    "contact": message.get("contact", ""),
+                    "content": message.get("content", ""),
+                },
+            )
+            raise
+        self.emit_runtime_log(
+            "info",
+            "xinyu_send_flow_summary",
+            {
+                "contact": message.get("contact", ""),
+                "input_focused": input_focused,
+                "input_box_source": self.config.get("_runtime_cache", {}).get("metrics", {}).get("input_box_source", ""),
+                "input_box_template": self.config.get("_runtime_cache", {}).get("metrics", {}).get("input_box_template", ""),
+                "microphone_template": self.config.get("_runtime_cache", {}).get("metrics", {}).get("microphone_template", ""),
+                "tts_success": self.config.get("_runtime_cache", {}).get("metrics", {}).get("tts_success", False),
+                "tts_retry_count": self.config.get("_runtime_cache", {}).get("metrics", {}).get("tts_retry_count", 0),
+                "send_clicks": send_clicks,
+                "send_clear_extra_clicks": self.config.get("_runtime_cache", {}).get("metrics", {}).get("send_clear_extra_clicks", 0),
+                "send_clear_reason": self.config.get("_runtime_cache", {}).get("metrics", {}).get("send_clear_reason", ""),
+                "return_clicks": return_clicks,
+                "return_reason": self.config.get("_runtime_cache", {}).get("metrics", {}).get("return_reason", ""),
+                "after_send_double_back_allowed": True,
+            },
+        )
+        self._mark_activity()
+        reporter("wait_next_round", "等待下一轮扫描")
+        self.record_reply_round(time.monotonic() - round_started_at)
+        self._emit_round_metrics(round_started_at)
+        self.mark_success()
+
+    # ------------------------------------------------------------------
+    # 流程状态机（v1 接入：回复段 PREPARING→VOICE→SENDING→RETURNING）
+    # ------------------------------------------------------------------
+
+    def _flow_engine_enabled(self) -> bool:
+        return bool(self.config.get("enable_flow_engine", False))
+
+    def _reply_segment_flow(
+        self,
+        message: dict[str, str],
+        target_name: str,
+        greeting_reply: str,
+        round_started_at: float,
+        reporter: Callable[..., None],
+    ) -> None:
+        from apps.xinyu.flow import FlowEngine, FlowHardReset, FlowState
+
+        ctx: dict[str, Any] = {
+            "message": message,
+            "target_name": target_name,
+            "greeting_reply": greeting_reply,
+            "round_started_at": round_started_at,
+            "reporter": reporter,
+            "next": None,
+        }
+
+        def executor(action: str, *, state: str, trigger: str) -> None:
+            ctx["next"] = self._flow_action(action, state, trigger, ctx)
+
+        engine = FlowEngine(state=FlowState.PREPARING_REPLY, executor=executor)
+        # 入口动作：ENTERING_CHAT+screen:chat 的迁移动作，由本轮外层流程
+        # （find_unread_target/enter_chat/confirm_chat_window）代为完成。
+        executor("submit_reply_and_focus_input", state="entering_chat", trigger="screen:chat")
+        for _ in range(_FLOW_MAX_TICKS):
+            pending = ctx["next"]
+            if pending is None:
+                return  # 轮次收尾（成功/优雅放弃/中止），外层轮询自然进入下轮
+            event, perception = pending
+            try:
+                engine.tick(event, perception)
+            except FlowHardReset as exc:
+                raise RuntimeError(f"flow 恢复梯度耗尽：{exc}") from exc
+        raise RuntimeError("flow 单轮迁移次数超限")
+
+    def _flow_action(
+        self,
+        action: str,
+        state: str,
+        trigger: str,
+        ctx: dict[str, Any],
+    ) -> tuple[str, Any] | None:
+        handler = self._FLOW_ACTION_HANDLERS.get(action)
+        if handler is None:
+            raise RuntimeError(f"flow 动作未接入：{action}")
+        return handler(self, ctx)
+
+    def _flow_submit_reply_and_focus_input(self, ctx: dict[str, Any]) -> tuple[str, Any] | None:
+        from apps.xinyu.flow import Perception
+
+        message = ctx["message"]
+        reporter = ctx["reporter"]
+        reporter("request_ai", "请求 AI 回复")
+        executor = ThreadPoolExecutor(max_workers=1)
+        if ctx["greeting_reply"]:
+            future = executor.submit(
+                self.greeting_provider,
+                str(message.get("contact") or ctx["target_name"] or ""),
+            )
+        else:
+            future = executor.submit(self.reply_provider, message)
+        try:
+            try:
+                steps.focus_input_box(self.robot, self.config, reporter=reporter)
+                self._mark_activity()
+            except steps.StepUnavailable:
+                # 输入框定位失败：先感知再决定是优雅放弃还是真异常。
+                screen = self._flow_perceive_fresh()
+                if screen == "list":
+                    return "screen:list", Perception.of("list")
+                raise
+            try:
+                raw = future.result()
+            except Exception as exc:  # noqa: BLE001 - AI 失败转 ai:failed 事件计一次错误
+                from services.cancellation import OperationCancelled
+
+                if isinstance(exc, OperationCancelled):
+                    raise
+                ctx["ai_error"] = str(exc)
+                return "ai:failed", Perception.of("chat")
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        if ctx["greeting_reply"]:
+            action = ReplyAction(
+                text=str(raw or "") or ctx["greeting_reply"],
+                reason="greeting_reply",
+            )
+        else:
+            action = raw if isinstance(raw, ReplyAction) else ReplyAction(text=str(raw))
+            if action.reason == "pending_send":
+                self.emit_runtime_log(
+                    "warning",
+                    "心遇复用待发送回复",
+                    {"contact": message.get("contact", ""), "content": message.get("content", "")},
+                )
+        ctx["action"] = action
+        self.emit_runtime_log(
+            "info",
+            "xinyu_reply_text",
+            {
+                "contact": message.get("contact", ""),
+                "reply_text": action.text,
+                "skip": action.skip,
+                "reason": action.reason,
+            },
+        )
+        if action.skip:
+            reporter("skip_reply", "跳过本轮回复")
+            self._flow_best_effort_go_back(ctx)
+            self._emit_round_metrics(ctx["round_started_at"])
+            self.mark_success()
+            return None
+        if not action.text:
+            return "ai:failed", Perception.of("chat")
+        return "ai:ready", Perception.of("chat")
+
+    def _flow_prepare_tts(self, ctx: dict[str, Any]) -> tuple[str, Any] | None:
+        """TTS 合成 + 麦克风搜索（带感知门，替代 20 秒干等死局）。"""
+        from apps.xinyu.flow import Perception
+
+        action = ctx["action"]
+        reporter = ctx["reporter"]
+        cfg = self.config
+        retry_count = max(0, int(cfg.get("tts_retry_attempts", 1) or 0))
+        last_error: Exception | None = None
+        prepared_chunks = None
+        for attempt in range(retry_count + 1):
+            try:
+                reporter("tts_prepare", "合成 TTS 音频", log_label="TTS 音频合成中，完成后再点击麦克风")
+                prepared_chunks = steps.prepare_tts_input(self.robot, action.text)
+                reporter("tts_prepared", "TTS 音频已就绪", log_label="TTS 音频已就绪，准备点击麦克风播放")
+                last_error = None
+                break
+            except Exception as exc:  # noqa: BLE001 - TTS 失败重试语义与流水线一致
+                last_error = exc
+                if attempt >= retry_count:
+                    break
+                reporter("tts_retry", "TTS 合成失败，准备重试", log_label=f"TTS 合成失败，准备重试：{exc}")
+        if prepared_chunks is None:
+            return "mic:exhausted", Perception.of("chat")
+
+        deadline = steps.step_deadline(cfg, steps._step_timeout(cfg))
+        miss_limit = max(1, int(cfg.get("flow_mic_miss_limit", 6) or 6))
+        misses = 0
+        popup_sweeps = 0
+        microphone = None
+        while True:
+            image = steps.capture_after_popups(
+                self.robot, cfg, label="microphone", reporter=reporter, skip_popup_detection=True
+            )
+            microphone_match = steps._template_match(image, cfg, steps.MICROPHONE_BUTTON, group="buttons")
+            if microphone_match is not None:
+                microphone = (
+                    microphone_match["x"] + microphone_match["w"] / 2,
+                    microphone_match["y"] + microphone_match["h"] / 2,
+                )
+                break
+            misses += 1
+            if misses >= miss_limit:
+                # 感知门：弹窗遮挡优先清扫（吸收 skip_popup_detection=True 盲区）。
+                if popup_sweeps < 2:
+                    popup_sweeps += 1
+                    steps.capture_after_popups(self.robot, cfg, label="mic_popup_sweep", reporter=reporter)
+                    misses = 0
+                    continue
+                screen = steps.classify_screen(image, cfg)
+                if screen == "list":
+                    self.emit_runtime_log(
+                        "warning",
+                        "心遇麦克风缺失且已回列表",
+                        {"contact": ctx["message"].get("contact", "")},
+                    )
+                    return "screen:list", Perception.of("list")
+                if screen == "no_phone":
+                    raise steps.NoPhoneScreenError("flow 感知：检测到无手机界面，请先把手机放回支架")
+                if screen == "black":
+                    raise steps.BlackScreenError("flow 感知：检测到黑屏界面")
+                return "mic:exhausted", Perception.of(screen)
+            if deadline.expired():
+                return "mic:exhausted", Perception.of("chat")
+            time.sleep(0.4)
+
+        reporter("microphone_click", "点击麦克风", log_label=f"点击麦克风：{steps.format_point(*microphone)}")
+        steps.click_image_point(self.robot, *microphone)
+        steps.play_prepared_tts_input(self.robot, prepared_chunks)
+        time.sleep(steps.TTS_POST_DELAY_SECONDS)
+        self._mark_activity()
+        return "tts:done", Perception.of("chat")
+
+    def _flow_click_send(self, ctx: dict[str, Any]) -> tuple[str, Any] | None:
+        from apps.xinyu.flow import Perception
+
+        reporter = ctx["reporter"]
+        try:
+            send_clicks = steps.send_reply(self.robot, self.config, reporter=reporter)
+        except Exception:
+            # 发送按钮始终未出现/未消失：与流水线同语义（异常上抛走 on_error）。
+            raise
+        self.emit_runtime_log("info", "xinyu_send_clicks", {"clicks": send_clicks})
+        self._mark_recovered_progress()
+        if send_clicks > 1:
+            self.emit_runtime_log(
+                "warning",
+                "心遇发送按钮被连续点击",
+                {"contact": ctx["message"].get("contact", ""), "clicks": send_clicks},
+            )
+        self._mark_activity()
+        return "send:sent", Perception.of("chat")
+
+    def _flow_click_back(self, ctx: dict[str, Any]) -> tuple[str, Any] | None:
+        from apps.xinyu.flow import Perception
+
+        try:
+            steps.go_back(self.robot, self.config, double_click_on_first_attempt=True, reporter=ctx["reporter"])
+        except Exception:
+            return "back:exhausted", Perception.of("unknown")
+        return "back:at_list", Perception.of("list")
+
+    def _flow_mark_round_success(self, ctx: dict[str, Any]) -> None:
+        message = ctx["message"]
+        action = ctx["action"]
+        self._abandon_streak = 0
+        if self.sent_callback:
+            ctx["reporter"]("mark_sent", "记录发送结果")
+            self.sent_callback(action, message)
+        self._emit_send_flow_summary(ctx, return_clicks=0, send_clicks=int(
+            self.config.get("_runtime_cache", {}).get("metrics", {}).get("send_button_clicks", 0) or 0
+        ))
+        ctx["reporter"]("wait_next_round", "等待下一轮扫描")
+        self.record_reply_round(time.monotonic() - ctx["round_started_at"])
+        self._emit_round_metrics(ctx["round_started_at"])
+        self.mark_success()
+        return None
+
+    def _flow_abandon_round_keep_pending(self, ctx: dict[str, Any]) -> None:
+        """优雅放弃：不进熔断计数，但连续放弃要留痕并在阈值升级。"""
+        self._abandon_streak += 1
+        self.emit_runtime_log(
+            "warning" if self._abandon_streak >= _FLOW_ABANDON_WARN_AT else "info",
+            "心遇流程优雅放弃本轮",
+            {
+                "contact": ctx["message"].get("contact", ""),
+                "consecutive_abandons": self._abandon_streak,
+                "note": "待发回复保留，下轮复用",
+            },
+        )
+        if self._abandon_streak >= _FLOW_ABANDON_ESCALATE_AT:
+            raise RuntimeError(
+                f"flow 连续优雅放弃 {self._abandon_streak} 次，升级为错误（疑似持久性故障）"
+            )
+        self._emit_round_metrics(ctx["round_started_at"])
+        return None
+
+    def _flow_abort_round_go_back(self, ctx: dict[str, Any]) -> None:
+        # 计一次错误（与流水线 ai:failed/发送耗尽口径一致），但不动机械臂。
+        reason = str(ctx.get("ai_error", "") or "本轮中止（语音/发送耗尽）")
+        self.status.error_count += 1
+        self.status.last_error = f"flow: {reason}"
+        self.emit_runtime_log(
+            "error",
+            "app_error",
+            {
+                "step": self.status.current_step,
+                "label": self.status.current_step_label,
+                "error": self.status.last_error,
+                "error_count": self.status.error_count,
+            },
+        )
+        if self.status.error_count >= self.circuit_breaker_threshold:
+            self.status.is_circuit_open = True
+        self._flow_best_effort_go_back(ctx)
+        return None
+
+    def _flow_finish_round_from_list(self, ctx: dict[str, Any]) -> None:
+        return self._flow_mark_round_success(ctx)
+
+    def _flow_recover_navigate(self, ctx: dict[str, Any]) -> tuple[str, Any] | None:
+        from apps.xinyu.flow import Perception
+
+        try:
+            steps.go_back(self.robot, self.config, reporter=ctx["reporter"])
+            return "screen:list", Perception.of("list")
+        except Exception:
+            return "recover:exhausted", Perception.of("unknown")
+
+    def _flow_relaunch_app(self, ctx: dict[str, Any]) -> tuple[str, Any] | None:
+        # v1 未实现软件层重进心遇：直接走硬复位出口（对接现有 on_error）。
+        raise RuntimeError("flow: 中恢复(重进App)暂未实现，升级硬复位")
+
+    def _flow_hard_reset(self, ctx: dict[str, Any]) -> tuple[str, Any] | None:
+        raise RuntimeError("flow: 恢复梯度耗尽，需要硬复位")
+
+    def _flow_best_effort_go_back(self, ctx: dict[str, Any]) -> None:
+        try:
+            steps.go_back(self.robot, self.config, reporter=ctx["reporter"])
+            self._mark_activity()
+        except Exception as exc:
+            self.emit_runtime_log("warning", "flow 中止后返回列表失败", {"error": str(exc)})
+
+    def _flow_perceive_fresh(self) -> str:
+        image = steps.capture_after_popups(
+            self.robot, self.config, label="flow_perceive", skip_popup_detection=True
+        )
+        return steps.classify_screen(image, self.config)
+
+    def _emit_send_flow_summary(self, ctx: dict[str, Any], *, return_clicks: int, send_clicks: int) -> None:
+        metrics = self.config.get("_runtime_cache", {}).get("metrics", {})
+        self.emit_runtime_log(
+            "info",
+            "xinyu_send_flow_summary",
+            {
+                "contact": ctx["message"].get("contact", ""),
+                "input_focused": True,
+                "input_box_source": metrics.get("input_box_source", ""),
+                "input_box_template": metrics.get("input_box_template", ""),
+                "microphone_template": metrics.get("microphone_template", ""),
+                "tts_success": metrics.get("tts_success", False),
+                "tts_retry_count": metrics.get("tts_retry_count", 0),
+                "send_clicks": send_clicks,
+                "send_clear_extra_clicks": metrics.get("send_clear_extra_clicks", 0),
+                "send_clear_reason": metrics.get("send_clear_reason", ""),
+                "return_clicks": return_clicks,
+                "return_reason": metrics.get("return_reason", ""),
+                "after_send_double_back_allowed": True,
+                "flow_engine": True,
+            },
+        )
+
+    _FLOW_ACTION_HANDLERS: dict[str, Callable[..., Any]] = {
+        "submit_reply_and_focus_input": _flow_submit_reply_and_focus_input,
+        "prepare_tts": _flow_prepare_tts,
+        "click_send": _flow_click_send,
+        "click_back": _flow_click_back,
+        "mark_round_success": _flow_mark_round_success,
+        "finish_round_from_list": _flow_finish_round_from_list,
+        "abandon_round_keep_pending": _flow_abandon_round_keep_pending,
+        "abort_round_go_back": _flow_abort_round_go_back,
+        "recover_navigate": _flow_recover_navigate,
+        "relaunch_app": _flow_relaunch_app,
+        "hard_reset": _flow_hard_reset,
+    }
 
     def _mark_activity(self) -> None:
         self.last_activity_at = time.monotonic()
@@ -385,130 +877,10 @@ class XinyuApp(BaseApp):
                 },
             )
 
-            input_focused = False
-            if greeting_reply:
-                reporter("request_ai", "请求 AI 回复")
-                if self.greeting_provider:
-                    # 人设 AI 招呼链路：底稿挑选/AI 改写/防重复/回退全部在 provider 内完成（docs/13 4.4）
-                    executor = ThreadPoolExecutor(max_workers=1)
-                    future = executor.submit(self.greeting_provider, str(message.get("contact") or target_name or ""))
-                    try:
-                        steps.focus_input_box(self.robot, self.config, reporter=reporter)
-                        self._mark_activity()
-                        input_focused = True
-                        greeting_text = future.result()
-                    finally:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                    action = ReplyAction(text=greeting_text or greeting_reply, reason="greeting_reply")
-                else:
-                    steps.focus_input_box(self.robot, self.config, reporter=reporter)
-                    self._mark_activity()
-                    input_focused = True
-                    action = ReplyAction(text=greeting_reply, reason="greeting_reply")
+            if self._flow_engine_enabled():
+                self._reply_segment_flow(message, target_name, greeting_reply, round_started_at, reporter)
             else:
-                reporter("request_ai", "请求 AI 回复")
-                executor = ThreadPoolExecutor(max_workers=1)
-                future = executor.submit(self.reply_provider, message)
-                try:
-                    steps.focus_input_box(self.robot, self.config, reporter=reporter)
-                    self._mark_activity()
-                    input_focused = True
-                    raw_action = future.result()
-                finally:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                action = raw_action if isinstance(raw_action, ReplyAction) else ReplyAction(text=str(raw_action))
-                if action.reason == "pending_send":
-                    self.emit_runtime_log(
-                        "warning",
-                        "心遇复用待发送回复",
-                        {
-                            "contact": message.get("contact", ""),
-                            "content": message.get("content", ""),
-                        },
-                    )
-
-            self.emit_runtime_log(
-                "info",
-                "xinyu_reply_text",
-                {
-                    "contact": message.get("contact", ""),
-                    "reply_text": action.text,
-                    "skip": action.skip,
-                    "reason": action.reason,
-                },
-            )
-            if action.skip:
-                reporter("skip_reply", "跳过本轮回复")
-                steps.go_back(self.robot, self.config, reporter=reporter)
-                self._mark_activity()
-                self._emit_round_metrics(round_started_at)
-                self.mark_success()
-                return
-            if not action.text:
-                raise RuntimeError("回复内容为空，未生成可发送文本")
-
-            if not input_focused:
-                steps.focus_input_box(self.robot, self.config, reporter=reporter)
-                self._mark_activity()
-            steps.play_voice_reply(self.robot, action.text, self.config, reporter=reporter)
-            self._mark_activity()
-            send_clicks = steps.send_reply(self.robot, self.config, reporter=reporter)
-            self.emit_runtime_log("info", "xinyu_send_clicks", {"clicks": send_clicks})
-            self._mark_recovered_progress()
-            if send_clicks > 1:
-                self.emit_runtime_log(
-                    "warning",
-                    "心遇发送按钮被连续点击",
-                    {
-                        "contact": message.get("contact", ""),
-                        "clicks": send_clicks,
-                    },
-                )
-            self._mark_activity()
-            if self.sent_callback:
-                reporter("mark_sent", "记录发送结果")
-                self.sent_callback(action, message)
-            try:
-                return_clicks = steps.go_back(
-                    self.robot,
-                    self.config,
-                    double_click_on_first_attempt=True,
-                    reporter=reporter,
-                )
-            except Exception:
-                self.emit_runtime_log(
-                    "warning",
-                    "心遇发送后未能返回列表",
-                    {
-                        "contact": message.get("contact", ""),
-                        "content": message.get("content", ""),
-                    },
-                )
-                raise
-            self.emit_runtime_log(
-                "info",
-                "xinyu_send_flow_summary",
-                {
-                    "contact": message.get("contact", ""),
-                    "input_focused": input_focused,
-                    "input_box_source": self.config.get("_runtime_cache", {}).get("metrics", {}).get("input_box_source", ""),
-                    "input_box_template": self.config.get("_runtime_cache", {}).get("metrics", {}).get("input_box_template", ""),
-                    "microphone_template": self.config.get("_runtime_cache", {}).get("metrics", {}).get("microphone_template", ""),
-                    "tts_success": self.config.get("_runtime_cache", {}).get("metrics", {}).get("tts_success", False),
-                    "tts_retry_count": self.config.get("_runtime_cache", {}).get("metrics", {}).get("tts_retry_count", 0),
-                    "send_clicks": send_clicks,
-                    "send_clear_extra_clicks": self.config.get("_runtime_cache", {}).get("metrics", {}).get("send_clear_extra_clicks", 0),
-                    "send_clear_reason": self.config.get("_runtime_cache", {}).get("metrics", {}).get("send_clear_reason", ""),
-                    "return_clicks": return_clicks,
-                    "return_reason": self.config.get("_runtime_cache", {}).get("metrics", {}).get("return_reason", ""),
-                    "after_send_double_back_allowed": True,
-                },
-            )
-            self._mark_activity()
-            reporter("wait_next_round", "等待下一轮扫描")
-            self.record_reply_round(time.monotonic() - round_started_at)
-            self._emit_round_metrics(round_started_at)
-            self.mark_success()
+                self._reply_segment_pipeline(message, target_name, greeting_reply, round_started_at, reporter)
         except steps.NoPhoneScreenError as exc:
             self.set_runtime_step("no_phone_waiting", "无手机异常，等待用户放回手机")
             self.status.last_error = str(exc)
