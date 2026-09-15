@@ -270,5 +270,6 @@
     }
   },
   "enable_black_screen_detection": false,
-  "enable_flow_engine": true
+  "enable_flow_engine": true,
+  "list_compact_region_bucket": 0.05
 }

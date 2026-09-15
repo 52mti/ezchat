@@ -4,6 +4,7 @@ import copy
 import difflib
 import json
 import hashlib
+import math
 import os
 import platform
 import random
@@ -1226,6 +1227,16 @@ def _cache_list_compact_region_from_ocr_result(config: dict[str, Any], ocr_resul
     full_bottom = float(full_region[1]) + float(full_region[3])
     bottom_nav_top = float(bottom_nav_region[1]) if bottom_nav_region is not None else full_bottom
     list_bottom = min(full_bottom, bottom_nav_top - bottom_margin)
+    # 档位对齐（形状稳定）：上下边界向外吸附到 bucket 归一化档的整数倍。
+    # 同设备截图尺寸恒定，归一化档即像素档（0.05 档 ≈ 64px）——列表行数
+    # 小变落在同一档，OCR 引擎不再每轮见到新输入尺寸（GPU 引擎对每种
+    # 新形状首次调用要付约 10 秒调机，此前列表 compact 每轮都在触发）。
+    # 向外取整只扩不切，底部半行本就识别不全且有无有效行回退完整 OCR 兜底。
+    # bucket<=0 关闭对齐，回到逐轮精确边界。
+    bucket = float(config.get("list_compact_region_bucket", 0.05) or 0)
+    if bucket > 0:
+        list_top = max(0.0, math.floor(list_top / bucket) * bucket)
+        list_bottom = min(1.0, math.ceil(list_bottom / bucket) * bucket)
     if list_bottom - list_top < float(config.get("list_compact_min_height", 0.2) or 0.2):
         return
     _cache_set(config, "ocr_regions", "list_compact", [0.0, list_top, 1.0, list_bottom - list_top])
