@@ -1,7 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import io
+import struct
 
 import numpy as np
 import pytest
@@ -225,20 +226,28 @@ def test_subprocess_runtime_closes_failed_child_process(tmp_path, monkeypatch):
     runtime_python.write_text("python", encoding="utf-8")
 
     class FakeStdin:
-        def __init__(self) -> None:
-            self.lines: list[str] = []
+        """二进制帧协议桩：收集主进程写入的帧字节。"""
 
-        def write(self, value: str) -> None:
+        def __init__(self) -> None:
+            self.lines: list[bytes] = []
+
+        def write(self, value: bytes) -> None:
             self.lines.append(value)
 
         def flush(self) -> None:
             return None
 
+    failure_payload = json.dumps({"ok": False, "error": "bad paddlex state"}).encode("utf-8")
+    failure_frame = struct.pack("<II", len(failure_payload), 0) + failure_payload
+    # reader 线程用 os.read 直读 fd，桩的 stdout 必须是真实文件对象。
+    stdout_stub = tmp_path / "fake_stdout.bin"
+    stdout_stub.write_bytes(failure_frame)
+
     class FakeProcess:
         def __init__(self) -> None:
             self.stdin = FakeStdin()
-            self.stdout = io.StringIO('{"ok": false, "error": "bad paddlex state"}\n')
-            self.stderr = io.StringIO("")
+            self.stdout = stdout_stub.open("rb")
+            self.stderr = io.BytesIO(b"")
             self.terminated = False
 
         def poll(self):
@@ -268,7 +277,7 @@ def test_subprocess_runtime_closes_failed_child_process(tmp_path, monkeypatch):
 
     assert engine._process is None
     assert process.terminated is True
-    assert any('"action": "shutdown"' in line for line in process.stdin.lines)
+    assert any(b'"action": "shutdown"' in line for line in process.stdin.lines)
 
 
 def test_manifest_subprocess_mode_uses_ocr_runtime_without_app_runtime(tmp_path, monkeypatch):
@@ -276,7 +285,8 @@ def test_manifest_subprocess_mode_uses_ocr_runtime_without_app_runtime(tmp_path,
         json.dumps({"executionMode": "subprocess"}, ensure_ascii=False),
         encoding="utf-8",
     )
-    ocr_python = tmp_path / "runtime" / "ocr_nvidia" / "python.exe"
+    # 引擎布局已迁至 engine/（runtime/ 只留运行数据），见 runtime_layout.runtime_root。
+    ocr_python = tmp_path / "engine" / "ocr_nvidia" / "python.exe"
     ocr_python.parent.mkdir(parents=True)
     ocr_python.write_text("python", encoding="utf-8")
 
@@ -330,7 +340,9 @@ def test_create_ocr_runtime_engine_falls_back_to_cpu_and_persists_state(tmp_path
     monkeypatch.setattr(runtime_module, "_effective_backend_config", lambda config: ("paddle_cuda", "lite"))
     monkeypatch.setattr(runtime_module, "_create_engine_for_backend", fake_create_engine)
 
-    engine = runtime_module.create_ocr_runtime_engine({"backend": "auto"})
+    # 本测试针对本地（inprocess）引擎的 CPU 回退；源码运行现在默认跟随
+    # manifest 走 subprocess（见 _effective_execution_mode），显式钉住模式。
+    engine = runtime_module.create_ocr_runtime_engine({"backend": "auto", "_execution_mode": "inprocess"})
 
     assert engine.preload() == "cpu"
     assert engine.predict(np.zeros((4, 4, 3), dtype=np.uint8))[0]["rec_texts"] == ["cpu"]
@@ -375,7 +387,7 @@ def test_gpu_preload_success_clears_previous_cpu_fallback_state(tmp_path, monkey
     monkeypatch.setattr(runtime_module, "select_ocr_backend", lambda preferred_backend, hardware=None: "paddle_cuda")
     monkeypatch.setattr(runtime_module, "_create_engine_for_backend", fake_create_engine)
 
-    engine = runtime_module.create_ocr_runtime_engine({"backend": "auto", "model_tier": "auto"})
+    engine = runtime_module.create_ocr_runtime_engine({"backend": "auto", "model_tier": "auto", "_execution_mode": "inprocess"})
 
     assert engine.preload() == "gpu:0"
     payload = json.loads(state_path.read_text(encoding="utf-8"))

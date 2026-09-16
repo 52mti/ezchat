@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import contextlib
 import json
@@ -13,6 +13,9 @@ from .screen import ImageInput, crop_region, load_image, normalize_box
 _OCR_NATIVE_CALL_CONDITION = threading.Condition()
 _OCR_NATIVE_ACTIVE_CALLS = 0
 _OCR_NATIVE_WAITING_CALLS = 0
+# 槽位按线程可重入：外层已占槽时（如 run_ocr_mode 全流程进槽后内部再调
+# ocr()），同线程嵌套进入不再占用新槽，避免自等死锁。
+_OCR_NATIVE_SLOT_DEPTH: dict[int, int] = {}
 _OCR_ENGINE_INIT_LOCK = threading.RLock()
 
 
@@ -212,18 +215,40 @@ def _ocr_max_concurrency(config: dict[str, Any]) -> int:
 def _ocr_native_call_slot(max_concurrency: int):
     global _OCR_NATIVE_ACTIVE_CALLS, _OCR_NATIVE_WAITING_CALLS
     limit = min(16, max(1, int(max_concurrency or 1)))
+    ident = threading.get_ident()
     with _OCR_NATIVE_CALL_CONDITION:
-        _OCR_NATIVE_WAITING_CALLS += 1
-        while _OCR_NATIVE_ACTIVE_CALLS >= limit:
-            _OCR_NATIVE_CALL_CONDITION.wait()
-        _OCR_NATIVE_WAITING_CALLS -= 1
-        _OCR_NATIVE_ACTIVE_CALLS += 1
+        depth = _OCR_NATIVE_SLOT_DEPTH.get(ident, 0)
+        if depth > 0:
+            _OCR_NATIVE_SLOT_DEPTH[ident] = depth + 1
+        else:
+            _OCR_NATIVE_WAITING_CALLS += 1
+            while _OCR_NATIVE_ACTIVE_CALLS >= limit:
+                _OCR_NATIVE_CALL_CONDITION.wait()
+            _OCR_NATIVE_WAITING_CALLS -= 1
+            _OCR_NATIVE_ACTIVE_CALLS += 1
+            _OCR_NATIVE_SLOT_DEPTH[ident] = 1
     try:
         yield
     finally:
         with _OCR_NATIVE_CALL_CONDITION:
-            _OCR_NATIVE_ACTIVE_CALLS -= 1
+            depth = _OCR_NATIVE_SLOT_DEPTH.get(ident, 0)
+            if depth <= 1:
+                _OCR_NATIVE_SLOT_DEPTH.pop(ident, None)
+                _OCR_NATIVE_ACTIVE_CALLS -= 1
+            else:
+                _OCR_NATIVE_SLOT_DEPTH[ident] = depth - 1
             _OCR_NATIVE_CALL_CONDITION.notify_all()
+
+
+def ocr_serialization_slot(config: dict[str, Any]):
+    """把一段 OCR 相关工作（推理+后处理+规则处理）整体纳入并发槽。
+
+    多设备并发的卡顿源不只是推理：normalize 与 App 规则处理是纯 Python，
+    持 GIL 且原先在槽外自由叠加（实测 4 线程即把 UI 心跳拉到 60ms+）。
+    用本槽把 run_ocr_mode 全流程与推理串到同一限流下，可重入设计保证
+    内部再调 ocr() 不会自等。推理本身已是串行（并发 1），吞吐无感变化。
+    """
+    return _ocr_native_call_slot(_ocr_max_concurrency(config))
 
 
 def get_ocr_queue_status() -> dict[str, int]:
@@ -233,6 +258,36 @@ def get_ocr_queue_status() -> dict[str, int]:
             "waiting": max(0, int(_OCR_NATIVE_WAITING_CALLS)),
             "active": max(0, int(_OCR_NATIVE_ACTIVE_CALLS)),
         }
+
+
+# 实际执行 OCR 的引擎信息（backend/device），从引擎对象侧记录——
+# install_state 的 backend=auto + hardware 探测为空时，配置文件无法
+# 判断真实路径；这里是运行时金标准，供耗时日志与 UI 标注读取。
+_OCR_RUNTIME_INFO: dict[str, str] = {}
+
+
+def get_ocr_runtime_info() -> dict[str, str]:
+    return dict(_OCR_RUNTIME_INFO)
+
+
+def _record_runtime_info(engine: Any) -> None:
+    backend = str(getattr(engine, "backend", "") or "")
+    if not backend:
+        primary = str(getattr(engine, "_primary_backend", "") or "")
+        fallback = getattr(engine, "_fallback_engine", None)
+        if primary:
+            backend = f"{primary}→fallback" if fallback is not None else primary
+    device = str(getattr(engine, "device_seen", "") or "")
+    info: dict[str, str] = {"backend": backend, "device": device}
+    timings = getattr(engine, "last_timings", None)
+    if isinstance(timings, dict) and timings:
+        # 子进程内部分段（解码/纯推理，毫秒）：与总耗时的差值即主进程
+        # 预处理 + 管道开销，用于定位"GPU 闲着但单次秒级"的链路瓶颈。
+        info["sub_decode_ms"] = str(timings.get("decode_ms", ""))
+        info["sub_predict_ms"] = str(timings.get("predict_ms", ""))
+    if info != _OCR_RUNTIME_INFO and (backend or device):
+        _OCR_RUNTIME_INFO.clear()
+        _OCR_RUNTIME_INFO.update(info)
 
 
 @lru_cache(maxsize=8)
@@ -258,7 +313,12 @@ def _get_paddle_engine(config: dict[str, Any]) -> Any:
 
 def _predict_with_lock(engine: Any, image: np.ndarray, config: dict[str, Any]) -> Any:
     with _ocr_native_call_slot(_ocr_max_concurrency(config)):
-        return engine.predict(image, **_runtime_predict_kwargs(config))
+        result = engine.predict(image, **_runtime_predict_kwargs(config))
+        # 必须在 predict 之后记录：响应里的分段计时（last_timings）只有
+        # 本次调用结束才更新；放在调用前会把上一次 pass 的毫秒数显示成
+        # 本次的（主 pass 与角标 pass 尺寸差异大时会明显误导）。
+        _record_runtime_info(engine)
+        return result
 
 
 def _legacy_ocr_with_lock(engine: Any, image: Any, config: dict[str, Any]) -> Any:

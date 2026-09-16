@@ -212,6 +212,9 @@ def _cache_set(config: dict[str, Any], section: str, key: str, value: Any) -> No
         return
     target = _runtime_cache(config).setdefault(section, {})
     if isinstance(target, dict):
+        if target.get(key) == value:
+            # 值未变化（容差内的重复学习）不触发落盘调度，防高频 fsync。
+            return
         target[key] = value
         if section in ("template_points", "screen_anchors", "ocr_regions"):
             persist_from_runtime(config)
@@ -492,25 +495,53 @@ def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = N
         return reused
     with exclude_ocr_wait_from_step_timeout(config):
         result = run_ocr_mode(image, config, mode, region=region)
+    queue_seconds = float(result.pop("_queue_seconds", 0.0) or 0.0) if isinstance(result, dict) else 0.0
     _store_ocr_reuse_result(config, key=reuse_key, signature=signature, result=result)
     elapsed = time.monotonic() - started_at
     metrics = _runtime_cache(config).get("metrics", {})
     if isinstance(metrics, dict):
         # OCR 耗时观测（客户机性能定位）：run_ocr_mode 内含角标数字等追加
-        # pass，这里记的是整个调用的墙钟时间。
+        # pass，这里记的是整个调用的墙钟时间（含并发槽排队）。
         metrics["ocr_seconds_total"] = round(float(metrics.get("ocr_seconds_total", 0.0) or 0.0) + elapsed, 4)
         metrics["ocr_seconds_max"] = round(max(float(metrics.get("ocr_seconds_max", 0.0) or 0.0), elapsed), 4)
+        # 排队与执行分开：多设备共享串行槽时，"单次 20s+"必须能区分是在
+        # 等其他设备还是推理本身慢；backend/device 为实际生效的引擎信息
+        # （install_state 的 backend=auto + 硬件探测为空时，配置文件看不出来）。
+        metrics["ocr_queue_seconds_total"] = round(float(metrics.get("ocr_queue_seconds_total", 0.0) or 0.0) + queue_seconds, 4)
+        metrics["ocr_queue_seconds_max"] = round(max(float(metrics.get("ocr_queue_seconds_max", 0.0) or 0.0), queue_seconds), 4)
         if result.get("_cache_hit"):
             metrics["ocr_cache_hit_count"] = int(metrics.get("ocr_cache_hit_count", 0) or 0) + 1
         else:
             metrics["ocr_count"] = int(metrics.get("ocr_count", 0) or 0) + 1
-        metrics["last_ocr"] = {
+        last_ocr = {
             "mode": mode,
             "region": region,
             "seconds": round(elapsed, 4),
+            "queue_seconds": round(queue_seconds, 4),
             "cache_hit": bool(result.get("_cache_hit")),
             "cache_source": result.get("_cache_source", ""),
         }
+        try:
+            from vision.ocr import get_ocr_runtime_info
+
+            runtime_info = get_ocr_runtime_info()
+            if runtime_info.get("backend"):
+                last_ocr["backend"] = runtime_info["backend"]
+                # 后端/推理毫秒同时落在 metrics 顶层：统计行取自顶层，
+                # 不再被"最后一次调用恰好是缓存复用"冲掉（复用分支的
+                # last_ocr 不带这些字段，曾导致客户日志缺关键定位数据）。
+                metrics["ocr_backend"] = runtime_info["backend"]
+            if runtime_info.get("device"):
+                last_ocr["device"] = runtime_info["device"]
+                metrics["ocr_device"] = runtime_info["device"]
+            if runtime_info.get("sub_predict_ms"):
+                last_ocr["sub_predict_ms"] = runtime_info["sub_predict_ms"]
+                metrics["ocr_sub_predict_ms"] = runtime_info["sub_predict_ms"]
+            if runtime_info.get("sub_decode_ms"):
+                last_ocr["sub_decode_ms"] = runtime_info["sub_decode_ms"]
+        except Exception:
+            pass
+        metrics["last_ocr"] = last_ocr
     return result
 
 
@@ -640,6 +671,9 @@ def _complete_button_ocr_center(image: Any, config: dict[str, Any]) -> tuple[flo
     return None
 
 
+_WARM_BACK_PROBE_COOLDOWN_SECONDS = 30.0
+
+
 def _warm_back_button_cache(
     image: Any,
     config: dict[str, Any],
@@ -654,10 +688,19 @@ def _warm_back_button_cache(
     cached = _cached_point(config, "template_points", "back")
     if cached is not None:
         return cached
+    # 探测失败冷却：返回按钮不在屏上（列表页常态）时，无缓存则每张图都
+    # 全量探测所有变体 × 多通道多尺度，多设备时是持续的 CPU/GIL 尖峰。
+    # 失败后冷却期内不重试；成功一次即写缓存、后续走 cached 短路。
+    cache_state = _runtime_cache(config)
+    now = time.monotonic()
+    last_probe_at = cache_state.get("_warm_back_probe_at")
+    if isinstance(last_probe_at, (int, float)) and now - float(last_probe_at) < _WARM_BACK_PROBE_COOLDOWN_SECONDS:
+        return None
     # A cached miss is unsafe here: a nearly identical camera frame can score
     # above the threshold, and this cache must be established as soon as one
     # such frame arrives.  Bypass both reuse layers and run every variant on
     # this exact image; normal template matching still keeps its cache.
+    cache_state["_warm_back_probe_at"] = now
     match_config = dict(config)
     # Keep diagnostics in the live runtime cache.  A shallow config copy is
     # enough for the cache switch, but must not hide the probe result from logs.
@@ -690,6 +733,7 @@ def _warm_back_button_cache(
         return None
     position = (result["x"] + result["w"] / 2, result["y"] + result["h"] / 2)
     _cache_point_once(config, "template_points", "back", position)
+    cache_state.pop("_warm_back_probe_at", None)  # 缓存已建立，冷却不再需要
     return position
 
 
@@ -2862,7 +2906,8 @@ def calibrate_dialogue_chat_area(
         return {"ok": False, "reason": reason}
     updated = _update_dynamic_chat_area(cfg, llm_payload, ocr_result)
     _dialogue_message_region(image, cfg)
-    persist_from_runtime(cfg)
+    # 手动标定是用户显式操作：同步落盘，不吃 0.5s 防抖窗口。
+    persist_from_runtime(cfg, immediate=True)
     try:
         calibration_image = ensure_portrait_image(image)
     except Exception:

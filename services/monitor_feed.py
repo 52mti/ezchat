@@ -13,6 +13,15 @@ from typing import Any, Iterable
 _LOCK = threading.Lock()
 _LATEST: dict[str, dict[str, Any]] = {}  # device_ip -> {"app", "image", "label", "ts"}
 MIN_INTERVAL_SECONDS = 1.0
+# 订阅者：worker 截图发布成功后立即回调（回调发生在 worker 线程，
+# 订阅方自行负责跨线程投递，如 Qt 信号）。监控墙由此从"定时轮询"
+# 改为"截图即达"。
+_LISTENERS: list = []
+
+
+def add_capture_listener(callback) -> None:
+    with _LOCK:
+        _LISTENERS.append(callback)
 
 
 def publish_capture(device_ip: str, app_name: str, image_bytes: bytes, *, label: str = "") -> None:
@@ -30,6 +39,12 @@ def publish_capture(device_ip: str, app_name: str, image_bytes: bytes, *, label:
             "label": str(label or ""),
             "ts": now,
         }
+        listeners = list(_LISTENERS)
+    for callback in listeners:
+        try:
+            callback(ip)
+        except Exception:
+            continue
 
 
 def snapshots() -> dict[str, dict[str, Any]]:
@@ -49,3 +64,4 @@ def retain_devices(device_ips: Iterable[str]) -> None:
 def reset_for_tests() -> None:
     with _LOCK:
         _LATEST.clear()
+        _LISTENERS.clear()

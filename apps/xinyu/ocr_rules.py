@@ -17,7 +17,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from vision.ocr import OcrItem, ocr
+from vision.ocr import OcrItem, ocr, ocr_serialization_slot
 from vision.screen import ImageInput, ensure_portrait_image, load_image
 
 
@@ -2000,6 +2000,29 @@ def run_ocr_mode(
 ) -> dict[str, Any]:
     if mode not in {"dialogue", "list", "points"}:
         raise ValueError("mode must be dialogue, list, or points")
+    # 推理+normalize+规则处理整体进 OCR 并发槽：纯 Python 后处理段原先在
+    # 槽外多设备自由叠加（持 GIL），是"OCR 时 UI 卡"的放大器之一。
+    # 槽可重入，内部 ocr() 的推理槽不会自等。
+    # 排队/执行分开计时（附加键由 steps._run_ocr_mode 消费后剥离）：
+    # 多设备共享串行槽时，日志里的"单次耗时"必须能区分排队与真实执行。
+    import time as _time
+
+    queue_t0 = _time.perf_counter()
+    with ocr_serialization_slot(config):
+        queue_seconds = _time.perf_counter() - queue_t0
+        payload = _run_ocr_mode_locked(image, config, mode, region=region)
+        if isinstance(payload, dict):
+            payload["_queue_seconds"] = round(queue_seconds, 4)
+        return payload
+
+
+def _run_ocr_mode_locked(
+    image: ImageInput,
+    config: dict[str, Any],
+    mode: str,
+    *,
+    region: Any | None = None,
+) -> dict[str, Any]:
     base_ocr = config["ocr"]
     if not isinstance(base_ocr, dict):
         raise ValueError("ocr must be a dict")

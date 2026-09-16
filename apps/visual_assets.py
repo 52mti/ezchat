@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from hashlib import blake2b
 import re
 import uuid
@@ -87,7 +88,7 @@ def machine_template_id() -> str:
     return _MACHINE_TEMPLATE_ID
 
 
-_TEMPLATE_MATCH_CACHE: dict[tuple[Any, ...], dict[str, float] | None] = {}
+_TEMPLATE_MATCH_CACHE: "OrderedDict[tuple[Any, ...], dict[str, float] | None]" = OrderedDict()
 _TEMPLATE_MATCH_CACHE_LOCK = Lock()
 
 
@@ -620,13 +621,17 @@ def _cached_template_match(cache_key: tuple[Any, ...]) -> dict[str, float] | Non
         if cache_key not in _TEMPLATE_MATCH_CACHE:
             return ...
         cached = _TEMPLATE_MATCH_CACHE[cache_key]
+        _TEMPLATE_MATCH_CACHE.move_to_end(cache_key)
     return dict(cached) if cached is not None else None
 
 
 def _store_template_match(cache_key: tuple[Any, ...], result: dict[str, float] | None) -> None:
     with _TEMPLATE_MATCH_CACHE_LOCK:
+        # LRU 淘汰最旧条目。原先满 512 条整体 clear()，会把所有其他设备的
+        # 有效缓存一并抹掉，下一轮全部 miss 触发"全量重匹配风暴"（多设备
+        # 周期性集体卡顿）；LRU 只逐出真正最久未用的条目。
         if len(_TEMPLATE_MATCH_CACHE) >= TEMPLATE_MATCH_CACHE_MAX_SIZE:
-            _TEMPLATE_MATCH_CACHE.clear()
+            _TEMPLATE_MATCH_CACHE.popitem(last=False)
         _TEMPLATE_MATCH_CACHE[cache_key] = dict(result) if result is not None else None
 
 

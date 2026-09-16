@@ -125,7 +125,20 @@ def test_monitor_wall_shows_only_listed_devices(qtbot, tmp_path):
     assert set(dialog._tiles) == {"1.1.1.1", "3.3.3.3"}
     assert "2.2.2.2" not in monitor_feed.snapshots()  # 已被 retain_devices 清掉
     tile = dialog._tiles["1.1.1.1"]
-    assert tile.image_label.pixmap() is not None and not tile.image_label.pixmap().isNull()
+    # 解码已移至后台线程（经 Qt 信号回主线程），等待信号送达再断言。
+    from PyQt6.QtCore import QTimer
+
+    for _ in range(100):  # 最多 ~2s
+        app = QTimer.__module__ and None
+        from PyQt6.QtWidgets import QApplication
+
+        QApplication.processEvents()
+        pixmap = tile.image_label.pixmap()
+        if pixmap is not None and not pixmap.isNull():
+            break
+        time.sleep(0.02)
+    pixmap = tile.image_label.pixmap()
+    assert pixmap is not None and not pixmap.isNull()
 
     devices.remove({"ip": "3.3.3.3"})
     dialog.refresh()

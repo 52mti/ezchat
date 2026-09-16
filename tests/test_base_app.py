@@ -312,7 +312,7 @@ def test_coordinate_cache_persists_by_device_app_and_perspective(tmp_path, monke
         },
         "_runtime_cache": {"template_points": {"back": [0.2, 0.3]}},
     }
-    coordinate_cache.persist_from_runtime(config)
+    coordinate_cache.persist_from_runtime(config, immediate=True)
     restored = {
         "_runtime": {
             "device_ip": "192.168.1.10",
@@ -407,7 +407,8 @@ def test_coordinate_cache_invalidates_across_app_versions():
     try:
         coordinate_cache._APP_VERSION_CACHE[:] = ["test-1.0"]
         coordinate_cache.persist_from_runtime(
-            {"_runtime": runtime, "_runtime_cache": {"template_points": {"back": [0.2, 0.3]}}}
+            {"_runtime": runtime, "_runtime_cache": {"template_points": {"back": [0.2, 0.3]}}},
+            immediate=True,
         )
         path_v1 = coordinate_cache._path({"_runtime": runtime})
 

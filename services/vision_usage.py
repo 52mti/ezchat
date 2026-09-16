@@ -38,15 +38,25 @@ def _usage_path(config: dict[str, Any]) -> Path:
     return path.resolve()
 
 
+def _scope_key_raw(identity: str, perspective: str, generation: int) -> str:
+    raw = "|".join((identity, perspective, str(generation)))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _generation_for(payload: dict[str, Any], identity: str) -> int:
+    return int(payload.get("reset_generations", {}).get(identity, 0) or 0)
+
+
+def _runtime_perspective(config: dict[str, Any]) -> str:
+    runtime = config.get("_runtime", {})
+    return str(runtime.get("perspective_signature", "")) if isinstance(runtime, dict) else ""
+
+
 def scope_key(config: dict[str, Any]) -> str:
     identity = _scope_identity(config)
-    runtime = config.get("_runtime", {})
-    runtime = runtime if isinstance(runtime, dict) else {}
-    path = _usage_path(config)
     with _LOCK:
-        generation = int(_load(path).get("reset_generations", {}).get(identity, 0) or 0)
-    raw = "|".join((identity, str(runtime.get("perspective_signature", "")), str(generation)))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+        generation = _generation_for(_load(_usage_path(config)), identity)
+    return _scope_key_raw(identity, _runtime_perspective(config), generation)
 
 
 def _scope_identity(config: dict[str, Any]) -> str:
@@ -87,9 +97,12 @@ def _write(path: Path, payload: dict[str, Any]) -> None:
 def acquire(config: dict[str, Any], *, limit: int) -> tuple[bool, int]:
     """原子地占用一次调用额度；进程重启后仍延续计数。"""
     path = _usage_path(config)
-    key = scope_key(config)
+    identity = _scope_identity(config)
+    perspective = _runtime_perspective(config)
     with _LOCK:
+        # 锁内单次读盘同时取得代次与计数（原先 scope_key + acquire 各读一次）。
         payload = _load(path)
+        key = _scope_key_raw(identity, perspective, _generation_for(payload, identity))
         scopes = payload["scopes"]
         current = max(0, int(scopes.get(key, 0) or 0))
         if current >= limit:
@@ -102,9 +115,10 @@ def acquire(config: dict[str, Any], *, limit: int) -> tuple[bool, int]:
 def rule_learning_status(config: dict[str, Any]) -> dict[str, Any]:
     """读取当前设备/App/透视的连续无新增规则状态。"""
     path = _usage_path(config)
-    key = scope_key(config)
+    identity = _scope_identity(config)
     with _LOCK:
         payload = _load(path)
+        key = _scope_key_raw(identity, _runtime_perspective(config), _generation_for(payload, identity))
         status = payload.get("rule_learning", {}).get(key, {})
         return dict(status) if isinstance(status, dict) else {}
 
@@ -117,10 +131,11 @@ def record_rule_learning(
 ) -> dict[str, Any]:
     """记录一次成功的视觉识别结果，并返回更新后的停用状态。"""
     path = _usage_path(config)
-    key = scope_key(config)
+    identity = _scope_identity(config)
     threshold = max(1, int(disable_after_zero or 3))
     with _LOCK:
         payload = _load(path)
+        key = _scope_key_raw(identity, _runtime_perspective(config), _generation_for(payload, identity))
         states = payload.setdefault("rule_learning", {})
         state = states.setdefault(key, {})
         if int(added_count or 0) > 0:

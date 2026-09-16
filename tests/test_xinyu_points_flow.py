@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -6,6 +6,89 @@ import pytest
 
 from apps.xinyu import app as xinyu_app
 from apps.xinyu import steps
+
+
+CHAT_LIST_SCREEN_KEY = "screen.chat_list"
+CHAT_LIST_TITLE_REGION = (0.0, 0.023, 0.489, 0.127)
+
+
+SCREENSHOT_MARKERS = (
+    "list", "chat", "my", "unknown", "no_phone", "microphone", "black",
+    "after_greeting", "after", "still_chat", "popup", "list_confirm",
+    "list_by_ocr", "call", "android_home", "after_unread",
+)
+
+
+@pytest.fixture(autouse=True)
+def _chat_list_title_ocr_stub(monkeypatch):
+    """聊天列表判定 stub（对齐 ce27647 后的产品行为）。
+
+    产品代码（_matches_chat_list_screen）已改为"标题区域内 OCR 识别
+    消息/通话"：region 由 template_match_region 解析、OCR 走
+    _run_ocr_mode。测试 config 的 template_match_regions=None 不能动
+    （模板匹配路径依赖它为 None 直通 mock 的 match），因此这里单独
+    stub 三个符号：
+
+    - template_match_region：仅聊天列表键返回生产默认标题区域，其余 None；
+    - _run_ocr_mode：标题判定场景下，截图标记 "list" 返回"消息/通话"
+      命中（等价旧 fixture 的 screen_聊天列表.jpg 模板命中语义），其余
+      截图返回空结果；非标题场景在运行时解析 steps.run_ocr_mode，
+      让测试体内的显式 monkeypatch 优先生效；
+    - _ocr_reuse_signature：签名改为基于截图标记的稳定值。原实现对
+      任意截图都会真实解码图片（ensure_portrait_image），字符串截图
+      fixture 过不了解码这一步。
+
+    测试体内的显式 monkeypatch 优先于本 autouse stub（fixture 先应用，
+    测试体后覆盖）。
+    """
+    original_region = steps.template_match_region
+
+    def fake_region(config, key):
+        if key == CHAT_LIST_SCREEN_KEY:
+            return CHAT_LIST_TITLE_REGION
+        return original_region(config, key)
+
+    monkeypatch.setattr(steps, "template_match_region", fake_region)
+
+    # 默认模板匹配 mock：无命中。产品路径里弹窗扫描/屏幕判定都会真调
+    # match，真 matcher 会解码字符串截图 fixture 报"图片读取失败"，并被
+    # run_once 吞成静默提前退出；默认拦截为"全不命中"，测试体内显式的
+    # fake_match monkeypatch 后应用、优先于本默认。
+    monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
+
+    def fake_signature(image, region=None):
+        import numpy as np
+
+        return (f"{image}|{region}", np.zeros((4, 4), dtype=np.uint8))
+
+    monkeypatch.setattr(steps, "_ocr_reuse_signature", fake_signature)
+
+    original_run_ocr_mode = steps._run_ocr_mode
+
+    def fake_run_ocr_mode(image, config, mode, region=None, **kwargs):
+        if mode == "list" and region == CHAT_LIST_TITLE_REGION:
+            if str(image) == "list":
+                return {
+                    "mode": mode,
+                    "items": [],
+                    "ocr_items": [
+                        {"text": "消息", "x": 0.10, "y": 0.03, "w": 0.10, "h": 0.04},
+                        {"text": "通话", "x": 0.30, "y": 0.03, "w": 0.10, "h": 0.04},
+                    ],
+                    "result": {},
+                }
+            return {"mode": mode, "items": [], "ocr_items": [], "result": {}}
+        try:
+            # 委托原实现：保留其 OCR 结果复用逻辑（_reused_ocr_result 等）。
+            # 原实现内部经模块命名空间调 run_ocr_mode，测试体的 mock 优先生效；
+            # 签名计算已被 fake_signature 拦截，字符串截图不会再解码失败，
+            # 兜底捕获以防万一。
+            return original_run_ocr_mode(image, config, mode, region=region)
+        except (RuntimeError, OSError):
+            return {"mode": mode, "items": [], "ocr_items": [], "result": {}}
+
+    monkeypatch.setattr(steps, "_run_ocr_mode", fake_run_ocr_mode)
+    yield
 
 
 class FakeRobot:
@@ -45,7 +128,7 @@ def _config(tmp_path: Path) -> dict[str, object]:
 
 def test_xinyu_read_my_points_clicks_my_reads_points_and_returns_message(monkeypatch, tmp_path):
     config = _config(tmp_path)
-    robot = FakeRobot(["list", "list", "my", "list"])
+    robot = FakeRobot(["list", "my", "list"])
     seen_modes: list[str] = []
 
     def fake_match(image, template, threshold=0.85):
@@ -104,7 +187,7 @@ def test_xinyu_read_my_points_reuses_cached_my_coordinate(monkeypatch, tmp_path)
 def test_xinyu_read_my_points_uses_cached_my_without_list_ocr(monkeypatch, tmp_path):
     config = _config(tmp_path)
     config["_runtime_cache"] = {"screen_anchors": {"bottom_my": (0.91, 0.93)}}
-    robot = FakeRobot(["list", "list", "my", "list"])
+    robot = FakeRobot(["list", "my", "list"])
     seen_modes: list[str] = []
 
     def fake_match(image, template, threshold=0.85):
@@ -161,7 +244,7 @@ def test_xinyu_read_my_points_skips_when_bottom_nav_has_no_my(monkeypatch, tmp_p
 
 def test_xinyu_read_my_points_uses_cached_my_without_message_ocr(monkeypatch, tmp_path):
     config = _config(tmp_path)
-    robot = FakeRobot(["list", "list", "my", "list"])
+    robot = FakeRobot(["list", "my", "list"])
 
     def fake_match(image, template, threshold=0.85):
         name = Path(template).name

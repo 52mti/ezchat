@@ -69,7 +69,7 @@ def test_calibrate_dialogue_chat_area_learns_and_persists(monkeypatch):
         return region
 
     monkeypatch.setattr(steps, "_dialogue_message_region", fake_message_region)
-    monkeypatch.setattr(steps, "persist_from_runtime", lambda config: persisted.append(config))
+    monkeypatch.setattr(steps, "persist_from_runtime", lambda config, **kwargs: persisted.append(config))
 
     result = steps.calibrate_dialogue_chat_area(object(), cfg)
 
@@ -178,7 +178,7 @@ def test_calibrate_reuses_provided_image_when_perspective_synced(monkeypatch):
         return [0.0, 0.1, 1.0, 0.6]
 
     monkeypatch.setattr(steps, "_dialogue_message_region", fake_message_region)
-    monkeypatch.setattr(steps, "persist_from_runtime", lambda config: None)
+    monkeypatch.setattr(steps, "persist_from_runtime", lambda config, **kwargs: None)
 
     result = steps.calibrate_dialogue_chat_area(object(), cfg, image=b"pre-captured")
 

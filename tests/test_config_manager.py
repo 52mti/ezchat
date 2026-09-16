@@ -483,3 +483,31 @@ def test_fresh_install_starts_customer_layer_empty(tmp_path):
     assert not (tmp_path / "runtime" / "configs" / "xinyu" / "config.json").exists()
     assert manager.get_app_overrides("xinyu")["match_threshold"] == 0.75
     assert (tmp_path / "runtime" / "configs" / ".layout_v2").is_file()
+
+
+def test_config_manager_caches_app_overrides_until_file_changes(tmp_path):
+    """App 级配置按 (mtime_ns,size) 文件戳缓存：未变化时复用、文件更新后失效。"""
+    config_path = tmp_path / "config.json"
+    (tmp_path / "apps" / "xinyu").mkdir(parents=True)
+    defaults_file = tmp_path / "apps" / "xinyu" / "config.json"
+    defaults_file.write_text(json.dumps({"match_threshold": 0.75}), encoding="utf-8")
+
+    manager = ConfigManager(config_path, tmp_path / "outbox.json")
+
+    assert manager.get_app_overrides("xinyu")["match_threshold"] == 0.75
+
+    # 命中缓存：返回的是副本，污染返回值不影响后续读取。
+    poisoned = manager.get_app_overrides("xinyu")
+    assert poisoned["match_threshold"] == 0.75
+    poisoned["match_threshold"] = 9.99
+    assert manager.get_app_overrides("xinyu")["match_threshold"] == 0.75
+
+    # defaults 层文件被外部修改后，文件戳变化应使缓存失效。
+    defaults_file.write_text(json.dumps({"match_threshold": 0.8}), encoding="utf-8")
+    assert manager.get_app_overrides("xinyu")["match_threshold"] == 0.8
+
+    # 客户层业务键通过 update 写入后，读取应立即看到（写后主动失效）。
+    manager.update_app_config("xinyu", {"dialogue_engine": "keyword"})
+    payload = manager.get_app_overrides("xinyu")
+    assert payload["dialogue_engine"] == "keyword"
+    assert payload["match_threshold"] == 0.8

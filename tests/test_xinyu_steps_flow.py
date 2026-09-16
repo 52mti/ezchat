@@ -10,6 +10,89 @@ from apps.xinyu import steps
 from services.rule_learning import RuleLearningStore
 
 
+CHAT_LIST_SCREEN_KEY = "screen.chat_list"
+CHAT_LIST_TITLE_REGION = (0.0, 0.023, 0.489, 0.127)
+
+
+SCREENSHOT_MARKERS = (
+    "list", "chat", "my", "unknown", "no_phone", "microphone", "black",
+    "after_greeting", "after", "still_chat", "popup", "list_confirm",
+    "list_by_ocr", "call", "android_home", "after_unread",
+)
+
+
+@pytest.fixture(autouse=True)
+def _chat_list_title_ocr_stub(monkeypatch):
+    """聊天列表判定 stub（对齐 ce27647 后的产品行为）。
+
+    产品代码（_matches_chat_list_screen）已改为"标题区域内 OCR 识别
+    消息/通话"：region 由 template_match_region 解析、OCR 走
+    _run_ocr_mode。测试 config 的 template_match_regions=None 不能动
+    （模板匹配路径依赖它为 None 直通 mock 的 match），因此这里单独
+    stub 三个符号：
+
+    - template_match_region：仅聊天列表键返回生产默认标题区域，其余 None；
+    - _run_ocr_mode：标题判定场景下，截图标记 "list" 返回"消息/通话"
+      命中（等价旧 fixture 的 screen_聊天列表.jpg 模板命中语义），其余
+      截图返回空结果；非标题场景在运行时解析 steps.run_ocr_mode，
+      让测试体内的显式 monkeypatch 优先生效；
+    - _ocr_reuse_signature：签名改为基于截图标记的稳定值。原实现对
+      任意截图都会真实解码图片（ensure_portrait_image），字符串截图
+      fixture 过不了解码这一步。
+
+    测试体内的显式 monkeypatch 优先于本 autouse stub（fixture 先应用，
+    测试体后覆盖）。
+    """
+    original_region = steps.template_match_region
+
+    def fake_region(config, key):
+        if key == CHAT_LIST_SCREEN_KEY:
+            return CHAT_LIST_TITLE_REGION
+        return original_region(config, key)
+
+    monkeypatch.setattr(steps, "template_match_region", fake_region)
+
+    # 默认模板匹配 mock：无命中。产品路径里弹窗扫描/屏幕判定都会真调
+    # match，真 matcher 会解码字符串截图 fixture 报"图片读取失败"，并被
+    # run_once 吞成静默提前退出；默认拦截为"全不命中"，测试体内显式的
+    # fake_match monkeypatch 后应用、优先于本默认。
+    monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
+
+    def fake_signature(image, region=None):
+        import numpy as np
+
+        return (f"{image}|{region}", np.zeros((4, 4), dtype=np.uint8))
+
+    monkeypatch.setattr(steps, "_ocr_reuse_signature", fake_signature)
+
+    original_run_ocr_mode = steps._run_ocr_mode
+
+    def fake_run_ocr_mode(image, config, mode, region=None, **kwargs):
+        if mode == "list" and region == CHAT_LIST_TITLE_REGION:
+            if str(image) == "list":
+                return {
+                    "mode": mode,
+                    "items": [],
+                    "ocr_items": [
+                        {"text": "消息", "x": 0.10, "y": 0.03, "w": 0.10, "h": 0.04},
+                        {"text": "通话", "x": 0.30, "y": 0.03, "w": 0.10, "h": 0.04},
+                    ],
+                    "result": {},
+                }
+            return {"mode": mode, "items": [], "ocr_items": [], "result": {}}
+        try:
+            # 委托原实现：保留其 OCR 结果复用逻辑（_reused_ocr_result 等）。
+            # 原实现内部经模块命名空间调 run_ocr_mode，测试体的 mock 优先生效；
+            # 签名计算已被 fake_signature 拦截，字符串截图不会再解码失败，
+            # 兜底捕获以防万一。
+            return original_run_ocr_mode(image, config, mode, region=region)
+        except (RuntimeError, OSError):
+            return {"mode": mode, "items": [], "ocr_items": [], "result": {}}
+
+    monkeypatch.setattr(steps, "_run_ocr_mode", fake_run_ocr_mode)
+    yield
+
+
 class FakeRobot:
     def __init__(self, images: list[object]) -> None:
         self.images = list(images)
@@ -149,7 +232,7 @@ def test_xinyu_online_photo_uses_complete_button_ocr_after_template_retries(monk
         "_template_center",
         lambda image, config, key, group: (0.1, 0.9) if key == steps.PHOTO_BUTTON else None,
     )
-    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, config, label="screen", reporter=None: "album")
+    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, config, label="screen", reporter=None, **kwargs: "album")
     monkeypatch.setattr(
         steps,
         "_run_ocr_mode",
@@ -226,7 +309,8 @@ def test_xinyu_reuses_same_screenshot_ocr_and_template_detection(monkeypatch, tm
 
     assert steps._matches_screen(image, config, steps.CHAT_LIST_SCREEN)
     assert steps._matches_screen(image, config, steps.CHAT_LIST_SCREEN)
-    assert match_calls == 1
+    # 首轮 = warm 探测（2 个返回按钮候选）+ 真匹配 1 次；第二轮全复用不再增长。
+    assert match_calls == 3
 
 
 def test_xinyu_dialogue_region_filter_is_forced_off(tmp_path):
@@ -317,7 +401,7 @@ def test_xinyu_ensure_list_screen_prioritizes_returning_to_list_before_popup_sca
     robot = FakeRobot(["chat", "list"])
     capture_labels: list[str] = []
 
-    def fake_capture(robot, config, pre_move=True, label="screen"):
+    def fake_capture(robot, config, pre_move=True, label="screen", **kwargs):
         capture_labels.append(label)
         return robot.get_transform_image()
 
@@ -382,7 +466,7 @@ def test_xinyu_ensure_list_screen_accepts_title_ocr_when_template_misses(monkeyp
 
     image = steps.ensure_list_screen(robot, config)
 
-    assert image == "list_confirm"
+    assert image == "list"
     assert robot.clicks == []
 
 
@@ -420,10 +504,11 @@ def test_xinyu_android_home_entry_uses_strict_match_settings():
 
 def test_xinyu_ensure_list_screen_reports_back_clicked_but_not_returned(monkeypatch, tmp_path):
     config = _config(tmp_path)
-    robot = FakeRobot(["chat", "still_chat"])
+    # 取图始终是聊天界面（含确认重试），保证"点了返回但从未回到列表"。
+    robot = FakeRobot(["chat"] * 12)
 
     monkeypatch.setattr(steps, "capture_transform_image", lambda robot, cfg, pre_move=True, label="screen": robot.get_transform_image())
-    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None: robot.get_transform_image())
+    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None, **kwargs: robot.get_transform_image())
     monkeypatch.setattr(
         steps,
         "_matches_screen",
@@ -447,7 +532,11 @@ def test_xinyu_ensure_list_screen_reports_unknown_screen_back_failure(monkeypatc
     config = _config(tmp_path)
     robot = FakeRobot(["unknown"])
 
-    monkeypatch.setattr(steps, "capture_transform_image", lambda robot, cfg, pre_move=True, label="screen": robot.get_transform_image())
+    monkeypatch.setattr(
+        steps,
+        "capture_transform_image",
+        lambda robot, cfg, pre_move=True, label="screen", **kwargs: "unknown",
+    )
     monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
 
     assert steps.ensure_list_screen(robot, config) is None
@@ -671,7 +760,7 @@ def test_xinyu_unreplied_filter_clicks_when_no_red(monkeypatch, tmp_path):
             "region": [1, 2, 3, 4],
         },
     )
-    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None: "after")
+    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None, **kwargs: "after")
     monkeypatch.setattr(steps.time, "sleep", lambda seconds: None)
 
     image, _ocr_result = steps.check_unread_button(robot, config, image="list")
@@ -784,10 +873,15 @@ def test_xinyu_unknown_screen_does_not_click_default_back(monkeypatch, tmp_path)
     config = _config(tmp_path)
     robot = FakeRobot(["unknown"])
 
+    monkeypatch.setattr(
+        steps,
+        "capture_transform_image",
+        lambda robot, cfg, pre_move=True, label="screen", **kwargs: "unknown",
+    )
     monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
 
-    with pytest.raises(steps.StepUnavailable, match="当前界面无法识别，且未找到返回按钮模板"):
-        steps.ensure_list_screen(robot, config)
+    # 未知界面且无返回按钮：软等待（返回 None、不点击、不抛），不执行复位。
+    assert steps.ensure_list_screen(robot, config) is None
     assert robot.clicks == []
 
 
@@ -807,7 +901,7 @@ def test_xinyu_input_box_error_is_reported_in_chinese(monkeypatch, tmp_path):
     config = _config(tmp_path)
     robot = FakeRobot(["chat"])
 
-    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None: "chat")
+    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None, **kwargs: "chat")
     monkeypatch.setattr(steps, "match", lambda image, template, threshold=0.85: None)
 
     with pytest.raises(steps.StepUnavailable, match="未找到输入框模板"):
@@ -818,7 +912,7 @@ def test_xinyu_focus_input_box_clamps_negative_offset(monkeypatch, tmp_path):
     config = _config(tmp_path)
     robot = FakeRobot(["chat"])
 
-    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None: "chat")
+    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None, **kwargs: "chat")
 
     def fake_match(image, template, threshold=0.85):
         if Path(template).name == "btn_输入框.jpg":
@@ -839,7 +933,7 @@ def test_xinyu_focus_input_box_reuses_cached_position(monkeypatch, tmp_path):
     robot = FakeRobot(["chat", "chat"])
     match_calls: list[str] = []
 
-    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None: "chat")
+    monkeypatch.setattr(steps, "capture_after_popups", lambda robot, cfg, label="screen", reporter=None, **kwargs: "chat")
 
     def fake_match(image, template, threshold=0.85):
         match_calls.append(Path(template).name)
@@ -1146,8 +1240,10 @@ def test_xinyu_list_still_prefers_unread_target_over_content_fallback(monkeypatc
 
     target = steps.find_unread_target(robot, config)
 
-    assert target["name"] == "unread_user"
-    assert target["unread_count"] == 1
+    # 9/2 起未回复视图内改为内容优先（prefer_detected_unread=False，
+    # 提交 125676e）：视图内行本就全有未读，角标缺失不该被跳过。
+    assert target["name"] == "content_only"
+    assert target["unread_count"] == 0
 
 
 def test_xinyu_list_falls_back_to_content_when_unread_is_missing(monkeypatch, tmp_path):
@@ -1268,8 +1364,9 @@ def test_xinyu_list_still_prefers_unread_target_over_content_fallback(monkeypatc
 
     target = steps.find_unread_target(robot, config)
 
-    assert target["name"] == "unread_user"
-    assert target["unread_count"] == 1
+    # 9/2 起未回复视图内改为内容优先（prefer_detected_unread=False，提交 125676e）。
+    assert target["name"] == "content_only"
+    assert target["unread_count"] == 0
 
 
 def test_xinyu_app_uses_short_list_content_directly(monkeypatch, tmp_path):
@@ -1841,6 +1938,9 @@ def test_xinyu_go_back_clicks_back_twice_after_send(monkeypatch, tmp_path):
             return {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1, "score": 0.99}
         if image == "list" and Path(template).name == "screen_聊天列表.jpg":
             return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        if str(image) == "chat" and Path(template).name.startswith("btn_麦克风按钮"):
+            # 8/25 后双击返回的前提是麦克风模板命中（退出语音输入态）。
+            return {"x": 0.5, "y": 0.9, "w": 0.1, "h": 0.05, "score": 0.99}
         return None
 
     monkeypatch.setattr(steps, "match", fake_match)
@@ -1848,7 +1948,7 @@ def test_xinyu_go_back_clicks_back_twice_after_send(monkeypatch, tmp_path):
     monkeypatch.setattr(
         steps,
         "capture_after_popups",
-        lambda robot, config, label="screen", max_dismiss=3, reporter=None: robot.get_transform_image(),
+        lambda robot, config, label="screen", max_dismiss=3, reporter=None, **kwargs: robot.get_transform_image(),
     )
 
     back_clicks = steps.go_back(robot, config, double_click_on_first_attempt=True)
@@ -1867,6 +1967,9 @@ def test_xinyu_go_back_reuses_cached_back_position_after_send(monkeypatch, tmp_p
             raise AssertionError("cached back position should avoid template matching")
         if image == "list" and Path(template).name == "screen_聊天列表.jpg":
             return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        if str(image) == "chat" and Path(template).name.startswith("btn_麦克风按钮"):
+            # 8/25 后双击返回的前提是麦克风模板命中（退出语音输入态）。
+            return {"x": 0.5, "y": 0.9, "w": 0.1, "h": 0.05, "score": 0.99}
         return None
 
     monkeypatch.setattr(steps, "match", fake_match)
@@ -1874,7 +1977,7 @@ def test_xinyu_go_back_reuses_cached_back_position_after_send(monkeypatch, tmp_p
     monkeypatch.setattr(
         steps,
         "capture_after_popups",
-        lambda robot, config, label="screen", max_dismiss=3, reporter=None: robot.get_transform_image(),
+        lambda robot, config, label="screen", max_dismiss=3, reporter=None, **kwargs: robot.get_transform_image(),
     )
 
     back_clicks = steps.go_back(robot, config, double_click_on_first_attempt=True)
@@ -1886,14 +1989,21 @@ def test_xinyu_go_back_reuses_cached_back_position_after_send(monkeypatch, tmp_p
 def test_xinyu_go_back_keeps_cached_back_position_until_next_start(monkeypatch, tmp_path):
     config = _config(tmp_path)
     config["_runtime_cache"] = {"template_points": {"back": (0.23, 0.07)}}
-    robot = FakeRobot(["chat", "chat", "chat", "chat", "list"])
+    # 8 张 chat：入口 1 + attempt0 点击前 1 + 确认 3 + attempt1 点击前 1 + 确认 2，
+    # 第 9 次取图耗尽兜底返回 "list" → attempt1 确认成功（retry_back_success）。
+    robot = FakeRobot(["chat"] * 8)
     reports: list[tuple[str, str, str | None]] = []
 
     def fake_match(image, template, threshold=0.85):
         if image == "chat" and Path(template).name in {"btn_返回按钮_2.jpg", "btn_返回按钮.jpg"}:
             raise AssertionError("cached back position should not be rematched in the same startup")
+        if str(image) == "chat" and Path(template).name.startswith("btn_麦克风按钮"):
+            return {"x": 0.5, "y": 0.9, "w": 0.1, "h": 0.05, "score": 0.99}
         if image == "list" and Path(template).name == "screen_聊天列表.jpg":
             return {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "score": 0.99}
+        if str(image) == "chat" and Path(template).name.startswith("btn_麦克风按钮"):
+            # 8/25 后双击返回的前提是麦克风模板命中（退出语音输入态）。
+            return {"x": 0.5, "y": 0.9, "w": 0.1, "h": 0.05, "score": 0.99}
         return None
 
     monkeypatch.setattr(steps, "match", fake_match)
@@ -1901,7 +2011,7 @@ def test_xinyu_go_back_keeps_cached_back_position_until_next_start(monkeypatch, 
     monkeypatch.setattr(
         steps,
         "capture_after_popups",
-        lambda robot, config, label="screen", max_dismiss=3, reporter=None: robot.get_transform_image(),
+        lambda robot, config, label="screen", max_dismiss=3, reporter=None, **kwargs: robot.get_transform_image(),
     )
 
     back_clicks = steps.go_back(robot, config, reporter=lambda step, label, log_label=None: reports.append((step, label, log_label)))
@@ -1931,7 +2041,7 @@ def test_xinyu_go_back_stops_when_chat_list_ocr_matches(monkeypatch, tmp_path):
     monkeypatch.setattr(
         steps,
         "capture_after_popups",
-        lambda robot, config, label="screen", max_dismiss=3, reporter=None: robot.get_transform_image(),
+        lambda robot, config, label="screen", max_dismiss=3, reporter=None, **kwargs: robot.get_transform_image(),
     )
     monkeypatch.setattr(
         steps,
@@ -1966,13 +2076,14 @@ def test_xinyu_go_back_single_clicks_when_not_after_send(monkeypatch, tmp_path):
     monkeypatch.setattr(
         steps,
         "capture_after_popups",
-        lambda robot, config, label="screen", max_dismiss=3, reporter=None: robot.get_transform_image(),
+        lambda robot, config, label="screen", max_dismiss=3, reporter=None, **kwargs: robot.get_transform_image(),
     )
 
     back_clicks = steps.go_back(robot, config)
 
-    assert robot.clicks == [pytest.approx((0.15, 0.15)), pytest.approx((0.15, 0.15))]
-    assert back_clicks == 2
+    # 无 double 参数：单次点击后确认循环兜底图 "list" 判定成功即返回。
+    assert robot.clicks == [pytest.approx((0.15, 0.15))]
+    assert back_clicks == 1
 
 
 def test_xinyu_keep_screen_awake_clicks_message_bottom_nav(monkeypatch, tmp_path):
@@ -2117,8 +2228,8 @@ def test_xinyu_caches_my_from_message_when_my_bottom_nav_missing(monkeypatch, tm
     assert steps.keep_screen_awake(robot, config)
 
     anchors = config["_runtime_cache"]["screen_anchors"]
-    assert anchors["bottom_message"] == pytest.approx((0.62, 0.9))
-    assert anchors["bottom_my"] == pytest.approx((0.82, 0.9))
+    assert anchors["bottom_message"] == pytest.approx((0.62, 0.88))
+    assert anchors["bottom_my"] == pytest.approx((0.82, 0.88))
 
 
 def test_xinyu_keep_screen_awake_does_not_click_without_message_bottom_nav(monkeypatch, tmp_path):

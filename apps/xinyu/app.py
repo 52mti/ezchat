@@ -93,21 +93,35 @@ class XinyuApp(BaseApp):
         metrics = cache.get("metrics", {}) if isinstance(cache, dict) else {}
         if not isinstance(metrics, dict):
             metrics = {}
-        self.emit_runtime_log(
-            "info",
-            "xinyu_round_metrics",
-            {
-                "ocr_count": int(metrics.get("ocr_count", 0) or 0),
-                "ocr_cache_hit_count": int(metrics.get("ocr_cache_hit_count", 0) or 0),
-                "ocr_seconds_total": round(float(metrics.get("ocr_seconds_total", 0.0) or 0.0), 3),
-                "ocr_seconds_max": round(float(metrics.get("ocr_seconds_max", 0.0) or 0.0), 3),
-                "detection_cache_hit_count": int(metrics.get("detection_cache_hit_count", 0) or 0),
-                "capture_count": int(metrics.get("capture_count", 0) or 0),
-                "dialogue_compact_fallback_count": int(metrics.get("dialogue_compact_fallback_count", 0) or 0),
-                "seconds": round(time.monotonic() - started_at, 3),
-                "last_ocr": metrics.get("last_ocr"),
-            },
-        )
+        last_ocr = metrics.get("last_ocr")
+        payload = {
+            "ocr_count": int(metrics.get("ocr_count", 0) or 0),
+            "ocr_cache_hit_count": int(metrics.get("ocr_cache_hit_count", 0) or 0),
+            "ocr_seconds_total": round(float(metrics.get("ocr_seconds_total", 0.0) or 0.0), 3),
+            "ocr_seconds_max": round(float(metrics.get("ocr_seconds_max", 0.0) or 0.0), 3),
+            # 排队/执行分开 + 实际后端：多设备串行槽时代长必须能区分排队，
+            # backend=auto 的配置文件看不出真实路径，以引擎侧记录为准。
+            "ocr_queue_seconds_total": round(float(metrics.get("ocr_queue_seconds_total", 0.0) or 0.0), 3),
+            "ocr_queue_seconds_max": round(float(metrics.get("ocr_queue_seconds_max", 0.0) or 0.0), 3),
+            "detection_cache_hit_count": int(metrics.get("detection_cache_hit_count", 0) or 0),
+            "capture_count": int(metrics.get("capture_count", 0) or 0),
+            "dialogue_compact_fallback_count": int(metrics.get("dialogue_compact_fallback_count", 0) or 0),
+            "seconds": round(time.monotonic() - started_at, 3),
+            "last_ocr": last_ocr,
+        }
+        if isinstance(last_ocr, dict):
+            if last_ocr.get("backend"):
+                payload["ocr_backend"] = str(last_ocr["backend"])
+            if last_ocr.get("device"):
+                payload["ocr_device"] = str(last_ocr["device"])
+        # 顶层字段优先：持久化在 metrics，不受最后一次调用是否复用影响。
+        if metrics.get("ocr_backend"):
+            payload["ocr_backend"] = str(metrics["ocr_backend"])
+        if metrics.get("ocr_device"):
+            payload["ocr_device"] = str(metrics["ocr_device"])
+        if metrics.get("ocr_sub_predict_ms"):
+            payload["ocr_sub_predict_ms"] = str(metrics["ocr_sub_predict_ms"])
+        self.emit_runtime_log("info", "xinyu_round_metrics", payload)
 
     def _reply_segment_pipeline(
         self,

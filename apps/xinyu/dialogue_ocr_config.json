@@ -1,7 +1,7 @@
 {
   "preprocess": {
     "mode": "original",
-    "scale": 2,
+    "scale": 1,
     "rotate_to_portrait": true
   },
   "rules": {

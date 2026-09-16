@@ -214,6 +214,27 @@ class VisionDialogueClient:
 
     def _image_to_data_uri(self, image: Any) -> str:
         portrait = ensure_portrait_image(image)
+        # cv2 编码全程释放 GIL（PIL save 持有 GIL，多设备并发视觉识别时
+        # 会把 Qt UI 线程饿出卡顿——与 photo_capture._portrait_bytes 同款
+        # 修复）；旋转方向保持竖屏，quality 与原 PIL 路径一致（95）。
+        try:
+            import cv2
+            import numpy as np
+
+            array = np.asarray(portrait)
+            if array.ndim == 3 and array.shape[2] >= 3:
+                if array.shape[2] == 4:
+                    array = cv2.cvtColor(array, cv2.COLOR_RGBA2BGR)
+                else:
+                    array = cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+                ok, encoded_array = cv2.imencode(".jpg", array, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                if ok:
+                    data = encoded_array.tobytes()
+                    encoded = base64.b64encode(data).decode("ascii")
+                    mime = mimetypes.guess_type("image.jpg")[0] or "image/jpeg"
+                    return f"data:{mime};base64,{encoded}"
+        except Exception:
+            pass
         from io import BytesIO
 
         buffer = BytesIO()

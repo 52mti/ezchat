@@ -9,6 +9,8 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -70,13 +72,22 @@ class _RobotCallGuard:
 
     1. 停止请求发出后，任何新的机械臂调用立即抛 OperationCancelled，
        工作线程不必等上一个长步骤走完才开始退出；
-    2. 实际调用在独立 daemon 线程执行并限时等待，超时后放弃等待
+    2. 实际调用提交到本守卫的有界线程池并限时等待，超时后放弃等待
        （指令仍只会发一次，不会重复执行动作），避免无限挂起。
+       池化替代原先"每次调用新建 daemon 线程"：多设备高频调用不再
+       反复创建线程，超时挂住的调用占用的是有界 worker 而不是无限
+       堆积的新线程（设备半死时的线程泄漏源）。
     """
+
+    EXECUTOR_WORKERS = 4
 
     def __init__(self, robot: Any, stop_check: Any) -> None:
         self._robot = robot
         self._stop_check = stop_check
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.EXECUTOR_WORKERS,
+            thread_name_prefix="robot-call",
+        )
 
     def __getattr__(self, name: str) -> Any:
         target = getattr(self._robot, name)
@@ -86,24 +97,14 @@ class _RobotCallGuard:
 
         def call(*args: Any, **kwargs: Any) -> Any:
             raise_if_cancelled(self._robot)
-            box: dict[str, Any] = {}
-
-            def runner() -> None:
-                try:
-                    box["result"] = target(*args, **kwargs)
-                except BaseException as exc:  # 原样回传给调用方处理
-                    box["error"] = exc
-
-            thread = threading.Thread(target=runner, name=f"robot-call-{name}", daemon=True)
-            thread.start()
-            thread.join(timeout)
-            if thread.is_alive():
+            future = self._executor.submit(target, *args, **kwargs)
+            try:
+                return future.result(timeout=timeout)
+            except FuturesTimeoutError:
+                # 不 cancel：已发出的 HTTP 让它自然跑完，线程归池复用。
                 if self._stop_check():
                     raise OperationCancelled("operation cancelled")
                 raise TimeoutError(f"机械臂调用超时：{name} 超过 {timeout:.0f}s 未返回")
-            if "error" in box:
-                raise box["error"]
-            return box.get("result")
 
         return call
 
@@ -714,5 +715,12 @@ class DeviceWorker(threading.Thread):
                 if self._stop_event.wait(wait_interval):
                     break
         finally:
+            # 坐标缓存防抖落盘的收尾：worker 退出前把待写缓存刷盘。
+            try:
+                from services.coordinate_cache import flush_persist_debounce
+
+                flush_persist_debounce()
+            except Exception:
+                pass
             self._flush_incident("stopped")
             self._emit("info", "stopped")

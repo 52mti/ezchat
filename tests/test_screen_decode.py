@@ -82,3 +82,36 @@ def test_portrait_bytes_rotates_counter_clockwise_like_pil() -> None:
     red_ratio_pil = float((pil_array[pil_array.shape[0] // 2 :, :, 0] > 200).mean())
     assert red_ratio_new > 0.9
     assert abs(red_ratio_new - red_ratio_pil) < 0.05
+
+
+def test_file_decode_cache_hits_and_invalidates(tmp_path):
+    """模板文件按 (路径,mtime,size) 缓存：重复加载零解码、文件替换自动失效。"""
+    import numpy as np
+
+    from vision.screen import _decode_file_cached, load_image, to_cv2
+
+    template = tmp_path / "tpl.jpg"
+    template.write_bytes(
+        __import__("cv2").imencode(
+            ".jpg", np.full((40, 60, 3), 200, dtype=np.uint8)
+        )[1].tobytes()
+    )
+
+    first = _decode_file_cached(str(template))
+    assert first is not None
+    # 命中缓存：同一只读对象，无重复解码。
+    assert _decode_file_cached(str(template)) is first
+    assert not first.flags.writeable
+    # to_cv2 / load_image 的文件路径同样吃缓存。
+    assert to_cv2(template) is first
+    assert load_image(template).size == (60, 40)
+
+    # 文件被替换（mtime/size 变化）后缓存失效，重新解码新内容。
+    template.write_bytes(
+        __import__("cv2").imencode(
+            ".jpg", np.full((20, 30, 3), 10, dtype=np.uint8)
+        )[1].tobytes()
+    )
+    second = _decode_file_cached(str(template))
+    assert second is not first
+    assert second.shape[:2] == (20, 30)

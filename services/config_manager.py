@@ -107,7 +107,9 @@ def _strip_customer_layer_template_scopes(payload: dict[str, Any]) -> dict[str, 
 
     - 开发域视觉键整体剔除；
     - template_match_regions / template_match_thresholds 只保留 popup.*；
-    - ocr_modes 只保留 dialogue / list（points 等其余模式属开发域）。
+    - ocr_modes 只保留 dialogue / list（points 等其余模式属开发域），且各模式
+      剥离 preprocess——旧布局迁移曾把整份默认值（含 scale）冻进客户层，
+      按键遮蔽随包默认值，开发端性能调优通道被冻结。
     """
     for config_key in DEVELOPER_SCOPED_APP_KEYS:
         payload.pop(config_key, None)
@@ -122,7 +124,12 @@ def _strip_customer_layer_template_scopes(payload: dict[str, Any]) -> dict[str, 
             payload.pop(config_key, None)
     ocr_modes = payload.get("ocr_modes")
     if isinstance(ocr_modes, dict):
-        customer_modes = {k: v for k, v in ocr_modes.items() if k in ("dialogue", "list")}
+        customer_modes = {}
+        for mode_name, mode_payload in ocr_modes.items():
+            if mode_name not in ("dialogue", "list") or not isinstance(mode_payload, dict):
+                continue
+            mode_payload.pop("preprocess", None)
+            customer_modes[mode_name] = mode_payload
         if customer_modes:
             payload["ocr_modes"] = customer_modes
         else:
@@ -288,6 +295,36 @@ def _load_app_ocr_mode_override_files(app_config_root: Path, app_name: str) -> d
     return {"ocr_modes": ocr_modes} if ocr_modes else {}
 
 
+def _app_override_stamp(path: Path) -> tuple[int, int] | None:
+    """文件存在性指纹：mtime_ns + size，用于跳过未变化文件的整读。
+
+    多设备 worker 每个轮询周期都会读 App 级配置；stat（微秒级）代替
+    6 次 open+read+parse（Windows 杀软实时扫描下单次数十毫秒），是
+    ConfigManager._lock 持锁时长的数量级优化。
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _app_override_file_stamps(
+    app_config_root: Path,
+    app_name: str,
+    defaults_root: Path | None = None,
+) -> tuple[tuple[int, int] | None, ...]:
+    roots = [app_config_root]
+    if defaults_root is not None:
+        roots.append(defaults_root)
+    stamps: list[tuple[int, int] | None] = []
+    for root in roots:
+        stamps.append(_app_override_stamp(_app_config_path(root, app_name)))
+        stamps.append(_app_override_stamp(_app_dialogue_ocr_config_path(root, app_name)))
+        stamps.append(_app_override_stamp(_app_list_ocr_config_path(root, app_name)))
+    return tuple(stamps)
+
+
 def _load_app_override_file(
     app_config_root: Path,
     app_name: str,
@@ -375,6 +412,10 @@ def _merge_app_level_config(
         (dialogue_mode, _app_dialogue_ocr_config_path(app_config_root, app_name)),
         (list_mode, _app_list_ocr_config_path(app_config_root, app_name)),
     ):
+        # preprocess（scale/rotate 等性能布局旋钮）属开发域，客户层 mode
+        # 文件不落盘，与读端剥离互为镜像（读写两端剥离开发域键）。
+        if isinstance(mode_payload, dict):
+            mode_payload.pop("preprocess", None)
         if isinstance(mode_payload, dict) and mode_payload:
             _atomic_write_json(path, mode_payload)
         else:
@@ -445,6 +486,9 @@ class ConfigManager:
         self._migrate_legacy_outbox()
         self._config = self._load_json(self.config_path, DEFAULT_CONFIG)
         self._outbox = self._load_json(self.outbox_path, DEFAULT_OUTBOX)
+        # App 级配置按 (mtime_ns,size) 文件戳缓存：worker 每轮热刷新只需 stat，
+        # 不再重复整读 6 个 JSON（见 _app_override_file_stams 注释）。
+        self._app_overrides_cache: dict[str, tuple[tuple[tuple[int, int] | None, ...], dict[str, Any]]] = {}
         self._migrate_if_needed()
         self._normalize_loaded_device_scopes()
         self._apply_environment_overrides()
@@ -811,9 +855,16 @@ class ConfigManager:
 
     def get_app_overrides(self, app_name: str) -> dict[str, Any]:
         with self._lock:
-            return _load_app_override_file(
+            cache_key = str(app_name)
+            stamps = _app_override_file_stamps(self.app_config_root, cache_key, defaults_root=self.app_defaults_root)
+            cached = self._app_overrides_cache.get(cache_key)
+            if cached is not None and cached[0] == stamps:
+                return copy.deepcopy(cached[1])
+            payload = _load_app_override_file(
                 self.app_config_root, str(app_name), defaults_root=self.app_defaults_root
             )
+            self._app_overrides_cache[cache_key] = (stamps, copy.deepcopy(payload))
+            return payload
 
     def update_app_config(self, app_name: str, updates: dict[str, Any]) -> None:
         scoped_updates, _, _ = _split_override_scopes(copy.deepcopy(updates))
@@ -823,6 +874,8 @@ class ConfigManager:
             _merge_app_level_config(
                 self.app_config_root, str(app_name), scoped_updates, defaults_root=self.app_defaults_root
             )
+            # 写后主动失效：防极端情况下新写入与旧文件 mtime_ns+size 完全相同。
+            self._app_overrides_cache.pop(str(app_name), None)
 
     def get_device_runtime_overrides(self, device_ip: str) -> dict[str, Any]:
         device = self.find_device(device_ip) or {}
@@ -888,6 +941,10 @@ class ConfigManager:
                 if existing.get("message_fingerprint") == fingerprint:
                     merged = copy.deepcopy(existing)
                     merged.update(copy.deepcopy(entry))
+                    if merged == existing:
+                        # 重复标记同一状态（如重试路径的 mark_sent）：
+                        # 内容未变化不重写盘，省一次全文件读改写。
+                        return
                     messages[index] = merged
                     break
             else:

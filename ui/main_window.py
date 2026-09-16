@@ -369,7 +369,10 @@ def _ocr_mode_label(config_manager: ConfigManager) -> str:
     ocr_config = app_config.get("ocr", {}) if isinstance(app_config.get("ocr", {}), dict) else {}
     label = _ocr_device_label_from_backend(ocr_config.get("backend", ocr_config.get("ocr_backend", "")))
     if not label:
-        label = "GPU" if bool(ocr_config.get("use_gpu", False)) else "CPU"
+        # 配置回退只代表"想用 GPU"，不代表运行时真实路径（backend=auto 时
+        # 实际后端由硬件探测决定，可能落 CPU/DirectML）。明确标注未验证，
+        # 避免把配置当事实显示（曾误导"GPU 已生效"的排查方向）。
+        label = "GPU(按配置未验证)" if bool(ocr_config.get("use_gpu", False)) else "CPU"
     return f"OCR: {label}"
 
 
@@ -821,6 +824,8 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._drain_events)
         self.timer.start(100)
+        # _drain_events 的重入保护标志（模态对话框嵌套事件循环会再次触发定时器）。
+        self._draining_events = False
         QTimer.singleShot(800, lambda: self._start_release_check(manual=False))
 
     def _button(self, text: str, variant: str = "default") -> QPushButton:
@@ -1489,12 +1494,29 @@ class MainWindow(QMainWindow):
     def _save_ocr_concurrency(self) -> None:
         self.config_manager.set("global", "ocr_max_concurrency", value=self.ocr_concurrency_input.value())
 
+    def _monitor_wall_devices_provider(self) -> list[dict[str, Any]]:
+        """监控墙的设备列表源：2 秒 TTL 缓存。
+
+        监控墙每秒 refresh 都要设备列表，而 devices() 走 ConfigManager
+        锁内全量深拷贝——监控墙开着时等于每秒抢一次锁。设备集合低频变化，
+        2 秒缓存消除抢锁；UI 侧的设备增删操作会在下次缓存过期后反映。
+        """
+        import time as _time
+
+        now = _time.monotonic()
+        cache = getattr(self, "_monitor_wall_devices_cache", None)
+        if cache is not None and now - cache[0] < 2.0:
+            return cache[1]
+        devices = self.config_manager.devices()
+        self._monitor_wall_devices_cache = (now, devices)
+        return devices
+
     def _open_monitor_wall(self) -> None:
         """监控墙：吸附在主窗口右侧的独立弹窗（不压缩主界面），按钮切换显示/隐藏。"""
         from ui.monitor_wall import MonitorWallWindow
 
         if self.monitor_wall_window is None:
-            self.monitor_wall_window = MonitorWallWindow(self.config_manager.devices, self)
+            self.monitor_wall_window = MonitorWallWindow(self._monitor_wall_devices_provider, self)
         visible = not self.monitor_wall_window.isVisible()
         self.monitor_wall_window.setVisible(visible)
         if visible:
@@ -1636,18 +1658,59 @@ class MainWindow(QMainWindow):
             project_uuid=str(global_config.get("project_uuid", "")),
             project_secret=str(global_config.get("project_secret", "")),
         )
-        result = client.verify_with_offline(device_ip, license_key, str(device.get("license_expires", "")))
-        if not result.ok:
+        # 授权服务器慢时（timeout 10s）同步校验会把 UI 冻结最多 10 秒；
+        # 移后台线程，结果经 update_events 队列回主线程处理。
+        self._append_log_line(device_ip, "卡密校验中…")
+
+        def verify() -> None:
+            try:
+                result = client.verify_with_offline(device_ip, license_key, str(device.get("license_expires", "")))
+            except Exception as exc:  # 网络栈异常也按校验失败呈现
+                self.update_events.put(
+                    (
+                        "license_verified",
+                        {"row": row, "device_ip": device_ip, "license_key": license_key, "error": str(exc)},
+                    )
+                )
+                return
+            self.update_events.put(
+                (
+                    "license_verified",
+                    {
+                        "row": row,
+                        "device_ip": device_ip,
+                        "license_key": license_key,
+                        "ok": bool(result.ok),
+                        "message": str(result.message),
+                        "expires_at": str(result.expires_at or ""),
+                        "status": str(result.status or ""),
+                    },
+                )
+            )
+
+        threading.Thread(target=verify, name="license-verify", daemon=True).start()
+
+    def _finish_license_verify(self, payload: dict[str, Any]) -> None:
+        row = int(payload.get("row", -1) or -1)
+        device_ip = str(payload.get("device_ip", "") or "")
+        license_key = str(payload.get("license_key", "") or "")
+        if payload.get("error"):
             self._set_row_status(device_ip, "license_error")
-            QMessageBox.warning(self, "卡密", result.message)
+            QMessageBox.warning(self, "卡密", f"校验异常：{payload['error']}")
+            return
+        if not payload.get("ok"):
+            self._set_row_status(device_ip, "license_error")
+            QMessageBox.warning(self, "卡密", str(payload.get("message", "") or "校验失败"))
             return
         self.config_manager.update_device(
             device_ip,
-            {"license_key": license_key, "license_expires": result.expires_at},
+            {"license_key": license_key, "license_expires": str(payload.get("expires_at", "") or "")},
         )
-        self.table.setItem(row, COL_LICENSE, QTableWidgetItem(mask_secret(license_key)))
-        self.table.setItem(row, COL_EXPIRES, QTableWidgetItem(result.expires_at or "-"))
-        self._set_row_status(device_ip, "normal" if result.status == "ok" else result.status)
+        if 0 <= row < self.table.rowCount() and self._device_ip_for_row(row) == device_ip:
+            self.table.setItem(row, COL_LICENSE, QTableWidgetItem(mask_secret(license_key)))
+            self.table.setItem(row, COL_EXPIRES, QTableWidgetItem(str(payload.get("expires_at", "") or "-")))
+        status_value = str(payload.get("status", "") or "")
+        self._set_row_status(device_ip, "normal" if status_value == "ok" else status_value)
 
     def _edit_app_config(self, row: int) -> None:
         device = self._device_for_row(row)
@@ -1990,9 +2053,23 @@ class MainWindow(QMainWindow):
             ocr_seconds_text = ""
             if ocr_seconds_total not in (None, "", 0, 0.0):
                 ocr_seconds_text = f"，OCR 耗时 {ocr_seconds_total} 秒（单次最长 {payload.get('ocr_seconds_max', 0)} 秒）"
+                queue_max = payload.get("ocr_queue_seconds_max", 0) or 0
+                if float(queue_max) >= 0.5:
+                    # 排队显著时单独标出：单次"最长"含并发槽排队，区分开才知道
+                    # 是在等其他设备还是推理本身慢。
+                    ocr_seconds_text += f"，其中排队最长 {queue_max} 秒"
+            sub_predict = payload.get("ocr_sub_predict_ms")
+            if sub_predict not in (None, "", "0", 0):
+                # 子进程纯推理毫秒数：与单次总耗时的差值 = 链路开销。
+                # 取自 metrics 顶层持久化值，缓存复用轮次也可见。
+                ocr_seconds_text += f"，子进程纯推理 {sub_predict}ms"
+            backend_text = ""
+            if payload.get("ocr_backend"):
+                device = str(payload.get("ocr_device", "") or "")
+                backend_text = f"，[{payload.get('ocr_backend')}{('/' + device) if device else ''}]"
             return (
                 f"[{event.level}] {event.device_ip}: 心遇本轮统计 "
-                f"OCR {payload.get('ocr_count', '')} 次{ocr_seconds_text}，{reuse_text}截图 {payload.get('capture_count', '')} 次，"
+                f"OCR {payload.get('ocr_count', '')} 次{ocr_seconds_text}{backend_text}，{reuse_text}截图 {payload.get('capture_count', '')} 次，"
                 f"详情回退 {payload.get('dialogue_compact_fallback_count', 0)} 次，"
                 f"耗时 {payload.get('seconds', '')} 秒"
             )
@@ -2073,6 +2150,17 @@ class MainWindow(QMainWindow):
         return f"[{event.level}] {event.device_ip}: {event.message}"
 
     def _drain_events(self) -> None:
+        # 重入保护：事件处理里弹出的模态对话框会开嵌套事件循环，QTimer
+        # 在嵌套循环里继续派发并再次进入本函数（旧代码无保护，可层层叠加）。
+        if self._draining_events:
+            return
+        self._draining_events = True
+        try:
+            self._drain_events_once()
+        finally:
+            self._draining_events = False
+
+    def _drain_events_once(self) -> None:
         started_at = time.monotonic()
         processed = 0
         while processed < UI_EVENT_DRAIN_LIMIT:
@@ -2105,7 +2193,19 @@ class MainWindow(QMainWindow):
             waiting = max(0, int(status.get("waiting", 0) or 0)) if isinstance(status, dict) else 0
         except Exception:
             waiting = 0
-        self.ocr_queue_label.setText(f"OCR等待：{waiting}")
+        text = f"OCR等待：{waiting}"
+        try:
+            from vision.ocr import get_ocr_runtime_info
+
+            info = get_ocr_runtime_info()
+            backend = str(info.get("backend", "") or "")
+            device = str(info.get("device", "") or "")
+            if backend:
+                # 实际生效的 OCR 后端（backend=auto 时配置文件看不出真实路径）。
+                text += f" | {backend}{'/' + device if device else ''}"
+        except Exception:
+            pass
+        self.ocr_queue_label.setText(text)
 
     def _drain_update_events(self) -> None:
         processed = 0
@@ -2121,6 +2221,19 @@ class MainWindow(QMainWindow):
                 self._append_log_line("", f"[{time.strftime('%H:%M:%S')}] [error] UI: 更新事件处理失败：{exc}")
 
     def _handle_update_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        if event_type == "license_verified":
+            self._finish_license_verify(payload if isinstance(payload, dict) else {})
+            return
+
+        if event_type == "click_test_done":
+            ok = bool(payload.get("ok"))
+            message = str(payload.get("message", "") or "")
+            if ok:
+                QMessageBox.information(self, "测试点击完成", message)
+            else:
+                QMessageBox.critical(self, "测试点击失败", message)
+            return
+
         if event_type in {"check_complete", "check_error"}:
             self._finish_release_check()
 
@@ -4080,6 +4193,10 @@ class DeviceSettingsDialogFixed(QDialog):
     def values(self) -> dict[str, Any]:
         return {}
 class DeviceSettingsDialogInteractive(QDialog):
+    # 跨线程信号：测试点击的机械臂 HTTP 调用在后台线程执行，结果经信号
+    # 回到对话框所在的主线程弹提示（同步调用会冻结 UI 数秒）。
+    _click_test_done = pyqtSignal(bool, str)
+
     def __init__(
         self,
         overrides: dict[str, Any],
@@ -4097,6 +4214,7 @@ class DeviceSettingsDialogInteractive(QDialog):
         self.test_target_combo: QComboBox | None = None
         self._screenshot_thread: DeviceScreenshotThread | None = None
         self._template_preview_thread: TemplatePreviewThread | None = None
+        self._click_test_done.connect(self._on_click_test_done)
         self._ocr_preview_thread: OcrPreviewThread | None = None
         self.setWindowTitle(f"设备设置 - {device_ip} / {app_name}")
         self.resize(1180, 760)
@@ -4616,18 +4734,27 @@ class DeviceSettingsDialogInteractive(QDialog):
         if point is None:
             QMessageBox.warning(self, "未选择坐标", "请先刷新截图，并在图片上点击一个基点位置。")
             return
-        try:
-            robot = RobotInterface(self.device_ip)
+
+        def run_click() -> None:
             try:
-                setattr(robot, "_codex_click_jitter_enabled", True)
-            except Exception:
-                pass
-            click_x, click_y = robot_point_with_jitter(robot, *point)
-            robot.move_click(click_x, click_y)
-        except Exception as exc:
-            QMessageBox.critical(self, "测试点击失败", f"机械臂点击失败：{exc}")
-            return
-        QMessageBox.information(self, "测试点击完成", f"已点击坐标：({click_x:.4f}, {click_y:.4f})")
+                robot = RobotInterface(self.device_ip)
+                try:
+                    setattr(robot, "_codex_click_jitter_enabled", True)
+                except Exception:
+                    pass
+                click_x, click_y = robot_point_with_jitter(robot, *point)
+                robot.move_click(click_x, click_y)
+                self._click_test_done.emit(True, f"已点击坐标：({click_x:.4f}, {click_y:.4f})")
+            except Exception as exc:
+                self._click_test_done.emit(False, f"机械臂点击失败：{exc}")
+
+        threading.Thread(target=run_click, name="click-test", daemon=True).start()
+
+    def _on_click_test_done(self, ok: bool, message: str) -> None:
+        if ok:
+            QMessageBox.information(self, "测试点击完成", message)
+        else:
+            QMessageBox.critical(self, "测试点击失败", message)
 
     def values(self) -> dict[str, Any]:
         values: dict[str, Any] = {}

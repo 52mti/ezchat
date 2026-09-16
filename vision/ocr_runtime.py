@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import contextlib
 import dataclasses
@@ -7,12 +7,15 @@ import inspect
 import json
 import os
 import platform
+import queue
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -970,6 +973,8 @@ def _persist_runtime_success(backend: str, model_tier: str, device: str) -> None
 
 
 class PaddleOcrRuntimeEngine:
+    device_seen: str = ""
+
     def __init__(self, *, backend: str, model_tier: str, manifest: RuntimeManifest, config: dict[str, Any]) -> None:
         self.backend = backend
         self.model_tier = model_tier
@@ -1040,10 +1045,13 @@ class PaddleOcrRuntimeEngine:
 
     def preload(self) -> str:
         _engine, device = self._get_engine()
+        # 记录实际落到的设备，供运行观测日志读取（backend 标注的金标准）。
+        self.device_seen = device
         return device
 
     def predict(self, image_array: np.ndarray, **_kwargs: Any) -> list[dict[str, Any]]:
-        engine, _device = self._get_engine()
+        engine, device = self._get_engine()
+        self.device_seen = device
         with _ENGINE_PREDICT_LOCK:
             return engine.predict(image_array)
 
@@ -1073,6 +1081,7 @@ def _normalize_rapidocr_results(raw_result: object) -> list[dict[str, Any]]:
 
 class OnnxDirectMLOcrRuntimeEngine:
     backend = "onnx_directml"
+    device_seen: str = ""
 
     def __init__(self, *, model_tier: str, manifest: RuntimeManifest, config: dict[str, Any]) -> None:
         self.model_tier = model_tier
@@ -1115,6 +1124,7 @@ class OnnxDirectMLOcrRuntimeEngine:
 
     def preload(self) -> str:
         self._get_engine()
+        self.device_seen = "dml:0"
         return "dml:0"
 
     def predict(self, image_array: np.ndarray, **_kwargs: Any) -> list[dict[str, Any]]:
@@ -1127,6 +1137,21 @@ class OnnxDirectMLOcrRuntimeEngine:
 
 
 class ResilientRuntimeEngine:
+    @property
+    def device_seen(self) -> str:
+        # 透传实际生效引擎（主或 fallback）观测到的设备，供运行日志读取。
+        engine = self._fallback_engine or self._primary_engine
+        return str(getattr(engine, "device_seen", "") or "")
+
+    @property
+    def last_timings(self) -> dict[str, float]:
+        # 透传实际生效引擎的分段耗时（解码/纯推理 ms）。缺这个属性时
+        # getattr(engine, "last_timings") 在包装层上恒为 None，统计行的
+        # "子进程纯推理"字段永远出不来（曾长期掩盖真实推理水位）。
+        engine = self._fallback_engine or self._primary_engine
+        timings = getattr(engine, "last_timings", None)
+        return dict(timings) if isinstance(timings, dict) else {}
+
     def __init__(
         self,
         primary_engine: Any,
@@ -1169,14 +1194,61 @@ class ResilientRuntimeEngine:
             return fallback.predict(image_array, **kwargs)
 
 
+def _frame_write(stream, payload: bytes, blob: bytes = b"") -> None:
+    """二进制帧协议：[8B 头: json_len, bin_len][json][blob]。
+
+    图像以原始字节直走管道，不再 base64 塞进 JSON 行——3.6MB 字符串的
+    json.dumps/loads 与分块行传输实测占稳态单次耗时的一半以上。
+    """
+    stream.write(struct.pack("<II", len(payload), len(blob)))
+    if payload:
+        stream.write(payload)
+    if blob:
+        stream.write(blob)
+    stream.flush()
+
+
+def _read_exact(stream, count: int) -> bytes:
+    """从管道读满 count 字节（os.read 直读文件描述符）。
+
+    BufferedReader 的缓冲层在读端逐 8KB 填充且小读触发整块底层读，
+    响应方向实测引入数百毫秒级延迟；os.read 直读避免缓冲层二次调度。
+    """
+    chunks: list[bytes] = []
+    remaining = count
+    fd = stream.fileno()
+    while remaining > 0:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            raise EOFError("pipe closed")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 class SubprocessOcrRuntimeEngine:
+    # 子进程单次请求的等待上限：CPU 全图 OCR 可达数十秒，取宽裕值；
+    # 超时杀进程重启（模型重载），远好于无限挂死拖住全局引擎锁。
+    RESPONSE_TIMEOUT_SECONDS = 120.0
+    STDERR_TAIL_LINES = 30
+    # 共享内存传图：跨进程管道逐块搬运实测 ~250ms/MB（同进程仅 3.5ms/2.7MB，
+    # 慢在进程边界的内核调度），SHM 一次内存拷贝替代。块大小取对话
+    # scale=2 全幅上限再留余量；超限或 SHM 创建失败回退 blob 直传。
+    SHM_CAPACITY_BYTES = 16 * 1024 * 1024
+
     def __init__(self, *, backend: str, model_tier: str, manifest: RuntimeManifest, config: dict[str, Any]) -> None:
         self.backend = backend
         self.model_tier = model_tier
         self.manifest = manifest
         self.config = dict(config)
-        self._process: subprocess.Popen[str] | None = None
+        self._process: subprocess.Popen[bytes] | None = None
         self._lock = threading.RLock()
+        self.device_seen: str = ""
+        self.last_timings: dict[str, float] = {}
+        self._shm: Any = None
+        self._shm_failed = False
+        self._response_queue: "queue.Queue[bytes | None]" = queue.Queue()
+        self._stderr_tail: "deque[str]" = deque(maxlen=self.STDERR_TAIL_LINES)
 
     def _runtime_python_path(self) -> Path:
         root = _package_root()
@@ -1186,6 +1258,11 @@ class SubprocessOcrRuntimeEngine:
         state_python = _state_runtime_python(load_installed_runtime_state(root), self.backend)
         if state_python is not None:
             return state_python
+        if not getattr(sys, "frozen", False):
+            # 开发机源码运行：engine/ 运行时不随仓库，主进程解释器本身
+            # 装有 paddle（inprocess 模式同依赖），直接复用，保证子进程
+            # 路径在开发机上可跑（否则与客户机行为脱节，优化无法本地复现）。
+            return Path(sys.executable)
         raise RuntimeError(f"Missing OCR runtime python for backend: {self.backend}")
 
     def _subprocess_config(self) -> dict[str, Any]:
@@ -1214,11 +1291,16 @@ class SubprocessOcrRuntimeEngine:
             return self._process
         root = _package_root()
         python_exe = self._runtime_python_path()
+        # 入口优先 .py（源码/全量布局）：根目录若残留旧 .pyc，直接执行会
+        # 跑过期代码；打包引擎桥（仅 .pyc）布局再回退 .pyc。
+        entry_path = root / "ocr_subprocess_entry.py"
+        if not entry_path.is_file():
+            entry_path = root / "ocr_subprocess_entry.pyc"
         command = [
             str(python_exe),
             "-s",
             "-u",
-            str(root / "ocr_subprocess_entry.pyc"),
+            str(entry_path),
             "--root",
             str(root),
             "--backend",
@@ -1265,27 +1347,72 @@ class SubprocessOcrRuntimeEngine:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
             env=env,
             startupinfo=startupinfo,
             creationflags=creationflags,
         )
+        # 每代进程配全新响应队列，避免旧进程残留响应污染新会话。
+        self._response_queue = queue.Queue()
+        self._start_pipe_workers(self._process)
         return self._process
 
-    def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _start_pipe_workers(self, process: subprocess.Popen[bytes]) -> None:
+        """stdout reader + stderr 排空两个常驻 daemon 线程。
+
+        Paddle/PaddleX 运行时会向 stderr 打日志；Windows 管道缓冲仅
+        4-8KB，无人消费时子进程会阻塞在 stderr 写上、不再产出 stdout
+        响应，主进程 readline 挂死且持有全局引擎锁——所有设备 OCR
+        一起排队停摆。排空线程持续消费 stderr（保留尾部若干行供报错），
+        reader 线程让 _request 可以带超时等待。
+        """
+
+        def read_stdout() -> None:
+            try:
+                while True:
+                    if process.stdout is None:
+                        break
+                    header = _read_exact(process.stdout, 8)
+                    json_len, blob_len = struct.unpack("<II", header)
+                    json_bytes = _read_exact(process.stdout, json_len)
+                    if blob_len:
+                        _read_exact(process.stdout, blob_len)  # 响应不带 blob，防御性丢弃
+                    self._response_queue.put(json_bytes)
+            except Exception:
+                pass
+            finally:
+                self._response_queue.put(None)
+
+        def drain_stderr() -> None:
+            try:
+                while True:
+                    raw = process.stderr.readline() if process.stderr else b""
+                    if not raw:
+                        break
+                    self._stderr_tail.append(raw.decode("utf-8", "replace"))
+            except Exception:
+                pass
+
+        threading.Thread(target=read_stdout, name="ocr-sub-stdout", daemon=True).start()
+        threading.Thread(target=drain_stderr, name="ocr-sub-stderr", daemon=True).start()
+
+    def _request(self, payload: dict[str, Any], blob: bytes = b"") -> dict[str, Any]:
         with self._lock:
             process = self._start_process()
-            if process.stdin is None or process.stdout is None:
+            if process.stdin is None:
                 raise RuntimeError("OCR subprocess pipes are unavailable.")
-            process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            process.stdin.flush()
-            line = process.stdout.readline()
-            if not line:
-                stderr_output = ""
-                if process.stderr is not None:
-                    stderr_output = process.stderr.read().strip()
+            _frame_write(process.stdin, json.dumps(payload, ensure_ascii=False).encode("utf-8"), blob)
+            try:
+                line = self._response_queue.get(timeout=self.RESPONSE_TIMEOUT_SECONDS)
+            except queue.Empty:
+                # 不再无限挂死：杀进程（下次调用自动重启重载模型），
+                # 全局引擎锁随之释放，其他设备可继续。
+                self.close()
+                tail = "".join(list(self._stderr_tail)[-5:]).strip()
+                raise TimeoutError(
+                    f"OCR subprocess did not respond within {self.RESPONSE_TIMEOUT_SECONDS:.0f}s. {tail}"
+                ) from None
+            if line is None:
+                stderr_output = "".join(list(self._stderr_tail)[-10:]).strip()
                 self.close()
                 raise RuntimeError(f"OCR subprocess exited unexpectedly. {stderr_output}".strip())
             try:
@@ -1299,39 +1426,79 @@ class SubprocessOcrRuntimeEngine:
             if not bool(response.get("ok", False)):
                 self.close()
                 raise RuntimeError(str(response.get("error", "OCR subprocess request failed.")))
+            # predict 响应顺带实际设备与子进程内部分段耗时，记录供观测。
+            device_seen = str(response.get("device", "") or "").strip()
+            if device_seen:
+                self.device_seen = device_seen
+            timings = response.get("timings")
+            if isinstance(timings, dict):
+                self.last_timings = dict(timings)
             return response
 
     def preload(self) -> str:
         response = self._request({"action": "preload"})
-        return str(response.get("device", "") or "")
+        device = str(response.get("device", "") or "")
+        # 记录子进程实际生效的设备，供运行观测日志读取。
+        self.device_seen = device
+        return device
 
     def predict(self, image_array: np.ndarray, **_kwargs: Any) -> list[dict[str, Any]]:
-        root = _package_root()
-        temp_dir = root / "runtime" / "tmp" / "ocr_requests"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        temp_path: str | None = None
+        # 图像走共享内存：主进程写入复用块（一次内存拷贝），帧里只传块名
+        # 与字节数——跨进程管道逐块搬运的 ~250ms/MB 调度税整体绕开。
+        # 超容量或 SHM 不可用时回退 blob 直传（帧协议不变，两端兼容）。
+        contiguous = np.ascontiguousarray(image_array)
+        payload = {
+            "action": "predict",
+            "shape": [int(dim) for dim in contiguous.shape],
+        }
+        blob = contiguous.tobytes()
+        shm = self._usable_shm(len(blob))
+        if shm is not None:
+            shm.buf[: len(blob)] = blob
+            payload["shm_name"] = shm.name
+            payload["size"] = len(blob)
+            blob = b""
+        response = self._request(payload, blob=blob)
+        result = response.get("result", [])
+        return result if isinstance(result, list) else []
+
+    def _usable_shm(self, size: int) -> Any:
+        if self._shm_failed or size > self.SHM_CAPACITY_BYTES:
+            return None
+        if self._shm is not None:
+            return self._shm
         try:
-            with tempfile.NamedTemporaryFile(prefix="ocr_", suffix=".npy", dir=temp_dir, delete=False) as handle:
-                temp_path = handle.name
-            np.save(temp_path, np.ascontiguousarray(image_array))
-            response = self._request({"action": "predict", "image_path": temp_path})
-            result = response.get("result", [])
-            return result if isinstance(result, list) else []
-        finally:
-            if temp_path:
-                with contextlib.suppress(OSError):
-                    Path(temp_path).unlink()
+            from multiprocessing import shared_memory
+
+            # 名字带主进程 pid：主进程退出后 Windows 句柄机制自动回收，
+            # 不依赖 unlink；子进程重启后按名重新 attach 即可。
+            self._shm = shared_memory.SharedMemory(
+                create=True,
+                size=self.SHM_CAPACITY_BYTES,
+                name=f"jixiebi_ocr_{os.getpid()}",
+            )
+            return self._shm
+        except Exception:
+            self._shm_failed = True
+            return None
 
     def close(self) -> None:
         with self._lock:
             process = self._process
             self._process = None
+            shm = self._shm
+            self._shm = None
+            if shm is not None:
+                try:
+                    shm.close()
+                    shm.unlink()
+                except Exception:
+                    pass
             if process is None:
                 return
             try:
                 if process.poll() is None and process.stdin is not None and process.stdout is not None:
-                    process.stdin.write(json.dumps({"action": "shutdown"}) + "\n")
-                    process.stdin.flush()
+                    _frame_write(process.stdin, json.dumps({"action": "shutdown"}).encode("utf-8"))
             except OSError:
                 pass
             with contextlib.suppress(Exception):
@@ -1376,7 +1543,10 @@ def _effective_execution_mode(config: dict[str, Any]) -> str:
     if getattr(sys, "frozen", False) and (has_packaged_runtime_layout(root) or has_ocr_runtime):
         return "subprocess"
     manifest_mode = _manifest_execution_mode(root)
-    if manifest_mode != "auto" and has_ocr_runtime:
+    if manifest_mode != "auto" and (has_ocr_runtime or not getattr(sys, "frozen", False)):
+        # 源码运行（开发机）没有 engine/ 目录也要跟随 manifest：否则开发机
+        # 退回 inprocess，与客户机的子进程路径不一致，性能与观测字段都
+        # 无法在开发机上复现。
         return manifest_mode
     return "inprocess"
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import threading
+from collections import OrderedDict
 from datetime import datetime
 from hashlib import blake2b
 from io import BytesIO
@@ -13,6 +16,40 @@ from PIL import Image
 
 ImageInput = bytes | bytearray | str | Path | Image.Image | np.ndarray
 Region = Sequence[float]
+
+# 文件图片解码缓存（模板 jpg 每次匹配重复解码是纯浪费）：
+# 键 = (路径, mtime_ns, size)，值为只读 BGR ndarray。模板文件被替换时
+# mtime 变化自动失效；罕见格式（cv2 解不了）不缓存，回退 PIL 原路径。
+_FILE_DECODE_CACHE_LIMIT = 256
+_FILE_DECODE_CACHE: "OrderedDict[tuple[str, int, int], np.ndarray]" = OrderedDict()
+_FILE_DECODE_LOCK = threading.Lock()
+
+
+def _decode_file_cached(path_text: str) -> np.ndarray | None:
+    try:
+        stat = os.stat(path_text)
+        key = (path_text, stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+    with _FILE_DECODE_LOCK:
+        cached = _FILE_DECODE_CACHE.get(key)
+        if cached is not None:
+            _FILE_DECODE_CACHE.move_to_end(key)
+            return cached
+    try:
+        data = Path(path_text).read_bytes()
+    except OSError:
+        return None
+    decoded = _decode_bytes_to_bgr(data)
+    if decoded is None:
+        return None
+    decoded.setflags(write=False)
+    with _FILE_DECODE_LOCK:
+        _FILE_DECODE_CACHE[key] = decoded
+        _FILE_DECODE_CACHE.move_to_end(key)
+        while len(_FILE_DECODE_CACHE) > _FILE_DECODE_CACHE_LIMIT:
+            _FILE_DECODE_CACHE.popitem(last=False)
+    return decoded
 
 
 def _decode_bytes_to_bgr(data: bytes | bytearray) -> np.ndarray | None:
@@ -92,6 +129,10 @@ def load_image(image: ImageInput) -> Image.Image:
             if decoded is not None:
                 return Image.fromarray(cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB))
             return Image.open(BytesIO(image)).convert("RGB")
+        if isinstance(image, (str, Path)):
+            decoded = _decode_file_cached(str(image))
+            if decoded is not None:
+                return Image.fromarray(cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB))
         return Image.open(Path(image)).convert("RGB")
     except Exception as exc:
         source = describe_image_input(image)
@@ -124,6 +165,10 @@ def to_cv2(image: ImageInput) -> np.ndarray:
         return image
     if isinstance(image, (bytes, bytearray)):
         decoded = _decode_bytes_to_bgr(image)
+        if decoded is not None:
+            return decoded
+    if isinstance(image, (str, Path)):
+        decoded = _decode_file_cached(str(image))
         if decoded is not None:
             return decoded
     pil_image = load_image(image)
