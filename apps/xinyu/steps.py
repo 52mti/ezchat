@@ -1319,15 +1319,53 @@ def _bottom_nav_strip_region(config: dict[str, Any]) -> list[float]:
     return [0.0, top, 1.0, min(1.0, 1.0 - top)]
 
 
+def _list_top_strip_region(config: dict[str, Any]) -> list[float] | None:
+    """列表顶部条带：只覆盖最上面几行会话 + 「未回复」Tab 带。
+
+    选目标本就是取最上方带角标的行——批量打招呼场景（全列表角标）条带
+    必命中，把每轮主扫描从全列表（30+ 条文字 ~1.5s+）压到 ~10 条文字
+    （~0.5s）。未命中（顶部无未读）回落既有 compact/全量链，下方未读
+    不漏。档位对齐与 compact 同口径，保持引擎形状稳定。
+    """
+    if not _optimization_enabled(config, "enable_list_top_strip_scan"):
+        return None
+    bottom = float(config.get("list_top_strip_bottom", 0.35) or 0.35)
+    bucket = float(config.get("list_compact_region_bucket", 0.05) or 0)
+    top = 0.05
+    if bucket > 0:
+        top = math.floor(top / bucket) * bucket
+        bottom = min(0.9, math.ceil(bottom / bucket) * bucket)
+    if bottom - top < 0.1:
+        return None
+    return [0.0, top, 1.0, bottom - top]
+
+
 def _run_list_ocr(
     image: Any,
     config: dict[str, Any],
     *,
     reporter: Reporter | None = None,
     prefer_compact: bool = False,
+    allow_top_strip: bool = False,
 ) -> dict[str, Any]:
     """列表 OCR：条带覆盖「未回复」Tab 带，有行即返回（不依赖导航缓存
     合并，不再"同帧门槛失败→回退全屏"每轮双 OCR）；Tab 位置永远来自当前帧。"""
+    if allow_top_strip:
+        strip_region = _list_top_strip_region(config)
+        if strip_region is not None:
+            strip_result = _run_ocr_mode(image, config, "list", region=strip_region)
+            strip_rows = strip_result.get("result", {}).get("message_list", [])
+            if isinstance(strip_rows, list) and strip_rows and (
+                _select_list_target_from_rows(strip_rows, require_unread=True) is not None
+            ):
+                _report(
+                    reporter,
+                    "list_ocr_region",
+                    "顶部条带命中未读",
+                    log_label="使用列表顶部条带 OCR（未读命中，跳过全列表）",
+                )
+                return strip_result
+            _report(reporter, "list_ocr_region", "顶部条带未命中未读，回落列表主体")
     compact_region = _list_compact_region(config)
     if compact_region is not None:
         compact_result = _run_ocr_mode(image, config, "list", region=compact_region)
@@ -2055,7 +2093,7 @@ def check_unread_button(
     )
     time.sleep(0.4)
     current_image = capture_after_popups(robot, cfg, label="after_unread_button", reporter=reporter)
-    ocr_result = _run_list_ocr(current_image, cfg, reporter=reporter, prefer_compact=True)
+    ocr_result = _run_list_ocr(current_image, cfg, reporter=reporter, prefer_compact=True, allow_top_strip=True)
     unread_target = _select_list_target_from_ocr_result(ocr_result, require_unread=True)
     unread_item = _unread_tab_item(ocr_result)
     if unread_item is None:

@@ -767,7 +767,8 @@ def test_xinyu_unreplied_filter_clicks_when_no_red(monkeypatch, tmp_path):
 
     assert image == "after"
     assert robot.clicks == [pytest.approx((0.3, 0.15))]
-    assert ocr_calls == ["list", "after"]
+    # 顶部条带快路径：重扫先条带、未命中未读再回落——无未读轮次多一次小扫描
+    assert ocr_calls == ["list", "after", "after"]
 
 
 def test_xinyu_unreplied_filter_does_not_click_when_red(monkeypatch, tmp_path):
@@ -2323,3 +2324,93 @@ def test_xinyu_bottom_nav_scans_use_strip_region(monkeypatch):
     # 主扫描保持全量
     result = steps_module._run_list_ocr(None, {"enable_compact_list_ocr_region": False})
     assert captured[-1] is None
+
+
+def test_xinyu_list_top_strip_hits_unread_and_skips_full_scan(monkeypatch):
+    """顶部条带快路径：条带内已有带角标目标时直接返回，不再扫 compact/
+    全量——批量打招呼场景（全列表角标）每轮主扫描 30+ 条文字 → ~10 条。"""
+    import apps.xinyu.steps as steps_module
+
+    calls: list[list[float] | None] = []
+
+    def fake_run_ocr_mode(image, config, mode, region=None, **kwargs):
+        calls.append(region)
+        if region is not None and region[1] < 0.1:  # 顶部条带
+            return {
+                "result": {
+                    "message_list": [
+                        {"name": "小明", "unread_count": 1, "content": "你好", "bounds": [0.1, 0.12, 0.9, 0.2]},
+                    ]
+                }
+            }
+        return {
+            "result": {
+                "message_list": [
+                    {"name": "小明", "unread_count": 1, "content": "你好", "bounds": [0.1, 0.12, 0.9, 0.2]},
+                    {"name": "小红", "unread_count": 2, "content": "在吗", "bounds": [0.1, 0.5, 0.9, 0.58]},
+                ]
+            }
+        }
+
+    monkeypatch.setattr(steps_module, "_run_ocr_mode", fake_run_ocr_mode)
+
+    result = steps_module._run_list_ocr("img", {}, prefer_compact=True, allow_top_strip=True)
+
+    assert len(calls) == 1  # 只有条带一次，无 compact/全量
+    assert calls[0] == pytest.approx([0.0, 0.05, 1.0, 0.3])
+    assert [row["name"] for row in result["result"]["message_list"]] == ["小明"]
+
+
+def test_xinyu_list_top_strip_miss_falls_back_to_full_scan(monkeypatch):
+    """条带未命中未读（顶部全已读）→ 回落既有链路，列表深处的未读不漏。"""
+    import apps.xinyu.steps as steps_module
+
+    calls: list[list[float] | None] = []
+
+    def fake_run_ocr_mode(image, config, mode, region=None, **kwargs):
+        calls.append(region)
+        if region is not None and region[1] < 0.1:
+            return {
+                "result": {
+                    "message_list": [
+                        {"name": "已读君", "unread_count": None, "content": "", "bounds": [0.1, 0.12, 0.9, 0.2]},
+                    ]
+                }
+            }
+        return {
+            "result": {
+                "message_list": [
+                    {"name": "深处未读", "unread_count": 1, "content": "救我", "bounds": [0.1, 0.6, 0.9, 0.68]},
+                ]
+            }
+        }
+
+    monkeypatch.setattr(steps_module, "_run_ocr_mode", fake_run_ocr_mode)
+
+    result = steps_module._run_list_ocr(
+        "img", {"enable_compact_list_ocr_region": False}, allow_top_strip=True
+    )
+
+    assert calls[0] is not None and calls[0][1] < 0.1  # 条带先扫
+    assert calls[1] is None  # 全量兜底
+    assert result["result"]["message_list"][0]["name"] == "深处未读"
+
+
+def test_xinyu_list_top_strip_disabled_keeps_legacy_chain(monkeypatch):
+    import apps.xinyu.steps as steps_module
+
+    calls: list[list[float] | None] = []
+
+    def fake_run_ocr_mode(image, config, mode, region=None, **kwargs):
+        calls.append(region)
+        return {"result": {"message_list": []}}
+
+    monkeypatch.setattr(steps_module, "_run_ocr_mode", fake_run_ocr_mode)
+
+    steps_module._run_list_ocr(
+        "img",
+        {"enable_list_top_strip_scan": False, "enable_compact_list_ocr_region": False},
+        allow_top_strip=True,
+    )
+
+    assert calls == [None]  # 开关关闭直接全量
