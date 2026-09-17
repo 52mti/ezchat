@@ -181,7 +181,7 @@ class DeviceWorker(threading.Thread):
             engine_pool_size = int(global_config.get("ocr_engine_pool_size", 2) or 2)
         except (TypeError, ValueError):
             engine_pool_size = 2
-        engine_pool_size = min(8, max(1, engine_pool_size))
+        engine_pool_size = min(16, max(1, engine_pool_size))
         ocr_config = self.app_config.setdefault("ocr", {})
         if not ocr_config.get("ocr_engine_pool_size"):
             ocr_config["ocr_engine_pool_size"] = engine_pool_size
@@ -334,7 +334,7 @@ class DeviceWorker(threading.Thread):
             engine_pool_size = int(global_config.get("ocr_engine_pool_size", 2) or 2)
         except (TypeError, ValueError):
             engine_pool_size = 2
-        engine_pool_size = min(8, max(1, engine_pool_size))
+        engine_pool_size = min(16, max(1, engine_pool_size))
         ocr_config = fresh.setdefault("ocr", {})
         if not ocr_config.get("ocr_engine_pool_size"):
             ocr_config["ocr_engine_pool_size"] = engine_pool_size
@@ -704,8 +704,16 @@ class DeviceWorker(threading.Thread):
                 mode_config = ocr_modes.get(mode_key)
                 if not isinstance(mode_config, dict) or not mode_config:
                     continue
+                first_engine = None
                 for lane in range(engine_pool_size_for(mode_config)):
-                    get_pooled_runtime_engine(mode_config, lane=lane).preload()
+                    engine = get_pooled_runtime_engine(mode_config, lane=lane)
+                    if lane > 0 and engine is first_engine:
+                        # 该车道实例创建失败已降级共享 0 号（引擎侧已留痕），
+                        # 继续往后预热只会重复空试创建，就此打住。
+                        break
+                    engine.preload()
+                    if lane == 0:
+                        first_engine = engine
                 break  # 两模式引擎键一致（backend/tier 同池），预热一份即全暖
         except Exception:
             pass

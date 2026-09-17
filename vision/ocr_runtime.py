@@ -1668,13 +1668,13 @@ _RUNTIME_ENGINE_RELEVANT_KEYS = {
 # 与设备数解耦；超过池大小的调用方在并发槽排队（车道模型）。CPU/DirectML
 # 多实例只会互相抢核，恒为 1。
 #
-# 上限按空闲显存自适应（探测一次缓存，进程内不再漂移——池缓存键含大小，
-# 漂移会裂出多个池）：cap = (空闲MB - 1GB 保留) / 1GB 每实例，绝对上限 8。
-# 8GB 卡空闲 ~6GB → cap 4；16GB 卡 → cap 8。探测失败回退保守 4。
-# 实例创建失败（显存被其他程序占用后不足）自动降级共享 0 号车道兜底。
+# 上限不强制：配置值即车道数，唯一硬顶是并发槽的 16。显存自适应
+# （adaptive_engine_pool_cap）只作 UI 提示建议值，不钳制配置——显存
+# 放不下时实例创建失败自动降级共享 0 号车道（日志留痕），不崩。
 _DEFAULT_GPU_ENGINE_POOL_SIZE = 2
 _FALLBACK_GPU_ENGINE_POOL_CAP = 4
-_ABSOLUTE_MAX_ENGINE_POOL_SIZE = 8
+_ABSOLUTE_MAX_ENGINE_POOL_SIZE = 16  # 配置硬顶：并发槽实现的自然天花板
+_ADAPTIVE_HINT_MAX_ENGINE_POOL = 8  # 建议值提示上限：再多只添噪（子进程开销）
 _ENGINE_INSTANCE_MB = 1024
 _ENGINE_POOL_VRAM_RESERVE_MB = 1024
 _POOLED_ENGINES: dict[str, list[Any]] = {}
@@ -1697,7 +1697,7 @@ def _probe_gpu_free_mb() -> int | None:
 
 
 def adaptive_engine_pool_cap() -> int:
-    """按空闲显存自适应的池上限（进程内缓存一次）。"""
+    """按空闲显存估算的建议池上限（仅作 UI 提示，不钳制配置；缓存一次）。"""
     global _ADAPTIVE_POOL_CAP_CACHE
     if _ADAPTIVE_POOL_CAP_CACHE is None:
         free_mb = _probe_gpu_free_mb()
@@ -1707,7 +1707,7 @@ def adaptive_engine_pool_cap() -> int:
             budget = free_mb - _ENGINE_POOL_VRAM_RESERVE_MB
             cap = budget // _ENGINE_INSTANCE_MB if budget > 0 else 0
             _ADAPTIVE_POOL_CAP_CACHE = min(
-                _ABSOLUTE_MAX_ENGINE_POOL_SIZE, max(1, int(cap))
+                _ADAPTIVE_HINT_MAX_ENGINE_POOL, max(1, int(cap))
             )
     return _ADAPTIVE_POOL_CAP_CACHE
 
@@ -1725,7 +1725,7 @@ def _engine_pool_size(config: dict[str, Any], backend: str) -> int:
             if value >= 1:
                 requested = value
                 break
-    return max(1, min(requested, adaptive_engine_pool_cap()))
+    return max(1, min(requested, _ABSOLUTE_MAX_ENGINE_POOL_SIZE))
 
 
 def engine_pool_size_for(config: dict[str, Any]) -> int:

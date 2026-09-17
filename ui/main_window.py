@@ -713,13 +713,13 @@ class MainWindow(QMainWindow):
         engine_pool_label = QLabel("引擎并发数")
         engine_pool_label.setToolTip(
             "OCR 引擎实例数（每台同时运行的设备占一条车道）。\n"
-            "建议设为同时运行的设备数；GPU 每实例约占 0.8GB 显存，CPU 后端固定单实例。\n"
-            "修改对下一轮生效（无需重启）。"
+            "建议设为同时运行的设备数；GPU 每实例约占 1GB 显存（当前显存建议不超过 "
+            f"{adaptive_engine_pool_cap()}），超出部分自动降级共享。\n"
+            "CPU 后端固定单实例；修改对下一轮生效（无需重启）。"
         )
         top_bar.addWidget(engine_pool_label)
         self.ocr_pool_size_input = NoWheelSpinBox()
-        # 上限按空闲显存自适应（探测失败回退 4）：8GB 卡 → 4，16GB 卡 → 8。
-        self.ocr_pool_size_input.setRange(1, adaptive_engine_pool_cap())
+        self.ocr_pool_size_input.setRange(1, 16)
         self.ocr_pool_size_input.setFixedWidth(72)
         self.ocr_pool_size_input.setValue(int(self.config_manager.get("global", "ocr_engine_pool_size", default=2) or 2))
         self.ocr_pool_size_input.valueChanged.connect(self._save_engine_pool_size)
@@ -1539,10 +1539,10 @@ class MainWindow(QMainWindow):
     def _save_engine_pool_size(self) -> None:
         """引擎并发数 → global.ocr_engine_pool_size，worker 每轮热刷新注入。
 
-        请求值经引擎侧按空闲显存自适应钳制（cap=(空闲-1GB)/1GB，绝对上限
-        8）；旧 global.ocr_max_concurrency 注入链已废弃——它作为显式并发
-        覆盖会把并发槽压回 1（默认值），强制全串行，曾长期抵消引擎池。"""
-        value = min(adaptive_engine_pool_cap(), max(1, int(self.ocr_pool_size_input.value() or 2)))
+        配置值即车道数（1~16，不按显存强制钳制——显存放不下的实例创建
+        失败会自动降级共享 0 号车道）；旧 global.ocr_max_concurrency 注入
+        链已废弃——它作为显式并发覆盖会把并发槽压回 1，曾长期抵消引擎池。"""
+        value = min(16, max(1, int(self.ocr_pool_size_input.value() or 2)))
         self.config_manager.set("global", "ocr_engine_pool_size", value=value)
 
     def _monitor_wall_devices_provider(self) -> list[dict[str, Any]]:

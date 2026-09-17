@@ -23,17 +23,13 @@ class _FakeEngine:
 
 
 def test_engine_pool_size_resolution(monkeypatch):
+    """上限不按显存强制钳制（用户决定）：配置值即车道数，唯一硬顶=并发槽 16。
+    显存不足由实例创建失败自动降级共享兜底，显存估算仅作 UI 提示。"""
     _use_backend(monkeypatch, "paddle_cuda")
-    monkeypatch.setattr(runtime_module, "adaptive_engine_pool_cap", lambda: 4)
     assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda"}) == 2
     assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 4}) == 4
-    # 自适应上限：请求值恒被空闲显存上限钳制（30 台设备显存也不越界）
-    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 30}) == 4
-    # 小显存卡（cap 2）：请求 4 只给 2；cap 1 时默认 2 也压到 1
-    monkeypatch.setattr(runtime_module, "adaptive_engine_pool_cap", lambda: 2)
-    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 4}) == 2
-    monkeypatch.setattr(runtime_module, "adaptive_engine_pool_cap", lambda: 1)
-    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda"}) == 1
+    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 10}) == 10
+    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 30}) == 16
     _use_backend(monkeypatch, "cpu")
     assert runtime_module.engine_pool_size_for({"backend": "cpu", "ocr_engine_pool_size": 4}) == 1
 
@@ -173,3 +169,38 @@ def test_ocr_max_concurrency_reads_backend_from_ocr_subtree(monkeypatch):
     # 两处都没有引擎键：传统路径保持串行
     assert ocr_module._ocr_max_concurrency({"ocr": {"det_db_thresh": 0.3}}) == 1
     assert ocr_module._ocr_max_concurrency({}) == 1
+
+
+def test_worker_preload_stops_after_degraded_lane(tmp_path, monkeypatch):
+    """车道创建失败降级共享后，预热不再往后空试（设 10 台时避免启动期
+    连续 9 次注定失败的创建尝试）。"""
+    from services.config_manager import ConfigManager
+    from workers.device_worker import DeviceWorker
+
+    class _SharedEngine:
+        def preload(self) -> str:
+            return "gpu:0"
+
+    shared = _SharedEngine()
+    warmed: list[int] = []
+
+    def fake_pool(config, lane=0):
+        warmed.append(lane)
+        return shared
+
+    import vision.ocr_runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "get_pooled_runtime_engine", fake_pool)
+    monkeypatch.setattr(runtime_mod, "engine_pool_size_for", lambda config: 3)
+
+    worker = DeviceWorker(
+        {"ip": "192.168.1.108", "selected_app": "xinyu"},
+        app_config={"poll_interval": 1, "ocr_modes": {"list": {"ocr_backend": "paddle_cuda"}}},
+        events=__import__("queue").Queue(),
+        config_manager=ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json"),
+        robot=object(),
+    )
+
+    worker._preload_ocr_engines()
+
+    # lane1 拿到的是 0 号共享实例（降级形态）→ 立即止损，不再尝试 lane2
+    assert warmed == [0, 1]
