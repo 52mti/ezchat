@@ -97,3 +97,36 @@ def test_ocr_max_concurrency_follows_pool_for_gpu(monkeypatch):
     assert ocr_module._ocr_max_concurrency({"backend": "paddle_cuda", "max_concurrency": 1}) == 1
     # 无运行时引擎键的传统路径保持串行
     assert ocr_module._ocr_max_concurrency({}) == 1
+
+
+def test_worker_preload_warms_all_pool_lanes(tmp_path, monkeypatch):
+    """worker 启动预热应暖齐池内全部车道（弱卡首加载 77~100s 从第一轮
+    挪到启动 runway），且与生产调用同池同实例。"""
+    from services.config_manager import ConfigManager
+    from workers.device_worker import DeviceWorker
+
+    warmed: list[int] = []
+
+    class _FakeEngine:
+        def preload(self) -> str:
+            return "gpu:0"
+
+    def fake_pool(config, lane=0):
+        warmed.append(lane)
+        return _FakeEngine()
+
+    import vision.ocr_runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "get_pooled_runtime_engine", fake_pool)
+    monkeypatch.setattr(runtime_mod, "engine_pool_size_for", lambda config: 2)
+
+    worker = DeviceWorker(
+        {"ip": "192.168.1.108", "selected_app": "xinyu"},
+        app_config={"poll_interval": 1, "ocr_modes": {"list": {"ocr_backend": "paddle_cuda"}}},
+        events=__import__("queue").Queue(),
+        config_manager=ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json"),
+        robot=object(),
+    )
+
+    worker._preload_ocr_engines()
+
+    assert sorted(warmed) == [0, 1]

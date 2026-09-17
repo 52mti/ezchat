@@ -683,8 +683,32 @@ class DeviceWorker(threading.Thread):
         )
         return status
 
+    def _preload_ocr_engines(self) -> None:
+        """启动期后台预热 OCR 引擎池（车道 0..N-1）。
+
+        弱显卡机器首引擎加载可达 77~100s，原先摊在第一轮 OCR 上；挪到
+        worker 启动 runway（绑 TTS/返回按钮预缓存等动作期间）并行烧掉。
+        与生产调用走同一 cache-key（同池同实例），不会多起子进程；预热
+        失败静默——首轮 OCR 会自行拉起，绝不因预热阻断启动。
+        """
+        try:
+            from vision.ocr_runtime import engine_pool_size_for, get_pooled_runtime_engine
+
+            ocr_modes = self.app_config.get("ocr_modes", {})
+            ocr_modes = ocr_modes if isinstance(ocr_modes, dict) else {}
+            for mode_key in ("list", "dialogue"):
+                mode_config = ocr_modes.get(mode_key)
+                if not isinstance(mode_config, dict) or not mode_config:
+                    continue
+                for lane in range(engine_pool_size_for(mode_config)):
+                    get_pooled_runtime_engine(mode_config, lane=lane).preload()
+                break  # 两模式引擎键一致（backend/tier 同池），预热一份即全暖
+        except Exception:
+            pass
+
     def run(self) -> None:
         self._emit("info", "started")
+        threading.Thread(target=self._preload_ocr_engines, name="ocr-engine-preload", daemon=True).start()
         try:
             poll_interval = float(self.app_config.get("poll_interval", 1) or 1)
             try:
