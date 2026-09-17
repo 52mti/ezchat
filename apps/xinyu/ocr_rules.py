@@ -16,6 +16,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from vision.ocr import OcrItem, ocr, ocr_serialization_slot
 from vision.screen import ImageInput, ensure_portrait_image, load_image
@@ -1368,6 +1369,7 @@ def build_list_result(
     enable_red_badge_detection = bool(rules.get("enable_red_badge_detection", True))
     left_badge_enable_ocr_fallback = bool(rules.get("left_badge_enable_ocr_fallback", True))
     left_badge_read_red_badge_number = bool(rules.get("left_badge_read_red_badge_number", True))
+    badge_position = str(rules["badge_position"]).strip().lower()
     bottom_nav = _build_bottom_nav_result(rule_items, image_size, rules)
     bottom_nav_names = [item["name"] for item in bottom_nav]
     if bool(rules.get("main_top_from_top_nav", False)):
@@ -1528,6 +1530,37 @@ def build_list_result(
     if current_row is not None:
         raw_rows.append(current_row)
 
+    # 批量角标读数（方案：全部行角标拼一张固定形状条带，一次 OCR 读回）。
+    # 红点 bounds 检测是纯 numpy 逐行预计算；OCR 读数一次覆盖全部行，
+    # 行内只是查表，彻底消除"每行一次变尺寸裁图 OCR + 逐形状调机"。
+    row_red_badge_bounds: dict[int, tuple[int, int, int, int]] = {}
+    if badge_position == "left" and enable_red_badge_detection and image_array is not None:
+        for badge_index in range(len(raw_rows)):
+            badge_bounds = _detect_red_badge_bounds(
+                image_array,
+                _row_detection_bounds(raw_rows, badge_index, image_width, image_height, rules),
+                image_width,
+                image_height,
+                rules,
+            )
+            if badge_bounds is not None:
+                row_red_badge_bounds[badge_index] = badge_bounds
+    row_badge_values: dict[int, int] = {}
+    if (
+        row_red_badge_bounds
+        and left_badge_read_red_badge_number
+        and ocr_config is not None
+        and source_image is not None
+    ):
+        row_badge_values = _read_badge_numbers_batch(
+            source_image,
+            row_red_badge_bounds,
+            image_size,
+            ocr_config,
+            max_unread_count,
+            rules,
+        )
+
     rows: list[dict[str, Any]] = []
     for index, row in enumerate(raw_rows):
         header_line = row["header_line"]
@@ -1621,15 +1654,10 @@ def build_list_result(
         row_text = "".join([name, content, *[line["left_text"] for line in row["content_lines"]]])
         suppress_unread_count = bool(find_keyword(row_text, unread_count_excluded_keywords))
         row_lines = [header_line, *row["content_lines"]]
+        row_left, row_top, row_right, detection_row_bottom = _row_detection_bounds(
+            raw_rows, index, image_width, image_height, rules
+        )
         next_top = raw_rows[index + 1]["header_line"]["min_y"] if index + 1 < len(raw_rows) else int(image_height * 0.93)
-        row_left = max(0, min(line["min_x"] for line in row_lines) - 16)
-        if "row_top_extra_top_ratio" in rules:
-            row_top_extra = int(round(image_height * float(rules["row_top_extra_top_ratio"])))
-        else:
-            row_top_extra = 12
-        row_top = max(0, header_line["min_y"] - row_top_extra)
-        row_right = min(image_width, max(max(line["max_x"] for line in row_lines) + 16, image_width - 32))
-        detection_row_bottom = min(image_height, max(row["last_max_y"] + 16, next_top - 12))
         content_bottom = row["last_max_y"] + 12
         minimum_bottom = header_line["max_y"] + 20
         next_limit = next_top - 8
@@ -1679,24 +1707,17 @@ def build_list_result(
                 value = _unread_count_from_text(item["text"], max_unread_count)
                 if value is not None:
                     unread_candidates.append(value)
-        left_red_badge_bounds: tuple[int, int, int, int] | None = None
+        # 红点 bounds 已在循环前批量检测（row_red_badge_bounds），这里只查表。
+        left_red_badge_bounds: tuple[int, int, int, int] | None = row_red_badge_bounds.get(index)
         if (
             badge_position == "left"
             and not suppress_unread_count
-            and enable_red_badge_detection
-            and image_array is not None
+            and left_red_badge_bounds is not None
+            and left_red_badge_force_default
         ):
-            left_red_badge_bounds = _detect_red_badge_bounds(
-                image_array,
-                (row_left, row_top, row_right, detection_row_bottom),
-                image_width,
-                image_height,
-                rules,
-            )
-            if left_red_badge_bounds is not None and left_red_badge_force_default:
-                default_unread_count = int(rules["badge_default_unread_count"])
-                if default_unread_count > 0:
-                    unread_candidates.append(default_unread_count)
+            default_unread_count = int(rules["badge_default_unread_count"])
+            if default_unread_count > 0:
+                unread_candidates.append(default_unread_count)
         if (
             badge_position != "left"
             and not unread_candidates
@@ -1734,6 +1755,14 @@ def build_list_result(
                 if value is not None:
                     unread_candidates.append(value)
                     break
+        # 批量条带读数结果查表（一次 OCR 覆盖全部行，取代逐行裁图读数）。
+        if (
+            badge_position == "left"
+            and not suppress_unread_count
+            and not unread_candidates
+            and index in row_badge_values
+        ):
+            unread_candidates.append(row_badge_values[index])
         if (
             badge_position == "left"
             and not unread_candidates
@@ -1753,36 +1782,20 @@ def build_list_result(
             )
             if value is not None:
                 unread_candidates.append(value)
+        # 红点检出但批量读数没读出来（数字被遮挡/识别失败）→ 维持原语义：
+        # 没有任何候选时记默认未读数。
         if (
             badge_position == "left"
             and not suppress_unread_count
             and enable_red_badge_detection
             and left_badge_read_red_badge_number
-            and image_array is not None
             and ocr_config is not None
+            and left_red_badge_bounds is not None
+            and not unread_candidates
         ):
-            badge_bounds = left_red_badge_bounds or _detect_red_badge_bounds(
-                image_array,
-                (row_left, row_top, row_right, detection_row_bottom),
-                image_width,
-                image_height,
-                rules,
-            )
-            if badge_bounds is not None:
-                value = _read_badge_number_from_crop(
-                    source_image,
-                    badge_bounds,
-                    image_size,
-                    ocr_config,
-                    max_unread_count,
-                    rules,
-                )
-                if value is not None:
-                    unread_candidates.append(value)
-                elif not unread_candidates:
-                    default_unread_count = int(rules["badge_default_unread_count"])
-                    if default_unread_count > 0:
-                        unread_candidates.append(default_unread_count)
+            default_unread_count = int(rules["badge_default_unread_count"])
+            if default_unread_count > 0:
+                unread_candidates.append(default_unread_count)
         if badge_position != "left" and not unread_candidates and ocr_config is not None and source_image is not None:
             value = _read_unread_number_from_row_strip(
                 source_image,
@@ -1824,6 +1837,101 @@ def build_list_result(
             }
         )
     return {"message_list": rows, "bottom_nav": bottom_nav, "debug": {"excluded": excluded_entries}}
+
+
+def _row_detection_bounds(
+    raw_rows: list[dict[str, Any]],
+    index: int,
+    image_width: int,
+    image_height: int,
+    rules: dict[str, Any],
+) -> tuple[int, int, int, int]:
+    """行的角标检测框（row_left/top/right + 到下一行头部的下界）。
+
+    批量角标读数的预计算与逐行处理必须共用同一套几何，抽成函数防漂移。
+    """
+    row = raw_rows[index]
+    header_line = row["header_line"]
+    row_lines = [header_line, *row["content_lines"]]
+    next_top = raw_rows[index + 1]["header_line"]["min_y"] if index + 1 < len(raw_rows) else int(image_height * 0.93)
+    if "row_top_extra_top_ratio" in rules:
+        row_top_extra = int(round(image_height * float(rules["row_top_extra_top_ratio"])))
+    else:
+        row_top_extra = 12
+    row_left = max(0, min(line["min_x"] for line in row_lines) - 16)
+    row_top = max(0, header_line["min_y"] - row_top_extra)
+    row_right = min(image_width, max(max(line["max_x"] for line in row_lines) + 16, image_width - 32))
+    detection_row_bottom = min(image_height, max(row["last_max_y"] + 16, next_top - 12))
+    return row_left, row_top, row_right, detection_row_bottom
+
+
+# 角标条带固定形状：任意行数/任意角标尺寸，送进引擎的图都是同一大小——
+# GPU 引擎只调机一次；行数超过每条格数时按同样形状分多条（次数=行数/12）。
+_BADGE_STRIP_CELL = 112
+_BADGE_STRIP_GAP = 16
+_BADGE_STRIP_CELLS = 12
+
+
+def _read_badge_numbers_batch(
+    source_image: ImageInput,
+    badge_bounds_by_row: dict[int, tuple[int, int, int, int]],
+    image_size: tuple[int, int],
+    base_ocr_config: dict[str, Any],
+    max_unread_count: int,
+    rules: dict[str, Any],
+) -> dict[int, int]:
+    """所有行的红点角标拼成一张固定尺寸条带图，一次 OCR 读回全部数字。
+
+    取代逐行 _read_badge_number_from_crop：批量打招呼场景每行都带角标，
+    逐行 6 倍放大的变尺寸裁图会把一次列表扫描放大成 1+N 次引擎调用且
+    逐形状调机（客户机曾 25 次/扫描）。返回 {行号: 未读数}，漏读的行
+    不在返回值里，走原有兜底链。
+    """
+    if not badge_bounds_by_row:
+        return {}
+    source = load_image(source_image).convert("RGB")
+    image_width, image_height = image_size
+    config = dict(base_ocr_config)
+    config.pop("region", None)
+    config["preprocess"] = "original"
+    config["scale"] = 1
+    config["rotate_to_portrait"] = False
+    values: dict[int, int] = {}
+    row_order = sorted(badge_bounds_by_row)
+    cell_stride = _BADGE_STRIP_CELL + _BADGE_STRIP_GAP
+    fit = _BADGE_STRIP_CELL - 8
+    for chunk_start in range(0, len(row_order), _BADGE_STRIP_CELLS):
+        chunk_rows = row_order[chunk_start : chunk_start + _BADGE_STRIP_CELLS]
+        strip = Image.new("RGB", (_BADGE_STRIP_CELL, cell_stride * _BADGE_STRIP_CELLS), "white")
+        for cell_index, row_index in enumerate(chunk_rows):
+            left, top, right, bottom = badge_bounds_by_row[row_index]
+            crop_left, crop_top = max(0, left), max(0, top)
+            crop_right, crop_bottom = min(image_width, right), min(image_height, bottom)
+            if crop_right <= crop_left or crop_bottom <= crop_top:
+                continue
+            crop = source.crop((crop_left, crop_top, crop_right, crop_bottom))
+            factor = min(fit / crop.width, fit / crop.height)
+            crop = crop.resize(
+                (max(1, round(crop.width * factor)), max(1, round(crop.height * factor))),
+                Image.LANCZOS,
+            )
+            paste_x = (_BADGE_STRIP_CELL - crop.width) // 2
+            paste_y = cell_index * cell_stride + (_BADGE_STRIP_CELL - crop.height) // 2
+            strip.paste(crop, (paste_x, paste_y))
+        best_by_cell: dict[int, tuple[int, float]] = {}
+        for item in ocr(strip, config):
+            cell_index = int((float(item["y"]) + float(item["h"]) / 2) // cell_stride)
+            if not 0 <= cell_index < len(chunk_rows):
+                continue
+            value = _unread_count_from_badge_text(str(item.get("text", "")), max_unread_count)
+            if value is None:
+                continue
+            confidence = float(item.get("confidence") or 0.0)
+            if cell_index not in best_by_cell or confidence > best_by_cell[cell_index][1]:
+                best_by_cell[cell_index] = (value, confidence)
+        for cell_index, (value, _confidence) in best_by_cell.items():
+            values[chunk_rows[cell_index]] = value
+    return values
 
 
 def _points_value_from_text(text: str, keywords: tuple[str, ...]) -> str | None:

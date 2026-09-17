@@ -284,9 +284,15 @@ def test_list_rules_support_xinyu_top_nav_and_left_badge_default_unread(monkeypa
         "_detect_red_badge_bounds",
         lambda *args, **kwargs: (32, 386, 52, 406),
     )
+    # 批量条带读数整体漏读（数字被遮挡等）→ 红点检出但无候选 → 记默认未读数。
     monkeypatch.setattr(
         xinyu_ocr_rules,
-        "_read_badge_number_from_crop",
+        "_read_badge_numbers_batch",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        xinyu_ocr_rules,
+        "_read_left_badge_number_from_row_crop",
         lambda *args, **kwargs: None,
     )
 
@@ -323,6 +329,9 @@ def test_list_rules_left_badge_does_not_default_unread_without_red_detection(mon
 
     monkeypatch.setattr(
         xinyu_ocr_rules, "_detect_red_badge_bounds", lambda *args, **kwargs: None)
+    # 行条兜底读数与本次断言无关（白图上也读不到数字），打桩避免真实引擎调用。
+    monkeypatch.setattr(
+        xinyu_ocr_rules, "_read_left_badge_number_from_row_crop", lambda *args, **kwargs: None)
 
     result = build_list_result(
         items,
@@ -488,3 +497,93 @@ def test_xinyu_list_rules_reject_name_beyond_right_boundary():
 
     assert [row["name"] for row in result["message_list"]] == ["validName"]
     assert result["message_list"][0]["content"] == "hello"
+
+
+def test_read_badge_numbers_batch_maps_cells_to_rows(monkeypatch):
+    """批量条带读数：全部角标拼一张固定尺寸图，一次 OCR 按格映射回行号；
+    行数超过每条格数时按同样形状分条。"""
+    calls: list[tuple[tuple[int, int], dict]] = []
+
+    def fake_ocr(image, config):
+        calls.append((image.size, dict(config)))
+        cell_stride = xinyu_ocr_rules._BADGE_STRIP_CELL + xinyu_ocr_rules._BADGE_STRIP_GAP
+        offset = (len(calls) - 1) * xinyu_ocr_rules._BADGE_STRIP_CELLS
+        items = []
+        for row_index in range(offset, min(offset + xinyu_ocr_rules._BADGE_STRIP_CELLS, 14)):
+            cell = row_index - offset
+            center_y = cell * cell_stride + 56
+            items.append({"text": "1", "x": 40, "y": center_y - 8, "w": 32, "h": 16, "confidence": 0.9})
+        if len(calls) == 1:
+            # 与格 1 同格的非数字噪声：置信度更高但不可解析，必须被忽略。
+            items.append({"text": "在线", "x": 20, "y": 200, "w": 60, "h": 16, "confidence": 0.95})
+        return items
+
+    monkeypatch.setattr(xinyu_ocr_rules, "ocr", fake_ocr)
+    source = Image.new("RGB", (681, 1498), "white")
+    bounds = {row: (10, 100 + row * 90, 30, 120 + row * 90) for row in range(14)}
+
+    values = xinyu_ocr_rules._read_badge_numbers_batch(
+        source,
+        bounds,
+        (681, 1498),
+        {"runtime_enabled": True, "preprocess": "original"},
+        99,
+        _xinyu_rules(),
+    )
+
+    assert sorted(values) == list(range(14))
+    assert all(value == 1 for value in values.values())
+    assert len(calls) == 2  # 14 行 → 12 + 2 分两条
+    cell_stride = xinyu_ocr_rules._BADGE_STRIP_CELL + xinyu_ocr_rules._BADGE_STRIP_GAP
+    assert {size for size, _config in calls} == {
+        (xinyu_ocr_rules._BADGE_STRIP_CELL, cell_stride * xinyu_ocr_rules._BADGE_STRIP_CELLS)
+    }
+    for _size, config in calls:
+        assert config["scale"] == 1
+        assert config["preprocess"] == "original"
+        assert "region" not in config
+
+
+def test_list_rules_left_badges_read_via_single_batch_ocr(monkeypatch):
+    """批量打招呼场景（每行都带角标）：一次列表扫描只产生一次批量角标 OCR；
+    逐行裁图读数与行条兜底不再触发，未读数来自批量结果。"""
+    items = []
+    for index in range(4):
+        y = 360 + index * 200
+        items.append(_item(f"用户{index}", 146, 260, y, y + 42))
+        items.append(_item("你好呀", 146, 320, y + 60, y + 94))
+    batch_calls: list[dict] = []
+    crop_calls: list[int] = []
+    row_crop_calls: list[int] = []
+
+    monkeypatch.setattr(xinyu_ocr_rules, "_detect_red_badge_bounds", lambda *args, **kwargs: (32, 400, 52, 420))
+
+    def fake_batch(source_image, badge_bounds_by_row, image_size, base_ocr_config, max_unread_count, rules):
+        batch_calls.append(dict(badge_bounds_by_row))
+        return {row: 1 for row in badge_bounds_by_row}
+
+    def fake_crop(*args, **kwargs):
+        crop_calls.append(1)
+        return None
+
+    def fake_row_crop(*args, **kwargs):
+        row_crop_calls.append(1)
+        return None
+
+    monkeypatch.setattr(xinyu_ocr_rules, "_read_badge_numbers_batch", fake_batch)
+    monkeypatch.setattr(xinyu_ocr_rules, "_read_badge_number_from_crop", fake_crop)
+    monkeypatch.setattr(xinyu_ocr_rules, "_read_left_badge_number_from_row_crop", fake_row_crop)
+
+    result = build_list_result(
+        items,
+        (681, 1498),
+        _xinyu_rules(min_box_height_ratio=0.01, badge_position="left"),
+        source_image=Image.new("RGB", (681, 1498), "white"),
+        ocr_config={"runtime_enabled": True, "preprocess": "original"},
+    )
+
+    assert len(batch_calls) == 1
+    assert len(batch_calls[0]) == 4
+    assert not crop_calls
+    assert not row_crop_calls
+    assert [row["unread_count"] for row in result["message_list"]] == [1, 1, 1, 1]
