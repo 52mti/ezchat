@@ -1303,6 +1303,22 @@ def _list_compact_region(config: dict[str, Any]) -> list[float] | None:
     return _valid_region(_cache_get(config, "ocr_regions", "list_compact"))
 
 
+def _bottom_nav_strip_region(config: dict[str, Any]) -> list[float]:
+    """底部导航条专用 OCR 区域：只扫屏幕底部导航带。
+
+    防熄屏/积分读取等只需要导航按钮位置的调用此前 region=None 全列表
+    扫描（3.3s/次 + 角标条带批处理），实际需要的只有底部 ~20% 的导航条
+    （~0.4s/次）。条带内只有导航词，会被分行阶段按 bottom_nav_line 排除，
+    不产生会话行，角标批处理自动跳过。
+    """
+    ratio = 0.8
+    mode_config = (config.get("ocr_modes") or {}).get("list")
+    if isinstance(mode_config, dict) and isinstance(mode_config.get("rules"), dict):
+        ratio = float(mode_config["rules"].get("bottom_nav_top_ratio", 0.8) or 0.8)
+    top = max(0.0, ratio - 0.02)
+    return [0.0, top, 1.0, min(1.0, 1.0 - top)]
+
+
 def _run_list_ocr(
     image: Any,
     config: dict[str, Any],
@@ -1679,7 +1695,7 @@ def _click_message_button(
         return True
     if image is not None:
         _report(reporter, "message_button_click", "消息按钮缓存不存在，执行一次 list OCR 查找")
-        ocr_result = _run_ocr_mode(image, config, "list", region=None)
+        ocr_result = _run_ocr_mode(image, config, "list", region=_bottom_nav_strip_region(config))
         _cache_bottom_nav_from_ocr_result(config, ocr_result)
         pos = _cached_point(config, "screen_anchors", "bottom_message")
         if pos is not None and pos[1] >= 0.5:
@@ -1725,7 +1741,7 @@ def _main_nav_ocr_result(
     reporter: Reporter | None = None,
 ) -> dict[str, Any] | None:
     """Return list OCR when the bottom navigation identifies the app home."""
-    ocr_result = _run_ocr_mode(image, config, "list", region=None)
+    ocr_result = _run_ocr_mode(image, config, "list", region=_bottom_nav_strip_region(config))
     result = ocr_result.get("result", {}) if isinstance(ocr_result, dict) else {}
     bottom_nav = result.get("bottom_nav", []) if isinstance(result, dict) else []
     if not isinstance(bottom_nav, list):
@@ -2173,7 +2189,7 @@ def keep_screen_awake(
         return True
 
     _report(reporter, "keep_awake_scan", "防熄屏扫描底部导航")
-    ocr_result = _run_ocr_mode(image, cfg, "list", region=None)
+    ocr_result = _run_ocr_mode(image, cfg, "list", region=_bottom_nav_strip_region(cfg))
     _cache_bottom_nav_from_ocr_result(cfg, ocr_result)
     bottom_nav = ocr_result["result"].get("bottom_nav", [])
     message = _cached_point(cfg, "screen_anchors", "bottom_message")
@@ -2212,7 +2228,7 @@ def read_my_points(
     if already_my:
         _report(reporter, "points_open_my", "当前已在我的界面，直接读取积分")
         _report(reporter, "points_scan_bottom_nav", "积分读取前扫描底部导航")
-        nav_ocr = _run_ocr_mode(image, cfg, "list", region=None)
+        nav_ocr = _run_ocr_mode(image, cfg, "list", region=_bottom_nav_strip_region(cfg))
         _cache_bottom_nav_from_ocr_result(cfg, nav_ocr)
         _cache_message_from_cached_my(cfg, _cached_point(cfg, "screen_anchors", "bottom_my"))
         _raise_if_black_screen(image, cfg)
@@ -2249,7 +2265,7 @@ def read_my_points(
         )
     if pos is None:
         _report(reporter, "points_scan_bottom_nav", "积分读取前扫描底部导航")
-        ocr_result = _run_ocr_mode(image, cfg, "list", region=None)
+        ocr_result = _run_ocr_mode(image, cfg, "list", region=_bottom_nav_strip_region(cfg))
         _cache_bottom_nav_from_ocr_result(cfg, ocr_result)
         bottom_nav = ocr_result.get("result", {}).get("bottom_nav", [])
         pos = _cached_point(cfg, "screen_anchors", "bottom_my")

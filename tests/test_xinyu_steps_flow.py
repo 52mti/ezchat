@@ -2278,3 +2278,48 @@ def test_xinyu_play_voice_reply_reclicks_microphone_when_tts_fails(monkeypatch, 
     assert config["_runtime_cache"]["metrics"]["microphone_template"] == "btn_麦克风按钮.jpg"
     assert config["_runtime_cache"]["metrics"]["tts_success"] is True
     assert config["_runtime_cache"]["metrics"]["tts_retry_count"] == 1
+
+
+def test_xinyu_bottom_nav_scans_use_strip_region(monkeypatch):
+    """防熄屏/导航定位不再付全列表扫描：导航用途的 list OCR 必须用底部
+    条带区域（~0.4s），只有主扫描保持全量（region=None）。"""
+    import apps.xinyu.steps as steps_module
+
+    captured: list[list[float] | None] = []
+
+    def fake_run_ocr_mode(image, config, mode, region=None, **kwargs):
+        captured.append(region)
+        return {
+            "result": {
+                "bottom_nav": [
+                    {"name": "消息", "center": (0.18, 0.93), "bounds": [0.10, 0.90, 0.28, 0.07]},
+                    {"name": "我的", "center": (0.86, 0.93), "bounds": [0.78, 0.90, 0.94, 0.07]},
+                ],
+                "message_list": [],
+            }
+        }
+
+    monkeypatch.setattr(steps_module, "_run_ocr_mode", fake_run_ocr_mode)
+
+    strip = steps_module._bottom_nav_strip_region({})
+    assert strip == pytest.approx([0.0, 0.78, 1.0, 0.22])
+    assert steps_module._bottom_nav_strip_region(
+        {"ocr_modes": {"list": {"rules": {"bottom_nav_top_ratio": 0.85}}}}
+    ) == pytest.approx([0.0, 0.83, 1.0, 0.17])
+
+    monkeypatch.setattr(
+        steps_module, "ensure_list_screen",
+        lambda robot, config, reporter=None: "fake_list_screen",
+    )
+
+    class _Robot:
+        def move_click(self, x, y):
+            pass
+
+    # 防熄屏走条带
+    steps_module.keep_screen_awake(_Robot(), {"keep_awake_interval_seconds": 0})
+    assert captured[-1] is not None and captured[-1][1] >= 0.7, captured[-1]
+
+    # 主扫描保持全量
+    result = steps_module._run_list_ocr(None, {"enable_compact_list_ocr_region": False})
+    assert captured[-1] is None
