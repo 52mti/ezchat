@@ -130,3 +130,19 @@ def test_worker_preload_warms_all_pool_lanes(tmp_path, monkeypatch):
     worker._preload_ocr_engines()
 
     assert sorted(warmed) == [0, 1]
+
+
+def test_ocr_max_concurrency_reads_backend_from_ocr_subtree(monkeypatch):
+    """回归（20260917 开发机实测排队未消）：生产调用链里 backend/model_tier
+    在 config["ocr"] 子树，模式级并发槽拿的是整个 app config——顶层漏看
+    子树会让槽恒为 1，引擎池永远接不上。"""
+    import vision.ocr_runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "engine_pool_size_for", lambda config: 2)
+
+    assert ocr_module._ocr_max_concurrency({"ocr": {"backend": "paddle_cuda"}}) == 2
+    assert ocr_module._ocr_max_concurrency({"ocr": {"model_tier": "lite"}}) == 2
+    # 顶层键仍然生效
+    assert ocr_module._ocr_max_concurrency({"backend": "paddle_cuda"}) == 2
+    # 两处都没有引擎键：传统路径保持串行
+    assert ocr_module._ocr_max_concurrency({"ocr": {"det_db_thresh": 0.3}}) == 1
+    assert ocr_module._ocr_max_concurrency({}) == 1

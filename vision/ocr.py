@@ -211,11 +211,16 @@ def _ocr_max_concurrency(config: dict[str, Any]) -> int:
         return min(16, max(1, value))
     # 未显式配置：GPU 运行时引擎默认并发随池大小（车道=引擎实例，见
     # get_pooled_runtime_engine）；CPU/DirectML 与传统进程内路径保持串行。
-    if config.get("backend") or config.get("ocr_backend") or config.get("model_tier") or config.get("modelTier"):
+    # 引擎键可能位于 config["ocr"] 子树（生产调用链：run_ocr_mode 收整个
+    # app config，backend/model_tier 在 ocr 子树里）——顶层和子树都要看，
+    # 否则模式级槽恒为 1，引擎池永远接不上（20260917 开发机实测排队未消）。
+    ocr_subtree = config.get("ocr") if isinstance(config.get("ocr"), dict) else {}
+    probe = {**ocr_subtree, **{key: config[key] for key in ("backend", "ocr_backend", "model_tier", "modelTier") if key in config}}
+    if probe.get("backend") or probe.get("ocr_backend") or probe.get("model_tier") or probe.get("modelTier"):
         from .ocr_runtime import engine_pool_size_for
 
         try:
-            return min(16, max(1, engine_pool_size_for(config)))
+            return min(16, max(1, engine_pool_size_for(probe)))
         except Exception:
             return 1
     return 1
