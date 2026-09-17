@@ -134,6 +134,8 @@ def test_subprocess_runtime_start_uses_backend_env_and_cache_home(tmp_path, monk
     monkeypatch.setattr(runtime_module, "_runtime_state_path", lambda project_root=None: state_path)
     monkeypatch.setattr(runtime_module, "_package_root", lambda project_root=None: tmp_path)
     monkeypatch.setattr(runtime_module, "runtime_python", lambda root, runtime_name, gui=False: runtime_python)
+    # 固定自适应 fraction，避免 _start_process 内部触发 nvidia-smi 探测子进程
+    monkeypatch.setattr(runtime_module, "_adaptive_gpu_memory_fraction", lambda: "0.156")
     monkeypatch.setattr(runtime_module.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(runtime_module.subprocess, "STARTUPINFO", lambda: type("StartupInfo", (), {"dwFlags": 0})())
     monkeypatch.setattr(runtime_module.subprocess, "STARTF_USESHOWWINDOW", 1, raising=False)
@@ -153,7 +155,7 @@ def test_subprocess_runtime_start_uses_backend_env_and_cache_home(tmp_path, monk
     assert env["PADDLE_PDX_CACHE_HOME"] == str(cache_home)
     assert env["PADDLEX_HOME"] == str(cache_home)
     assert env["FLAGS_allocator_strategy"] == "auto_growth"
-    assert env["FLAGS_fraction_of_gpu_memory_to_use"] == "0.6"
+    assert env["FLAGS_fraction_of_gpu_memory_to_use"] == "0.156"
     assert env["PYTHONNOUSERSITE"] == "1"
     assert str(runtime_python.parent) in env["PATH"]
     assert str(scripts_dir) in env["PATH"]
@@ -196,6 +198,7 @@ def test_subprocess_runtime_ignores_packaging_staging_cache_home(tmp_path, monke
     monkeypatch.setattr(runtime_module, "_runtime_state_path", lambda project_root=None: state_path)
     monkeypatch.setattr(runtime_module, "_package_root", lambda project_root=None: tmp_path)
     monkeypatch.setattr(runtime_module, "runtime_python", lambda root, runtime_name, gui=False: runtime_python)
+    monkeypatch.setattr(runtime_module, "_adaptive_gpu_memory_fraction", lambda: "0.156")
     monkeypatch.setattr(runtime_module.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(runtime_module.subprocess, "STARTUPINFO", lambda: type("StartupInfo", (), {"dwFlags": 0})())
     monkeypatch.setattr(runtime_module.subprocess, "STARTF_USESHOWWINDOW", 1, raising=False)
@@ -261,6 +264,7 @@ def test_subprocess_runtime_closes_failed_child_process(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime_module, "_runtime_state_path", lambda project_root=None: state_path)
     monkeypatch.setattr(runtime_module, "_package_root", lambda project_root=None: tmp_path)
     monkeypatch.setattr(runtime_module, "runtime_python", lambda root, runtime_name, gui=False: runtime_python)
+    monkeypatch.setattr(runtime_module, "_adaptive_gpu_memory_fraction", lambda: "0.156")
     monkeypatch.setattr(runtime_module.subprocess, "Popen", lambda *args, **kwargs: process)
     monkeypatch.setattr(runtime_module.subprocess, "STARTUPINFO", lambda: type("StartupInfo", (), {"dwFlags": 0})())
     monkeypatch.setattr(runtime_module.subprocess, "STARTF_USESHOWWINDOW", 1, raising=False)

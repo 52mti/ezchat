@@ -46,16 +46,10 @@ DEFAULT_MANIFEST: dict[str, Any] = {
             ],
             "modelProvider": "rapidocr_builtin",
         },
-        "cpu": {
-            "description": "CPU PaddleOCR runtime for PP-OCRv5 mobile",
-            "packages": [
-                {
-                    "spec": "paddlepaddle==3.2.2",
-                    "indexUrl": "https://www.paddlepaddle.org.cn/packages/stable/cpu/",
-                }
-            ],
-            "modelProvider": "paddlex_named_models",
-        },
+        # 20260917 起 cpu 后端不再单独打包：paddlepaddle 的 Windows CPU 推理
+        # 实测比 ONNX Runtime 慢 ~5 倍（同机全屏 5.4s vs 1.1s），cpu 后端改用
+        # ocr_directml 运行时跑 ORT CPU EP（见 vision/ocr_runtime.py
+        # _engine_runtime_names），engine/ocr_cpu（1.1GB）随之移出全量包。
     },
     "models": {
         "defaultTier": "lite",
@@ -70,16 +64,14 @@ DEFAULT_MANIFEST: dict[str, Any] = {
                         "recVersion": "PP-OCRv5_mobile_rec",
                     },
                     "cpu": {
-                        "provider": "paddlex_named_models",
-                        "detModelName": "PP-OCRv5_mobile_det",
-                        "recModelName": "PP-OCRv5_mobile_rec",
-                        "detVersion": "PP-OCRv5_mobile_det",
-                        "recVersion": "PP-OCRv5_mobile_rec",
+                        "provider": "rapid_onnx_v5",
+                        "detVersion": "PP-OCRv5_mobile_det.onnx",
+                        "recVersion": "PP-OCRv5_mobile_rec.onnx",
                     },
                     "onnx_directml": {
-                        "provider": "rapidocr_builtin",
-                        "detVersion": "rapidocr_builtin_det",
-                        "recVersion": "rapidocr_builtin_rec",
+                        "provider": "rapid_onnx_v5",
+                        "detVersion": "PP-OCRv5_mobile_det.onnx",
+                        "recVersion": "PP-OCRv5_mobile_rec.onnx",
                     },
                 }
             }
@@ -87,7 +79,7 @@ DEFAULT_MANIFEST: dict[str, Any] = {
     },
 }
 
-FULL_PACKAGE_RUNTIME_NAMES = ("app", "ocr_cpu", "ocr_nvidia", "ocr_directml")
+FULL_PACKAGE_RUNTIME_NAMES = ("app", "ocr_nvidia", "ocr_directml")
 _PACKAGE_ROOT_OVERRIDE: Path | None = None
 _RUNTIME_NAME_OVERRIDE = "legacy"
 

@@ -40,7 +40,16 @@ DEFAULT_MODEL_TIER = "lite"
 SUPPORTED_BACKENDS = ("auto", "paddle_cuda", "onnx_directml", "cpu")
 SUPPORTED_EXECUTION_MODES = ("auto", "inprocess", "subprocess")
 DEFAULT_OCR_GPU_ALLOCATOR_STRATEGY = "auto_growth"
-DEFAULT_OCR_GPU_MEMORY_FRACTION = "0.6"
+# GPU 显存兜底值：paddle_cuda 未探测到显存信息时的保守上限。常规路径走
+# _adaptive_gpu_memory_fraction()（按卡容量自适应，mobile 模型 ~1GB 即足），
+# 不再默认 0.6——0.6 在被桌面程序占用的 8GB 卡上曾引发连环 CUDA OOM，
+# 进而静默降级 Paddle-CPU（全屏单次 5s+，20260917 OOM 事故的根因）。
+DEFAULT_OCR_GPU_MEMORY_FRACTION = "0.25"
+# 每车道显存预算（mobile det+rec 稳态 ~1GB，含 cuDNN workspace 与预热峰值）
+# 与自适应 fraction 的上限：budget = min(_GPU_MEM_BUDGET_MB, 总显存×上限)。
+_GPU_MEM_BUDGET_MB = 1280
+_GPU_MEM_FRACTION_CAP = 0.25
+_GPU_MEM_FRACTION_FLOOR = 0.05
 # OCR 子进程生命周期留痕：经主程序的 jixiebijiaoben logger 落
 # runtime/logs/app_YYYYMMDD.log。客户机"一轮拉起几次/是否每调用一拉"
 # 由此可直接数行得出（此前 stderr 只进内存环形缓冲，重启无任何痕迹）。
@@ -1012,6 +1021,13 @@ class PaddleOcrRuntimeEngine:
             kwargs["text_detection_model_dir"] = detection_dir
         if recognition_dir:
             kwargs["text_recognition_model_dir"] = recognition_dir
+        # det 输入分辨率限长：检测耗时随输入面积近似平方增长，全屏竖屏图
+        # 限到 960/max 实测省 ~20%（3060 Ti 246→195ms），识别条目数不变。
+        # 配置 text_det_limit_side_len=0 可关闭。
+        limit_side = int(self.config.get("text_det_limit_side_len", 960) or 0)
+        if limit_side > 0:
+            kwargs["text_det_limit_side_len"] = limit_side
+            kwargs["text_det_limit_type"] = str(self.config.get("text_det_limit_type", "max") or "max")
         return {key: value for key, value in kwargs.items() if value not in ("", None)}
 
     def _get_engine(self) -> tuple[Any, str]:
@@ -1084,11 +1100,56 @@ def _normalize_rapidocr_results(raw_result: object) -> list[dict[str, Any]]:
     return [{"rec_texts": rec_texts, "rec_scores": rec_scores, "rec_polys": rec_polys}]
 
 
+def _engine_runtime_names(backend: str) -> tuple[str, ...]:
+    """后端对应的引擎目录候选（先序优先）。
+
+    cpu 自 20260917 起切 ORT（CPU EP），复用 engine/ocr_directml 的
+    onnxruntime-directml 运行时；engine/ocr_cpu（paddle CPU，1.1GB）已
+    从全量包移除，仅作为旧安装目录的兜底候选保留。
+    """
+    normalized = str(backend or "").strip().lower()
+    if normalized == "cpu":
+        return ("ocr_directml", "ocr_cpu")
+    if normalized == "onnx_directml":
+        return ("ocr_directml",)
+    if normalized == "paddle_cuda":
+        return ("ocr_nvidia",)
+    return (backend_runtime_name(normalized),)
+
+
+def _resolve_bundled_rapid_onnx_models() -> dict[str, str] | None:
+    """随包分发的 v5 onnx 模型（vision/models/rapid_onnx/，与 GPU 路径
+    同源 PP-OCRv5 mobile，识别结果一致）。任一缺失返回 None，回退
+    rapidocr 内置模型（v3 时代）。"""
+    root = _package_root() / "vision" / "models" / "rapid_onnx"
+    det = root / "PP-OCRv5_mobile_det.onnx"
+    rec = root / "PP-OCRv5_mobile_rec.onnx"
+    dict_path = root / "PP-OCRv5_rec_dict.txt"
+    if det.is_file() and rec.is_file():
+        payload = {"det": str(det), "rec": str(rec)}
+        if dict_path.is_file():
+            payload["dict"] = str(dict_path)
+        return payload
+    return None
+
+
 class OnnxDirectMLOcrRuntimeEngine:
-    backend = "onnx_directml"
+    """ORT/RapidOCR 引擎：onnx_directml（DML EP）与 cpu（CPU EP）共用。
+
+    20260917 两项修正：
+    1. rapidocr_onnxruntime 1.2.3 的 OrtInferSession 只有 CPU/CUDA 分支，
+       构造参数里的 providers 会被静默吞掉——"DirectML 后端"此前从未真正
+       用过 GPU。现改为构造期临时替换其会话工厂，强制注入 EP 列表。
+    2. backend=cpu 不再走 paddlepaddle（Windows CPU 推理实测比 ORT 慢
+       ~6 倍：全屏 5.4s vs 0.9s），改用本引擎 CPU EP。
+    优先加载包内 v5 onnx 模型（与 GPU 路径同源，识别一致）；缺失时回退
+    rapidocr 内置模型（v3 时代，角标数字偶有差异）。
+    """
+
     device_seen: str = ""
 
-    def __init__(self, *, model_tier: str, manifest: RuntimeManifest, config: dict[str, Any]) -> None:
+    def __init__(self, *, backend: str = "onnx_directml", model_tier: str, manifest: RuntimeManifest, config: dict[str, Any]) -> None:
+        self.backend = "onnx_directml" if backend == "onnx_directml" else "cpu"
         self.model_tier = model_tier
         self.manifest = manifest
         self.config = dict(config)
@@ -1110,6 +1171,11 @@ class OnnxDirectMLOcrRuntimeEngine:
         except TypeError:
             return rapidocr_cls()
 
+    def _execution_providers(self) -> list[str]:
+        if self.backend == "cpu":
+            return ["CPUExecutionProvider"]
+        return ["DmlExecutionProvider", "CPUExecutionProvider"]
+
     def _get_engine(self) -> Any:
         if self._engine is not None:
             return self._engine
@@ -1118,19 +1184,39 @@ class OnnxDirectMLOcrRuntimeEngine:
                 return self._engine
             try:
                 import onnxruntime as ort  # type: ignore
+                import rapidocr_onnxruntime.utils as rapid_utils  # type: ignore
                 from rapidocr_onnxruntime import RapidOCR  # type: ignore
             except ImportError as exc:
-                raise RuntimeError("Missing packaged DirectML OCR runtime. Rebuild the full package.") from exc
-            providers = list(ort.get_available_providers())
-            if "DmlExecutionProvider" not in providers:
-                raise RuntimeError(f"onnxruntime does not expose the DirectML provider. Providers: {providers}")
-            self._engine = self._instantiate_rapidocr(RapidOCR, {"providers": ["DmlExecutionProvider", "CPUExecutionProvider"]})
+                raise RuntimeError("Missing packaged ORT OCR runtime (engine/ocr_directml). Rebuild the full package.") from exc
+            providers = self._execution_providers()
+            if "DmlExecutionProvider" in providers and "DmlExecutionProvider" not in list(ort.get_available_providers()):
+                raise RuntimeError(f"onnxruntime does not expose the DirectML provider. Providers: {ort.get_available_providers()}")
+            kwargs: dict[str, Any] = dict(self.config.get("rapidocr_kwargs") or {})
+            onnx = _resolve_bundled_rapid_onnx_models()
+            if onnx is not None:
+                kwargs.setdefault("det_model_path", onnx["det"])
+                kwargs.setdefault("rec_model_path", onnx["rec"])
+                if onnx.get("dict"):
+                    kwargs.setdefault("rec_dict_path", onnx["dict"])
+            # 构造期补丁：OrtInferSession 不读 providers 配置，临时替换其
+            # 会话工厂强制注入 EP（构造完立即还原，只在 init 锁内发生）。
+            real_session = rapid_utils.InferenceSession
+            requested_providers = providers
+
+            def _session_with_providers(path_or_bytes, sess_options=None, providers=None, **session_kwargs):
+                return real_session(path_or_bytes, sess_options=sess_options, providers=requested_providers, **session_kwargs)
+
+            rapid_utils.InferenceSession = _session_with_providers
+            try:
+                self._engine = self._instantiate_rapidocr(RapidOCR, kwargs)
+            finally:
+                rapid_utils.InferenceSession = real_session
             return self._engine
 
     def preload(self) -> str:
         self._get_engine()
-        self.device_seen = "dml:0"
-        return "dml:0"
+        self.device_seen = "cpu" if self.backend == "cpu" else "dml:0"
+        return self.device_seen
 
     def predict(self, image_array: np.ndarray, **_kwargs: Any) -> list[dict[str, Any]]:
         engine = self._get_engine()
@@ -1255,12 +1341,22 @@ class SubprocessOcrRuntimeEngine:
         self._response_queue: "queue.Queue[bytes | None]" = queue.Queue()
         self._stderr_tail: "deque[str]" = deque(maxlen=self.STDERR_TAIL_LINES)
         self._spawn_count = 0
+        # OOM 阶梯降级：CUDA OOM 时逐次减半 fraction 重拉子进程（至多
+        # _OOM_FRACTION_RETRIES 次），仍失败才交给 Resilient 落 CPU(ORT)——
+        # 不再一步跳崖到慢引擎。
+        self._gpu_memory_fraction_override: str | None = None
+        self._oom_fraction_retries = 0
+        self._OOM_FRACTION_RETRIES = 2
 
     def _runtime_python_path(self) -> Path:
         root = _package_root()
-        candidate = runtime_python(root, backend_runtime_name(self.backend), gui=False)
-        if candidate.is_file():
-            return candidate
+        # cpu 后端 20260917 起复用 ocr_directml 运行时跑 ORT CPU EP；
+        # 旧安装残留的 engine/ocr_cpu 仅作兜底候选（新全量包已不再收录）。
+        runtime_names = _engine_runtime_names(self.backend)
+        for runtime_name in runtime_names:
+            candidate = runtime_python(root, runtime_name, gui=False)
+            if candidate.is_file():
+                return candidate
         state_python = _state_runtime_python(load_installed_runtime_state(root), self.backend)
         if state_python is not None:
             return state_python
@@ -1283,6 +1379,8 @@ class SubprocessOcrRuntimeEngine:
             "text_recognition_model_name",
             "text_detection_model_dir",
             "text_recognition_model_dir",
+            "text_det_limit_side_len",
+            "text_det_limit_type",
             "det_db_thresh",
             "rec_thresh",
         }
@@ -1327,9 +1425,7 @@ class SubprocessOcrRuntimeEngine:
         env["FLAGS_allocator_strategy"] = str(
             self.config.get("ocr_gpu_allocator_strategy", DEFAULT_OCR_GPU_ALLOCATOR_STRATEGY) or DEFAULT_OCR_GPU_ALLOCATOR_STRATEGY
         )
-        env["FLAGS_fraction_of_gpu_memory_to_use"] = str(
-            self.config.get("ocr_gpu_memory_fraction", DEFAULT_OCR_GPU_MEMORY_FRACTION) or DEFAULT_OCR_GPU_MEMORY_FRACTION
-        )
+        env["FLAGS_fraction_of_gpu_memory_to_use"] = self._current_gpu_memory_fraction()
         cache_home = _resolve_runtime_cache_home(root, load_installed_runtime_state(root).get("cache_home", ""))
         env["PADDLE_PDX_CACHE_HOME"] = str(cache_home)
         env["PADDLEX_HOME"] = str(cache_home)
@@ -1369,6 +1465,17 @@ class SubprocessOcrRuntimeEngine:
         self._response_queue = queue.Queue()
         self._start_pipe_workers(self._process)
         return self._process
+
+    def _current_gpu_memory_fraction(self) -> str:
+        # 优先级：OOM 阶梯覆盖值 > 显式配置 > 按卡自适应 > 兜底常量。
+        if self._gpu_memory_fraction_override:
+            return self._gpu_memory_fraction_override
+        configured = str(self.config.get("ocr_gpu_memory_fraction", "") or "").strip()
+        if configured:
+            return configured
+        if self.backend == "paddle_cuda":
+            return _adaptive_gpu_memory_fraction()
+        return DEFAULT_OCR_GPU_MEMORY_FRACTION
 
     def _start_pipe_workers(self, process: subprocess.Popen[bytes]) -> None:
         """stdout reader + stderr 排空两个常驻 daemon 线程。
@@ -1410,6 +1517,38 @@ class SubprocessOcrRuntimeEngine:
         threading.Thread(target=drain_stderr, name="ocr-sub-stderr", daemon=True).start()
 
     def _request(self, payload: dict[str, Any], blob: bytes = b"") -> dict[str, Any]:
+        # OOM 阶梯：CUDA OOM 时减半 fraction 重拉子进程重试；仍失败才抛给
+        # 上层（Resilient 落 CPU——现已是 ORT，不再是慢速 Paddle-CPU）。
+        try:
+            return self._request_once(payload, blob=blob)
+        except Exception as exc:
+            if not self._prepare_oom_retry(str(exc)):
+                raise
+            return self._request_once(payload, blob=blob)
+
+    def _prepare_oom_retry(self, error_text: str) -> bool:
+        lowered = str(error_text or "").lower()
+        if self.backend != "paddle_cuda" or "out of memory" not in lowered and "cuda error" not in lowered:
+            return False
+        if self._oom_fraction_retries >= self._OOM_FRACTION_RETRIES:
+            return False
+        try:
+            current = float(self._current_gpu_memory_fraction())
+        except (TypeError, ValueError):
+            return False
+        halved = max(_GPU_MEM_FRACTION_FLOOR, current / 2.0)
+        self._gpu_memory_fraction_override = f"{halved:.3f}"
+        self._oom_fraction_retries += 1
+        self.close()
+        _OCR_RUNTIME_LOG.warning(
+            "[ocr-subprocess] CUDA OOM，显存 fraction %.3f→%.3f 重拉重试（第 %d 次）",
+            current,
+            halved,
+            self._oom_fraction_retries,
+        )
+        return True
+
+    def _request_once(self, payload: dict[str, Any], blob: bytes = b"") -> dict[str, Any]:
         with self._lock:
             process = self._start_process()
             if process.stdin is None:
@@ -1588,9 +1727,9 @@ def _create_engine_for_backend(
     manifest: RuntimeManifest,
     config: dict[str, Any],
 ) -> Any:
-    if backend == "onnx_directml":
-        return OnnxDirectMLOcrRuntimeEngine(model_tier=model_tier, manifest=manifest, config=config)
-    if backend in {"paddle_cuda", "cpu"}:
+    if backend in {"onnx_directml", "cpu"}:
+        return OnnxDirectMLOcrRuntimeEngine(backend=backend, model_tier=model_tier, manifest=manifest, config=config)
+    if backend == "paddle_cuda":
         return PaddleOcrRuntimeEngine(backend=backend, model_tier=model_tier, manifest=manifest, config=config)
     raise RuntimeError(f"Unsupported OCR backend: {backend}")
 
@@ -1662,20 +1801,23 @@ _RUNTIME_ENGINE_RELEVANT_KEYS = {
     "text_recognition_model_name",
     "text_detection_model_dir",
     "text_recognition_model_dir",
+    "text_det_limit_side_len",
+    "text_det_limit_type",
 }
 
 # 引擎实例池（车道模型）：GPU 每实例 ~1GB（CUDA 上下文是大头），池大小
 # 与设备数解耦；超过池大小的调用方在并发槽排队（车道模型）。CPU/DirectML
 # 多实例只会互相抢核，恒为 1。
 #
-# 上限不强制：配置值即车道数，唯一硬顶是并发槽的 16。显存自适应
-# （adaptive_engine_pool_cap）只作 UI 提示建议值，不钳制配置——显存
-# 放不下时实例创建失败自动降级共享 0 号车道（日志留痕），不崩。
+# 车道数受两重钳制：空闲显存自适应上限（adaptive_engine_pool_cap，防
+# 连环 CUDA OOM）与并发槽硬顶 16。20260917 曾短暂取消显存钳制，当天
+# 即在 8GB 卡上连环 OOM→静默降级 Paddle-CPU（单次 4s+），随即恢复。
+# ocr_engine_pool_ignore_vram_cap=true 可绕过显存钳制（仅调试）。
 _DEFAULT_GPU_ENGINE_POOL_SIZE = 2
 _FALLBACK_GPU_ENGINE_POOL_CAP = 4
 _ABSOLUTE_MAX_ENGINE_POOL_SIZE = 16  # 配置硬顶：并发槽实现的自然天花板
-_ADAPTIVE_HINT_MAX_ENGINE_POOL = 8  # 建议值提示上限：再多只添噪（子进程开销）
-_ENGINE_INSTANCE_MB = 1024
+_ADAPTIVE_HINT_MAX_ENGINE_POOL = 8  # 自适应上限的提示封顶：再多只添噪（子进程开销）
+_ENGINE_INSTANCE_MB = 1280
 _ENGINE_POOL_VRAM_RESERVE_MB = 1024
 _POOLED_ENGINES: dict[str, list[Any]] = {}
 _POOLED_ENGINES_LOCK = threading.Lock()
@@ -1696,8 +1838,45 @@ def _probe_gpu_free_mb() -> int | None:
         return None
 
 
+def _probe_gpu_total_mb() -> int | None:
+    """nvidia-smi 读显卡总显存（MB）；失败/无 N 卡返回 None。"""
+    result = _run_command(
+        ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+        timeout_seconds=5,
+    )
+    if result is None or not result.stdout:
+        return None
+    try:
+        return int(str(result.stdout).strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+@lru_cache(maxsize=1)
+def _adaptive_gpu_memory_fraction() -> str:
+    """按显卡总显存自适应的每进程显存上限（FLAGS_fraction_of_gpu_memory_to_use）。
+
+    mobile det+rec 实测稳态 ~1GB/车道，给到 _GPU_MEM_BUDGET_MB 再封顶 25%：
+    8GB 卡 ≈0.16、4GB 卡 ≈0.25（1GB）。旧默认 0.6 允许单进程吃 4.8GB，
+    在被桌面程序占用的卡上连环触发 CUDA OOM（20260917 事故），废弃。
+    探测失败回退 DEFAULT_OCR_GPU_MEMORY_FRACTION。配置键
+    ocr_gpu_memory_fraction 仍可显式覆盖。
+    """
+    total_mb = _probe_gpu_total_mb()
+    if not total_mb or total_mb <= 0:
+        return DEFAULT_OCR_GPU_MEMORY_FRACTION
+    budget_mb = min(_GPU_MEM_BUDGET_MB, total_mb * _GPU_MEM_FRACTION_CAP)
+    fraction = max(_GPU_MEM_FRACTION_FLOOR, min(_GPU_MEM_FRACTION_CAP, budget_mb / total_mb))
+    return f"{fraction:.3f}"
+
+
 def adaptive_engine_pool_cap() -> int:
-    """按空闲显存估算的建议池上限（仅作 UI 提示，不钳制配置；缓存一次）。"""
+    """按空闲显存估算的车道数上限（钳制配置；缓存一次）。
+
+    20260917 起恢复钳制（曾短暂取消，当天即连环 OOM）：空闲显存扣除
+    安全余量后按每车道预算折算，避免配置车道数超出显存放不下。
+    ocr_engine_pool_ignore_vram_cap=true 可显式绕过（调试用）。
+    """
     global _ADAPTIVE_POOL_CAP_CACHE
     if _ADAPTIVE_POOL_CAP_CACHE is None:
         free_mb = _probe_gpu_free_mb()
@@ -1725,7 +1904,19 @@ def _engine_pool_size(config: dict[str, Any], backend: str) -> int:
             if value >= 1:
                 requested = value
                 break
-    return max(1, min(requested, _ABSOLUTE_MAX_ENGINE_POOL_SIZE))
+    size = max(1, min(requested, _ABSOLUTE_MAX_ENGINE_POOL_SIZE))
+    if bool(config.get("ocr_engine_pool_ignore_vram_cap", False)):
+        return size
+    cap = adaptive_engine_pool_cap()
+    if size > cap:
+        _OCR_RUNTIME_LOG.warning(
+            "[ocr-pool] 配置车道数 %d 超出空闲显存自适应上限 %d，已钳制"
+            "（ocr_engine_pool_ignore_vram_cap=true 可绕过）",
+            size,
+            cap,
+        )
+        size = max(1, cap)
+    return size
 
 
 def engine_pool_size_for(config: dict[str, Any]) -> int:

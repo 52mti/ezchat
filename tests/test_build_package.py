@@ -607,7 +607,7 @@ def test_write_full_package_runtime_state_uses_auto_backend(tmp_path):
     assert payload["python_executable"] == "engine/app/python.exe"
     assert payload["runtime_path"] == "engine/app"
     assert payload["runtime_inventory"]["app"] == "engine/app"
-    assert payload["runtime_inventory"]["cpu"] == "engine/ocr_cpu"
+    assert payload["runtime_inventory"]["cpu"] == "engine/ocr_directml"
     assert payload["installed_backends"] == ["cpu", "paddle_cuda", "onnx_directml"]
 
 

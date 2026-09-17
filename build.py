@@ -79,7 +79,6 @@ PIPER_SOURCE_ASSETS_DIR = "tts/piper"
 
 RUNTIME_SKELETON_DIRS = [
     "engine/app",
-    "engine/ocr_cpu",
     "engine/ocr_nvidia",
     "engine/ocr_directml",
     "runtime/logs",
@@ -1187,7 +1186,7 @@ def _write_full_package_runtime_state(package_root: Path, *, model_tier: str, nv
         "installed_backends": ["cpu", "paddle_cuda", "onnx_directml"],
         "runtime_inventory": {
             "app": "engine/app",
-            "cpu": "engine/ocr_cpu",
+            "cpu": "engine/ocr_directml",
             "paddle_cuda": "engine/ocr_nvidia",
             "onnx_directml": "engine/ocr_directml",
         },
@@ -1327,16 +1326,8 @@ def _build_full_package_runtimes(
     use_cache: bool,
 ) -> None:
     _ensure_runtime_available(root, package_root, runtime_name="app", install_scope="app", model_tier=model_tier, use_cache=use_cache)
-    _ensure_runtime_available(
-        root,
-        package_root,
-        runtime_name="ocr_cpu",
-        install_scope="backend",
-        backend="cpu",
-        model_tier=model_tier,
-        bundle_models=True,
-        use_cache=use_cache,
-    )
+    # 20260917 起 cpu 后端复用 ocr_directml 引擎跑 ORT CPU EP，不再单独
+    # 打包 paddle CPU（省 1.1GB）；paddlex 模型捆绑改由 nvidia 腿承担。
     _ensure_runtime_available(
         root,
         package_root,
@@ -1345,6 +1336,7 @@ def _build_full_package_runtimes(
         backend="paddle_cuda",
         model_tier=model_tier,
         cuda_lane=nvidia_cuda_lane,
+        bundle_models=True,
         skip_validation=True,
         allow_missing_hardware=True,
         use_cache=use_cache,

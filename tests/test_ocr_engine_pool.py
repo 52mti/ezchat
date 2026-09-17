@@ -23,28 +23,35 @@ class _FakeEngine:
 
 
 def test_engine_pool_size_resolution(monkeypatch):
-    """上限不按显存强制钳制（用户决定）：配置值即车道数，唯一硬顶=并发槽 16。
-    显存不足由实例创建失败自动降级共享兜底，显存估算仅作 UI 提示。"""
+    """车道数 = 配置值，双重钳制：空闲显存自适应上限（防连环 CUDA OOM，
+    20260917 恢复）+ 并发槽硬顶 16；ocr_engine_pool_ignore_vram_cap=true
+    可绕过显存钳制（仅调试）。"""
     _use_backend(monkeypatch, "paddle_cuda")
+    monkeypatch.setattr(runtime_module, "_ADAPTIVE_POOL_CAP_CACHE", 6)
     assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda"}) == 2
     assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 4}) == 4
-    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 10}) == 10
-    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 30}) == 16
+    # 超出显存自适应上限被钳制
+    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 10}) == 6
+    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 30}) == 6
+    # 显式绕过显存钳制：配置值即车道数，唯一硬顶 16
+    bypass = {"backend": "paddle_cuda", "ocr_engine_pool_ignore_vram_cap": True}
+    assert runtime_module.engine_pool_size_for({**bypass, "ocr_engine_pool_size": 10}) == 10
+    assert runtime_module.engine_pool_size_for({**bypass, "ocr_engine_pool_size": 30}) == 16
     _use_backend(monkeypatch, "cpu")
     assert runtime_module.engine_pool_size_for({"backend": "cpu", "ocr_engine_pool_size": 4}) == 1
 
 
 def test_adaptive_engine_pool_cap_from_free_vram(monkeypatch):
-    """自适应上限 = (空闲MB - 1GB 保留) / 1GB 每实例，绝对上限 8，
-    探测失败回退保守 4；结果进程内缓存（探测一次）。"""
+    """自适应上限 = (空闲MB - 1GB 保留) / 1280MB 每车道（mobile 模型实测
+    ~1GB+峰值），提示封顶 8，探测失败回退保守 4；结果进程内缓存（探测一次）。"""
     monkeypatch.setattr(runtime_module, "_ADAPTIVE_POOL_CAP_CACHE", None)
 
     monkeypatch.setattr(runtime_module, "_probe_gpu_free_mb", lambda: 5980)  # 8GB 卡
-    assert runtime_module.adaptive_engine_pool_cap() == 4
+    assert runtime_module.adaptive_engine_pool_cap() == 3
 
     monkeypatch.setattr(runtime_module, "_ADAPTIVE_POOL_CAP_CACHE", None)
     monkeypatch.setattr(runtime_module, "_probe_gpu_free_mb", lambda: 14336)  # 16GB 卡
-    assert runtime_module.adaptive_engine_pool_cap() == 8  # 绝对上限
+    assert runtime_module.adaptive_engine_pool_cap() == 8  # 提示封顶
 
     monkeypatch.setattr(runtime_module, "_ADAPTIVE_POOL_CAP_CACHE", None)
     monkeypatch.setattr(runtime_module, "_probe_gpu_free_mb", lambda: 1500)  # 小显存
