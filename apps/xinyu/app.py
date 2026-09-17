@@ -103,6 +103,7 @@ class XinyuApp(BaseApp):
             # backend=auto 的配置文件看不出真实路径，以引擎侧记录为准。
             "ocr_queue_seconds_total": round(float(metrics.get("ocr_queue_seconds_total", 0.0) or 0.0), 3),
             "ocr_queue_seconds_max": round(float(metrics.get("ocr_queue_seconds_max", 0.0) or 0.0), 3),
+            "ocr_mode_stats": metrics.get("ocr_mode_stats") if isinstance(metrics.get("ocr_mode_stats"), dict) else {},
             "detection_cache_hit_count": int(metrics.get("detection_cache_hit_count", 0) or 0),
             "capture_count": int(metrics.get("capture_count", 0) or 0),
             "dialogue_compact_fallback_count": int(metrics.get("dialogue_compact_fallback_count", 0) or 0),

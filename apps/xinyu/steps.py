@@ -509,6 +509,17 @@ def _run_ocr_mode(image: Any, config: dict[str, Any], mode: str, region: Any = N
         # （install_state 的 backend=auto + 硬件探测为空时，配置文件看不出来）。
         metrics["ocr_queue_seconds_total"] = round(float(metrics.get("ocr_queue_seconds_total", 0.0) or 0.0) + queue_seconds, 4)
         metrics["ocr_queue_seconds_max"] = round(max(float(metrics.get("ocr_queue_seconds_max", 0.0) or 0.0), queue_seconds), 4)
+        # 分模式计时：总量/最大值看不出哪个模式吃时间（开发机稳态 21.6s/7 次
+        # 与裸引擎基准 ~1s 同尺寸裁图存在未解释差距，需要按模式指认）。
+        mode_stats = metrics.get("ocr_mode_stats")
+        if not isinstance(mode_stats, dict):
+            mode_stats = {}
+            metrics["ocr_mode_stats"] = mode_stats
+        entry = mode_stats.get(mode) if isinstance(mode_stats.get(mode), dict) else {"count": 0, "seconds": 0.0, "max": 0.0}
+        entry["count"] = int(entry.get("count", 0) or 0) + 1
+        entry["seconds"] = round(float(entry.get("seconds", 0.0) or 0.0) + elapsed, 3)
+        entry["max"] = round(max(float(entry.get("max", 0.0) or 0.0), elapsed), 3)
+        mode_stats[mode] = entry
         if result.get("_cache_hit"):
             metrics["ocr_cache_hit_count"] = int(metrics.get("ocr_cache_hit_count", 0) or 0) + 1
         else:

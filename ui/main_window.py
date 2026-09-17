@@ -2102,6 +2102,16 @@ class MainWindow(QMainWindow):
                         if float(queue_total) >= 0.5
                         else f"，其中排队最长 {queue_max} 秒"
                     )
+            mode_stats = payload.get("ocr_mode_stats")
+            if isinstance(mode_stats, dict) and mode_stats:
+                # 分模式计时：直接指认哪个模式吃掉时间（单次最大值归属不明）。
+                parts = [
+                    f"{mode_key} {entry.get('count', 0)}次/{entry.get('seconds', 0)}s"
+                    for mode_key, entry in sorted(mode_stats.items())
+                    if isinstance(entry, dict)
+                ]
+                if parts:
+                    ocr_seconds_text += "（" + "，".join(parts) + "）"
             sub_predict = payload.get("ocr_sub_predict_ms")
             if sub_predict not in (None, "", "0", 0):
                 # 子进程纯推理毫秒数：与单次总耗时的差值 = 链路开销。
