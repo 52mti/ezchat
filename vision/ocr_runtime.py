@@ -1192,6 +1192,14 @@ class OnnxDirectMLOcrRuntimeEngine:
             if "DmlExecutionProvider" in providers and "DmlExecutionProvider" not in list(ort.get_available_providers()):
                 raise RuntimeError(f"onnxruntime does not expose the DirectML provider. Providers: {ort.get_available_providers()}")
             kwargs: dict[str, Any] = dict(self.config.get("rapidocr_kwargs") or {})
+            # rapid 默认 det 限长 min/736 会把竖屏图"放大"（564→736 短边，
+            # det 输入像素 ×2.6）；对齐 paddle 路径的 max/960 策略，CPU EP
+            # 全屏实测 1320→853ms（-35%）且文本零差异。配置
+            # det_limit_side_len=0 可关闭。
+            limit_side = int(self.config.get("det_limit_side_len", 960) or 0)
+            if limit_side > 0:
+                kwargs.setdefault("det_limit_type", str(self.config.get("det_limit_type", "max") or "max"))
+                kwargs.setdefault("det_limit_side_len", limit_side)
             onnx = _resolve_bundled_rapid_onnx_models()
             if onnx is not None:
                 kwargs.setdefault("det_model_path", onnx["det"])
@@ -1381,6 +1389,8 @@ class SubprocessOcrRuntimeEngine:
             "text_recognition_model_dir",
             "text_det_limit_side_len",
             "text_det_limit_type",
+            "det_limit_side_len",
+            "det_limit_type",
             "det_db_thresh",
             "rec_thresh",
         }
@@ -1803,6 +1813,8 @@ _RUNTIME_ENGINE_RELEVANT_KEYS = {
     "text_recognition_model_dir",
     "text_det_limit_side_len",
     "text_det_limit_type",
+    "det_limit_side_len",
+    "det_limit_type",
 }
 
 # 引擎实例池（车道模型）：GPU 每实例 ~1GB（CUDA 上下文是大头），池大小

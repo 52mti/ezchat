@@ -144,11 +144,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # 启动预热：进程第一个 GPU 前向要付 cuDNN 初始化 + 首次 kernel 编译
     # （实测 ~13 秒），不预热的话这笔钱由业务第一个请求承担——表现为
-    # "单次 OCR 十几秒"。这里用业务主尺寸的空图提前付掉，失败不阻塞，
-    # 但把栈打到 stderr：预热失败往往预示业务首请求同样失败，静默吞掉
-    # 会让定位变成猜谜。
+    # "单次 OCR 十几秒"。预热形状用业务真实形状（矫正后竖屏全幅与列表
+    # 顶部条带）：旧版用 1280×720 横图，真实请求的首个形状仍要再付一次
+    # 形状特化开销（GPU 首帧 647ms vs 稳态 246ms 的差值来源）。失败不
+    # 阻塞，但把栈打到 stderr：预热失败往往预示业务首请求同样失败，
+    # 静默吞掉会让定位变成猜谜。
     try:
-        engine.predict(np.full((1280, 720, 3), 128, dtype=np.uint8))
+        engine.predict(np.full((1222, 564, 3), 128, dtype=np.uint8))  # 竖屏全幅
+        engine.predict(np.full((304, 564, 3), 128, dtype=np.uint8))  # 列表顶部条带
     except Exception:
         import traceback
 
