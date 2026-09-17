@@ -211,3 +211,42 @@ def test_evaluate_release_manifest_returns_none_when_app_version_matches_even_if
 
     assert decision.action == "none"
     assert "matches the remote" in decision.reason
+
+
+def test_load_local_release_state_tolerates_empty_version_fields(tmp_path):
+    """回归（20260917-02 事故）：更新包曾把空 runtimeVersion 的清单发到客户机，
+    检查更新读本地清单硬抛错，客户被卡死收不到后续修复。空字段必须容忍：
+    解析不抛错，比对按"未知"处理，照常给轻量更新。"""
+    (tmp_path / "runtime_manifest.json").write_text(
+        json.dumps(
+            {
+                "version": "",
+                "appVersion": "20260917-02",
+                "runtimeVersion": "",
+                "modelVersion": "",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    state = update_release.load_local_release_state(tmp_path)
+
+    assert state.app_version == "20260917-02"
+    assert state.runtime_version == ""
+    assert state.model_version == ""
+
+    remote = update_release.ReleaseManifest(
+        app_version="20260917-05",
+        runtime_version="2026.09.10-engine",
+        model_version="2026.06.02-full-package-lite",
+        requires_full_package=False,
+        update_share_url="https://liaotianbao.lanzouq.com/b006712hbg",
+        update_file_name="jixiebijiaoben_update_20260917_x.zip",
+        full_package_url="https://1822169749.share.123865.com/123pan/0OrBjv-AoL7d",
+        release_notes="",
+    )
+    decision = update_release.evaluate_release_manifest(remote, state)
+
+    assert decision.action == "incremental"
+    assert decision.target_app_version == "20260917-05"

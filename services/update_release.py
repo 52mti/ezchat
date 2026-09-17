@@ -163,8 +163,10 @@ def load_local_release_state(package_root: str | Path | None = None) -> LocalRel
         default_tier = str((payload.get("models", {}) or {}).get("defaultTier", "") or "").strip()
         if default_tier and runtime_version:
             model_version = f"{runtime_version}-{default_tier}"
-    if not app_version or not runtime_version:
-        raise ReleaseManifestError(f"Local runtime manifest is missing version fields: {manifest_path}")
+    # 版本字段为空不再硬拒：20260917-02 更新包曾把空 runtimeVersion 的清单
+    # 发到客户机，检查更新读本地清单直接报错，客户被卡死在旧版本收不到
+    # 后续修复。比对逻辑本就只对"两边都非空"的字段比较，本地缺失即视为
+    # 未知、不触发强制全量，让更新照常下发。
 
     return LocalReleaseState(
         package_root=root,
