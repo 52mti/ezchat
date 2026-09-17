@@ -2092,10 +2092,16 @@ class MainWindow(QMainWindow):
             if ocr_seconds_total not in (None, "", 0, 0.0):
                 ocr_seconds_text = f"，OCR 耗时 {ocr_seconds_total} 秒（单次最长 {payload.get('ocr_seconds_max', 0)} 秒）"
                 queue_max = payload.get("ocr_queue_seconds_max", 0) or 0
+                queue_total = payload.get("ocr_queue_seconds_total", 0) or 0
                 if float(queue_max) >= 0.5:
                     # 排队显著时单独标出：单次"最长"含并发槽排队，区分开才知道
-                    # 是在等其他设备还是推理本身慢。
-                    ocr_seconds_text += f"，其中排队最长 {queue_max} 秒"
+                    # 是在等其他设备还是推理本身慢。总量=多设备串行的真实代价，
+                    # 耗时 - 排队总量 = 本机真实执行开销。
+                    ocr_seconds_text += (
+                        f"，其中排队最长 {queue_max} 秒、总计 {queue_total} 秒"
+                        if float(queue_total) >= 0.5
+                        else f"，其中排队最长 {queue_max} 秒"
+                    )
             sub_predict = payload.get("ocr_sub_predict_ms")
             if sub_predict not in (None, "", "0", 0):
                 # 子进程纯推理毫秒数：与单次总耗时的差值 = 链路开销。
