@@ -1118,10 +1118,10 @@ def _engine_runtime_names(backend: str) -> tuple[str, ...]:
 
 
 def _resolve_bundled_rapid_onnx_models() -> dict[str, str] | None:
-    """随包分发的 v5 onnx 模型（vision/models/rapid_onnx/，与 GPU 路径
-    同源 PP-OCRv5 mobile，识别结果一致）。任一缺失返回 None，回退
-    rapidocr 内置模型（v3 时代）。"""
-    root = _package_root() / "vision" / "models" / "rapid_onnx"
+    """随包分发的 v5 onnx 模型（models/ocr/rapid_onnx_models/，与 GPU 路径
+    同源 PP-OCRv5 mobile，识别结果一致）。模型在更新器保护区（models/ 前缀），
+    只随全量包走、不进 update.zip；缺失时回退 rapidocr 内置模型（v3 时代）。"""
+    root = _package_root() / "models" / "ocr" / "rapid_onnx_models"
     det = root / "PP-OCRv5_mobile_det.onnx"
     rec = root / "PP-OCRv5_mobile_rec.onnx"
     dict_path = root / "PP-OCRv5_rec_dict.txt"

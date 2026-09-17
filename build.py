@@ -49,6 +49,9 @@ LOCAL_ENV_DIR_PATTERNS = ("*.env", "*.txt")
 INCLUDE_PATHS = [
     "apps",
     "vision",
+    # models/（v5 onnx 等）只随全量包下发：更新包按前缀整体排除 models/，
+    # 模型变更与引擎变更同走全量通道（runtimeVersion），不进 update.zip。
+    "models",
     "services",
     "ui",
     "workers",

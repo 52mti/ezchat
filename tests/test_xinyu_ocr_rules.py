@@ -90,6 +90,9 @@ def test_run_ocr_mode_reuses_result_for_same_image_and_config(monkeypatch):
     first = run_ocr_mode(image, config, "list")
     second = run_ocr_mode(image, config, "list")
 
+    # _queue_seconds 是并发槽计时，毫秒级抖动属正常，不参与缓存复用断言
+    first.pop("_queue_seconds", None)
+    second.pop("_queue_seconds", None)
     assert first == second
     assert calls == 1
 
