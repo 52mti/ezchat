@@ -1,0 +1,99 @@
+"""引擎实例池（车道模型）：GPU 多实例并行、池大小与设备数解耦、降级共享。"""
+
+from __future__ import annotations
+
+import threading
+
+import vision.ocr as ocr_module
+import vision.ocr_runtime as runtime_module
+
+
+def _use_backend(monkeypatch, backend: str):
+    monkeypatch.setattr(runtime_module, "_effective_backend_config", lambda config: (backend, "lite"))
+    monkeypatch.setattr(ocr_module.runtime_module if hasattr(ocr_module, "runtime_module") else runtime_module, "_effective_backend_config", lambda config: (backend, "lite"))
+
+
+def _reset_pools(monkeypatch):
+    monkeypatch.setattr(runtime_module, "_POOLED_ENGINES", {})
+
+
+class _FakeEngine:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+def test_engine_pool_size_resolution(monkeypatch):
+    _use_backend(monkeypatch, "paddle_cuda")
+    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda"}) == 2
+    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 4}) == 4
+    # 上限 4：30 台设备场景显存恒定，不随设备数增长
+    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 30}) == 4
+    _use_backend(monkeypatch, "cpu")
+    assert runtime_module.engine_pool_size_for({"backend": "cpu", "ocr_engine_pool_size": 4}) == 1
+
+
+def test_pooled_engine_assigns_instance_per_lane(monkeypatch):
+    _use_backend(monkeypatch, "paddle_cuda")
+    _reset_pools(monkeypatch)
+    created: list[_FakeEngine] = []
+    monkeypatch.setattr(
+        runtime_module,
+        "create_ocr_runtime_engine",
+        lambda config: created.append(_FakeEngine(f"engine-{len(created)}")) or created[-1],
+    )
+    config = {"backend": "paddle_cuda"}
+
+    first = runtime_module.get_pooled_runtime_engine(config, lane=0)
+    again = runtime_module.get_pooled_runtime_engine(config, lane=0)
+    lane1 = runtime_module.get_pooled_runtime_engine(config, lane=1)
+
+    assert first is again  # 同车道恒复用（子进程常驻）
+    assert lane1 is not first  # 不同车道独立实例
+    assert len(created) == 2
+
+
+def test_pooled_engine_creation_failure_degrades_to_shared(monkeypatch):
+    _use_backend(monkeypatch, "paddle_cuda")
+    _reset_pools(monkeypatch)
+    created: list[_FakeEngine] = []
+
+    def fake_create(config):
+        if created:  # 第二个实例创建失败（显存不足等）
+            raise RuntimeError("CUDA out of memory")
+        created.append(_FakeEngine("engine-0"))
+        return created[0]
+
+    monkeypatch.setattr(runtime_module, "create_ocr_runtime_engine", fake_create)
+
+    engine0 = runtime_module.get_pooled_runtime_engine({"backend": "paddle_cuda"}, lane=0)
+    engine1 = runtime_module.get_pooled_runtime_engine({"backend": "paddle_cuda"}, lane=1)
+
+    assert engine1 is engine0  # 降级共享 0 号，不阻断 OCR
+
+
+def test_native_slot_assigns_distinct_lanes_and_keeps_reentrant_lane():
+    lanes: dict[int, int] = {}
+    barrier = threading.Barrier(2)
+
+    def worker(tag: int) -> None:
+        with ocr_module._ocr_native_call_slot(2):
+            with ocr_module._ocr_native_call_slot(2):  # 可重入：沿用外层车道
+                lanes[tag] = ocr_module._current_ocr_lane()
+                barrier.wait(timeout=5)
+
+    threads = [threading.Thread(target=worker, args=(tag,)) for tag in (1, 2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert set(lanes.values()) == {0, 1}  # 并发持有者车道互异
+    assert ocr_module._current_ocr_lane() == 0  # 退出槽后回到默认
+
+
+def test_ocr_max_concurrency_follows_pool_for_gpu(monkeypatch):
+    monkeypatch.setattr(runtime_module, "engine_pool_size_for", lambda config: 3)
+    assert ocr_module._ocr_max_concurrency({"backend": "paddle_cuda"}) == 3
+    assert ocr_module._ocr_max_concurrency({"backend": "paddle_cuda", "max_concurrency": 1}) == 1
+    # 无运行时引擎键的传统路径保持串行
+    assert ocr_module._ocr_max_concurrency({}) == 1

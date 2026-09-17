@@ -1644,29 +1644,92 @@ def _cached_runtime_engine(cache_key: str) -> Any:
     return create_ocr_runtime_engine(json.loads(cache_key))
 
 
+_RUNTIME_ENGINE_RELEVANT_KEYS = {
+    "backend",
+    "ocr_backend",
+    "execution_mode",
+    "ocr_execution_mode",
+    "_execution_mode",
+    "model_tier",
+    "modelTier",
+    "lang",
+    "use_angle_cls",
+    "use_doc_orientation_classify",
+    "use_doc_unwarping",
+    "ocr_gpu_allocator_strategy",
+    "ocr_gpu_memory_fraction",
+    "text_detection_model_name",
+    "text_recognition_model_name",
+    "text_detection_model_dir",
+    "text_recognition_model_dir",
+}
+
+# 引擎实例池（车道模型）：GPU 每实例 ~0.6-1GB（大头是 CUDA 上下文），
+# 池大小与设备数解耦——默认 2、上限 4、可配置；超过池大小的调用方在
+# 并发槽排队（车道模型），显存不随设备数增长（30 台设备也恒定 ~2GB）。
+# CPU/DirectML 多实例只会互相抢核，恒为 1。
+_DEFAULT_GPU_ENGINE_POOL_SIZE = 2
+_MAX_ENGINE_POOL_SIZE = 4
+_POOLED_ENGINES: dict[str, list[Any]] = {}
+_POOLED_ENGINES_LOCK = threading.Lock()
+
+
+def _engine_pool_size(config: dict[str, Any], backend: str) -> int:
+    if backend != "paddle_cuda":
+        return 1
+    for key in ("ocr_engine_pool_size", "engine_pool_size"):
+        if key in config:
+            try:
+                value = int(config.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value >= 1:
+                return min(_MAX_ENGINE_POOL_SIZE, value)
+    return _DEFAULT_GPU_ENGINE_POOL_SIZE
+
+
+def engine_pool_size_for(config: dict[str, Any]) -> int:
+    """按配置与实际后端解析引擎池大小（并发槽的默认车道数同源于此）。"""
+    backend, _model_tier = _effective_backend_config(config)
+    return _engine_pool_size(config, backend)
+
+
+def get_pooled_runtime_engine(config: dict[str, Any], *, lane: int = 0) -> Any:
+    """按车道取引擎实例：车道=并发槽位，同一车道恒复用同一实例（子进程
+    常驻），不同车道各自独立实例并行推理。
+
+    lane>0 实例创建失败（显存不足等）自动降级共享 0 号实例——子进程桥
+    内部自带锁，共享只损失并行度、不损失正确性，绝不让池问题阻断 OCR。
+    """
+    relevant = {key: value for key, value in config.items() if key in _RUNTIME_ENGINE_RELEVANT_KEYS}
+    backend, _model_tier = _effective_backend_config(config)
+    size = _engine_pool_size(config, backend)
+    cache_key = json.dumps(relevant, sort_keys=True, ensure_ascii=False) + f"|pool{size}"
+    with _POOLED_ENGINES_LOCK:
+        instances = _POOLED_ENGINES.setdefault(cache_key, [])
+        index = max(0, min(int(lane), size - 1))
+        while len(instances) <= index:
+            instances.append(None)
+        if instances[index] is None:
+            engine_config = json.loads(cache_key.split("|pool")[0])
+            try:
+                instances[index] = create_ocr_runtime_engine(engine_config)
+            except Exception as exc:
+                if index == 0:
+                    raise
+                _OCR_RUNTIME_LOG.error(
+                    "[ocr-pool] 实例 #%d 创建失败，降级共享 #0: %s", index, exc
+                )
+                if instances[0] is None:
+                    instances[0] = create_ocr_runtime_engine(engine_config)
+                instances[index] = instances[0]
+        return instances[index]
+
+
 def get_ocr_runtime_engine(config: dict[str, Any]) -> Any:
     relevant = {
         key: value
         for key, value in config.items()
-        if key
-        in {
-            "backend",
-            "ocr_backend",
-            "execution_mode",
-            "ocr_execution_mode",
-            "_execution_mode",
-            "model_tier",
-            "modelTier",
-            "lang",
-            "use_angle_cls",
-            "use_doc_orientation_classify",
-            "use_doc_unwarping",
-            "ocr_gpu_allocator_strategy",
-            "ocr_gpu_memory_fraction",
-            "text_detection_model_name",
-            "text_recognition_model_name",
-            "text_detection_model_dir",
-            "text_recognition_model_dir",
-        }
+        if key in _RUNTIME_ENGINE_RELEVANT_KEYS
     }
-    return _cached_runtime_engine(json.dumps(relevant, sort_keys=True, ensure_ascii=False))
+    return get_pooled_runtime_engine(config)

@@ -3,6 +3,7 @@
 import contextlib
 import json
 import threading
+from collections import deque
 from functools import lru_cache
 from typing import Any, Iterable, TypedDict
 
@@ -208,12 +209,32 @@ def _ocr_max_concurrency(config: dict[str, Any]) -> int:
         except (TypeError, ValueError):
             value = 1
         return min(16, max(1, value))
+    # 未显式配置：GPU 运行时引擎默认并发随池大小（车道=引擎实例，见
+    # get_pooled_runtime_engine）；CPU/DirectML 与传统进程内路径保持串行。
+    if config.get("backend") or config.get("ocr_backend") or config.get("model_tier") or config.get("modelTier"):
+        from .ocr_runtime import engine_pool_size_for
+
+        try:
+            return min(16, max(1, engine_pool_size_for(config)))
+        except Exception:
+            return 1
     return 1
+
+
+# 车道分配：并发槽的第 N 个持有者拿到车道 N，引擎按车道绑定实例。可重入
+# 的内层调用沿用外层车道（thread-local），保证同一轮 OCR 全程同一实例。
+_OCR_NATIVE_SLOT_LANE = threading.local()
+_OCR_NATIVE_FREE_LANES: deque[int] = deque()
+_OCR_NATIVE_LANE_CREATED = 0
+
+
+def _current_ocr_lane() -> int:
+    return int(getattr(_OCR_NATIVE_SLOT_LANE, "value", 0) or 0)
 
 
 @contextlib.contextmanager
 def _ocr_native_call_slot(max_concurrency: int):
-    global _OCR_NATIVE_ACTIVE_CALLS, _OCR_NATIVE_WAITING_CALLS
+    global _OCR_NATIVE_ACTIVE_CALLS, _OCR_NATIVE_WAITING_CALLS, _OCR_NATIVE_LANE_CREATED
     limit = min(16, max(1, int(max_concurrency or 1)))
     ident = threading.get_ident()
     with _OCR_NATIVE_CALL_CONDITION:
@@ -227,6 +248,12 @@ def _ocr_native_call_slot(max_concurrency: int):
             _OCR_NATIVE_WAITING_CALLS -= 1
             _OCR_NATIVE_ACTIVE_CALLS += 1
             _OCR_NATIVE_SLOT_DEPTH[ident] = 1
+            # 车道惰性创建到 limit 为止：并发持有者恒拿到互异车道，全部
+            # 释放后车道回池复用（车道=引擎实例，恒定 limit 份）。
+            if not _OCR_NATIVE_FREE_LANES and _OCR_NATIVE_LANE_CREATED < limit:
+                _OCR_NATIVE_FREE_LANES.append(_OCR_NATIVE_LANE_CREATED)
+                _OCR_NATIVE_LANE_CREATED += 1
+            _OCR_NATIVE_SLOT_LANE.value = _OCR_NATIVE_FREE_LANES.popleft() if _OCR_NATIVE_FREE_LANES else 0
     try:
         yield
     finally:
@@ -235,6 +262,8 @@ def _ocr_native_call_slot(max_concurrency: int):
             if depth <= 1:
                 _OCR_NATIVE_SLOT_DEPTH.pop(ident, None)
                 _OCR_NATIVE_ACTIVE_CALLS -= 1
+                _OCR_NATIVE_FREE_LANES.append(getattr(_OCR_NATIVE_SLOT_LANE, "value", 0) or 0)
+                _OCR_NATIVE_SLOT_LANE.value = None
             else:
                 _OCR_NATIVE_SLOT_DEPTH[ident] = depth - 1
             _OCR_NATIVE_CALL_CONDITION.notify_all()
@@ -304,9 +333,10 @@ def _cached_paddle_engine(cache_key: str) -> Any:
 def _get_paddle_engine(config: dict[str, Any]) -> Any:
     with _OCR_ENGINE_INIT_LOCK:
         if config.get("backend") or config.get("ocr_backend") or config.get("model_tier") or config.get("modelTier"):
-            from .ocr_runtime import get_ocr_runtime_engine
+            # 按当前车道取池化实例：同一轮 OCR（外层槽可重入）恒同一实例。
+            from .ocr_runtime import get_pooled_runtime_engine
 
-            return get_ocr_runtime_engine(config)
+            return get_pooled_runtime_engine(config, lane=_current_ocr_lane())
         cache_key = json.dumps(_runtime_init_kwargs(config), sort_keys=True)
         return _cached_paddle_engine(cache_key)
 

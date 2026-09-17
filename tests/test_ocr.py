@@ -194,13 +194,13 @@ def test_ocr_runtime_prefers_auto_backend_entry(monkeypatch):
 
     import vision.ocr_runtime as runtime_module
 
-    def fake_runtime_engine(config):
+    def fake_runtime_engine(config, lane=0):
         captured["config"] = dict(config)
         return DummyRuntimeEngine()
 
     monkeypatch.setattr(
         runtime_module,
-        "get_ocr_runtime_engine",
+        "get_pooled_runtime_engine",
         fake_runtime_engine,
     )
 
