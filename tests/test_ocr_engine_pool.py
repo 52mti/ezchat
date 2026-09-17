@@ -211,3 +211,77 @@ def test_worker_preload_stops_after_degraded_lane(tmp_path, monkeypatch):
 
     # lane1 拿到的是 0 号共享实例（降级形态）→ 立即止损，不再尝试 lane2
     assert warmed == [0, 1]
+
+
+def test_mode_file_backend_reaches_production_engine_config(monkeypatch):
+    """回归（20260917 PDX 崩溃链）：UI「OCR 引擎」切换写进模式文件的
+    ocr_backend 必须并入生产调用配置——此前生产只看 ocr 子树的 auto，
+    切换不生效，且与预热按模式配置建的引擎形成同进程双后端，进程内
+    PaddleX 拒绝二次初始化（每次 OCR 必炸）。"""
+    from PIL import Image
+
+    import copy
+
+    import apps.xinyu.ocr_rules as rules_module
+    from apps.xinyu.ocr_config import DIALOGUE_OCR_MODE
+
+    captured: list[dict] = []
+
+    def fake_ocr(image, config):
+        captured.append({k: config[k] for k in ("backend", "ocr_backend", "model_tier") if k in config})
+        return []
+
+    monkeypatch.setattr(rules_module, "ocr", fake_ocr)
+    image = Image.new("RGB", (100, 200), "white")
+    config = {
+        "ocr": {"backend": "auto", "model_tier": "lite", "det_db_thresh": 0.3},
+        "ocr_modes": {
+            "dialogue": {
+                **copy.deepcopy(DIALOGUE_OCR_MODE),
+                "ocr_backend": "cpu",
+            }
+        },
+    }
+
+    rules_module.run_ocr_mode(image, config, "dialogue")
+
+    assert captured and captured[0]["ocr_backend"] == "cpu"  # 切换生效
+    assert captured[0]["model_tier"] == "lite"  # ocr 子树键保留
+
+
+def test_worker_preload_merges_ocr_subtree_and_mode_keys(tmp_path, monkeypatch):
+    """预热与生产必须命中同一池：引擎配置 = ocr 子树 + 模式文件引擎键。"""
+    from services.config_manager import ConfigManager
+    from workers.device_worker import DeviceWorker
+
+    captured: list[dict] = []
+
+    class _Engine:
+        def preload(self) -> str:
+            return "cpu"
+
+    def fake_pool(config, lane=0):
+        captured.append(dict(config))
+        return _Engine()
+
+    import vision.ocr_runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "get_pooled_runtime_engine", fake_pool)
+    monkeypatch.setattr(runtime_mod, "engine_pool_size_for", lambda config: 1)
+
+    worker = DeviceWorker(
+        {"ip": "192.168.1.108", "selected_app": "xinyu"},
+        app_config={
+            "poll_interval": 1,
+            "ocr": {"backend": "auto", "model_tier": "lite", "det_db_thresh": 0.3},
+            "ocr_modes": {"list": {"ocr_backend": "cpu", "rules": {"min_confidence": 0.3}}},
+        },
+        events=__import__("queue").Queue(),
+        config_manager=ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json"),
+        robot=object(),
+    )
+
+    worker._preload_ocr_engines()
+
+    assert captured and captured[0]["ocr_backend"] == "cpu"
+    assert captured[0]["backend"] == "auto"  # ocr 子树基底保留
+    assert captured[0]["model_tier"] == "lite"

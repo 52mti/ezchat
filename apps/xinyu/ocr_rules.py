@@ -2140,6 +2140,13 @@ def _run_ocr_mode_locked(
         raise ValueError(f"ocr_modes.{mode}.preprocess must be a dict")
     portrait_image = ensure_portrait_image(image)
     primary_ocr_config = dict(base_ocr)
+    # 模式文件里的引擎键（UI「OCR 引擎」切换写入 ocr_backend）必须并入调用
+    # 配置：否则生产链路看不到切换（仍走 ocr 子树的 auto），与预热线程按
+    # 模式配置建的引擎形成同进程双后端——进程内模式下 PaddleX 拒绝二次
+    # 初始化（PDX already initialized，20260917 客户机每次 OCR 必炸）。
+    for engine_key in ("ocr_backend", "backend", "model_tier", "modelTier", "ocr_engine_pool_size"):
+        if engine_key in mode_config:
+            primary_ocr_config[engine_key] = mode_config[engine_key]
     primary_ocr_config["region"] = region
     primary_ocr_config["preprocess"] = "original"
     primary_ocr_config["scale"] = preprocess["scale"]

@@ -704,9 +704,16 @@ class DeviceWorker(threading.Thread):
                 mode_config = ocr_modes.get(mode_key)
                 if not isinstance(mode_config, dict) or not mode_config:
                     continue
+                # 与生产调用同构的引擎配置（ocr 子树 + 模式文件引擎键）：
+                # 两边必须命中同一池——否则同进程双后端引擎，进程内模式
+                # 下 PaddleX 拒绝二次初始化（PDX already initialized）。
+                engine_config = dict(self.app_config.get("ocr", {})) if isinstance(self.app_config.get("ocr"), dict) else {}
+                for engine_key in ("ocr_backend", "backend", "model_tier", "modelTier", "ocr_engine_pool_size"):
+                    if engine_key in mode_config:
+                        engine_config[engine_key] = mode_config[engine_key]
                 first_engine = None
-                for lane in range(engine_pool_size_for(mode_config)):
-                    engine = get_pooled_runtime_engine(mode_config, lane=lane)
+                for lane in range(engine_pool_size_for(engine_config)):
+                    engine = get_pooled_runtime_engine(engine_config, lane=lane)
                     if lane > 0 and engine is first_engine:
                         # 该车道实例创建失败已降级共享 0 号（引擎侧已留痕），
                         # 继续往后预热只会重复空试创建，就此打住。
