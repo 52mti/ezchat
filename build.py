@@ -1166,7 +1166,10 @@ def _cleanup_python_caches(package_root: Path) -> None:
 
 def _write_full_package_runtime_state(package_root: Path, *, model_tier: str, nvidia_cuda_lane: str) -> None:
     state_path = package_root / "runtime" / "install_state.json"
-    model_spec = _manifest_default_model_spec(package_root, backend_key="cpu", model_tier=model_tier)
+    # install_state 的 models 谱取 paddle_cuda 档：launcher 据 provider==
+    # paddlex_named_models 校验包内 paddlex 模型文件齐全（N 卡机在用）；
+    # 若取 cpu/directml 档（rapid_onnx_v5）该校验会被跳过，丢安全网。
+    model_spec = _manifest_default_model_spec(package_root, backend_key="paddle_cuda", model_tier=model_tier)
     payload = {
         "schema_version": 5,
         "backend": "auto",

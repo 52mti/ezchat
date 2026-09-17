@@ -11,7 +11,8 @@ fastapi
 uvicorn
 
 # Full-package OCR runtimes are assembled during build:
-# - Common OCR packages: paddleocr + paddlex[ocr-core]
-# - NVIDIA: paddlepaddle-gpu
+# - NVIDIA: paddlepaddle-gpu + paddleocr/paddlex (Paddle-CUDA)
 # - AMD/Intel Windows GPU: onnxruntime-directml + rapidocr_onnxruntime
-# - CPU: paddlepaddle
+# - CPU: 复用 onnxruntime-directml 引擎跑 ORT CPU EP（20260917 起，
+#   paddlepaddle CPU 推理比 ORT 慢 ~5 倍，不再单独打包）
+# - v5 onnx 模型（cpu/dml 后端用）在 models/ocr/rapid_onnx_models，随包收录
