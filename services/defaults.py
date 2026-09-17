@@ -8,7 +8,9 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "poll_interval": 1,
     "keep_awake_interval_seconds": 200,
     "exclude_ocr_wait_from_step_timeout": True,
-    "ocr_max_concurrency": 1,
+    # 这里绝不能放 ocr_max_concurrency——with_app_defaults 会把它并进每个
+    # app 配置顶层，作为显式并发覆盖把并发槽压回 1、抵消引擎池（曾长期
+    # 强制全串行）。引擎并发由 global.ocr_engine_pool_size 控制。
 }
 
 DEFAULT_PERSONA_CONFIG: dict[str, Any] = {

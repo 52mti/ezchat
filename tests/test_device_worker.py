@@ -474,3 +474,42 @@ def test_is_stale_worker_event_rules():
     assert device_worker_module.is_stale_worker_event(stale, SimpleNamespace(worker_id="w-old")) is False
     # 无标记的事件（本地TTS/设备扫描等基础设施事件）永远不丢
     assert device_worker_module.is_stale_worker_event(device_worker_module.WorkerEvent("本地TTS", "info", "started"), None) is False
+
+
+def test_worker_injects_engine_pool_size_and_drops_legacy_concurrency(tmp_path, monkeypatch):
+    """主 UI「引擎并发数」链路：global.ocr_engine_pool_size（默认 2）注入 app
+    配置 ocr 子树、app 级值优先；旧 ocr_max_concurrency 注入必须移除——
+    它作为显式并发覆盖会把并发槽压回 1，曾长期抵消引擎池。"""
+    monkeypatch.setattr(device_worker_module, "get_registered_apps", lambda: {"dummy": DummyApp})
+    manager = ConfigManager(tmp_path / "config.json", tmp_path / "outbox.json")
+
+    worker = DeviceWorker(
+        {"ip": "192.168.1.108", "selected_app": "dummy"},
+        app_config={"poll_interval": 1},
+        events=queue.Queue(),
+        config_manager=manager,
+        robot=object(),
+    )
+    ocr = worker.app_config["ocr"]
+    assert ocr["ocr_engine_pool_size"] == 2
+    assert "max_concurrency" not in ocr
+    assert "ocr_max_concurrency" not in worker.app_config
+
+    manager.set("global", "ocr_engine_pool_size", value=3)
+    worker2 = DeviceWorker(
+        {"ip": "192.168.1.108", "selected_app": "dummy"},
+        app_config={"poll_interval": 1},
+        events=queue.Queue(),
+        config_manager=manager,
+        robot=object(),
+    )
+    assert worker2.app_config["ocr"]["ocr_engine_pool_size"] == 3
+
+    worker3 = DeviceWorker(
+        {"ip": "192.168.1.108", "selected_app": "dummy"},
+        app_config={"poll_interval": 1, "ocr": {"ocr_engine_pool_size": 1}},
+        events=queue.Queue(),
+        config_manager=manager,
+        robot=object(),
+    )
+    assert worker3.app_config["ocr"]["ocr_engine_pool_size"] == 1  # app 级优先

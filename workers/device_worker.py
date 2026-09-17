@@ -174,14 +174,17 @@ class DeviceWorker(threading.Thread):
         self.app_name = app_name
         self.app_config = with_app_defaults(app_config or self.config_manager.get_app_config(str(device["ip"]), app_name, {}))
         global_config = self.config_manager.get("global", default={})
+        # 引擎池大小注入：主 UI「引擎并发数」（global.ocr_engine_pool_size，
+        # 默认 2）→ app 配置 ocr 子树；app 级显式值优先。旧 ocr_max_concurrency
+        # 注入已移除——它作为显式并发覆盖会把并发槽压回 1，强制全串行。
         try:
-            ocr_max_concurrency = int(global_config.get("ocr_max_concurrency", 1) or 1)
+            engine_pool_size = int(global_config.get("ocr_engine_pool_size", 2) or 2)
         except (TypeError, ValueError):
-            ocr_max_concurrency = 1
-        self.app_config["ocr_max_concurrency"] = min(16, max(1, ocr_max_concurrency))
-        ocr_config = self.app_config.get("ocr", {})
-        if isinstance(ocr_config, dict):
-            ocr_config["max_concurrency"] = self.app_config["ocr_max_concurrency"]
+            engine_pool_size = 2
+        engine_pool_size = min(4, max(1, engine_pool_size))
+        ocr_config = self.app_config.setdefault("ocr", {})
+        if not ocr_config.get("ocr_engine_pool_size"):
+            ocr_config["ocr_engine_pool_size"] = engine_pool_size
         runtime_context = self.app_config.setdefault("_runtime", {})
         if isinstance(runtime_context, dict):
             runtime_context["device_ip"] = str(device["ip"])
@@ -326,14 +329,15 @@ class DeviceWorker(threading.Thread):
             runtime["ocr_backend"] = _ocr_backend_label_from_state()
             runtime["config_manager"] = self.config_manager
             runtime["rule_learning"] = global_config.get("rule_learning", {}) if isinstance(global_config, dict) else {}
+        # 引擎池大小随全局配置热生效（主 UI 改「引擎并发数」下一轮起作用）。
         try:
-            ocr_max_concurrency = int(global_config.get("ocr_max_concurrency", 1) or 1)
+            engine_pool_size = int(global_config.get("ocr_engine_pool_size", 2) or 2)
         except (TypeError, ValueError):
-            ocr_max_concurrency = 1
-        fresh["ocr_max_concurrency"] = min(16, max(1, ocr_max_concurrency))
-        ocr_config = fresh.get("ocr")
-        if isinstance(ocr_config, dict):
-            ocr_config["max_concurrency"] = fresh["ocr_max_concurrency"]
+            engine_pool_size = 2
+        engine_pool_size = min(4, max(1, engine_pool_size))
+        ocr_config = fresh.setdefault("ocr", {})
+        if not ocr_config.get("ocr_engine_pool_size"):
+            ocr_config["ocr_engine_pool_size"] = engine_pool_size
 
         self.app_config.clear()
         self.app_config.update(fresh)

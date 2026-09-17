@@ -710,13 +710,19 @@ class MainWindow(QMainWindow):
         top_bar = QHBoxLayout(top_panel)
         top_bar.setContentsMargins(12, 10, 12, 10)
         top_bar.setSpacing(8)
-        top_bar.addWidget(QLabel("OCR并发"))
-        self.ocr_concurrency_input = NoWheelSpinBox()
-        self.ocr_concurrency_input.setRange(1, 16)
-        self.ocr_concurrency_input.setFixedWidth(72)
-        self.ocr_concurrency_input.setValue(int(self.config_manager.get("global", "ocr_max_concurrency", default=1) or 1))
-        self.ocr_concurrency_input.valueChanged.connect(self._save_ocr_concurrency)
-        top_bar.addWidget(self.ocr_concurrency_input)
+        engine_pool_label = QLabel("引擎并发数")
+        engine_pool_label.setToolTip(
+            "OCR 引擎实例数（每台同时运行的设备占一条车道）。\n"
+            "建议设为同时运行的设备数；GPU 每实例约占 0.8GB 显存，CPU 后端固定单实例。\n"
+            "修改对下一轮生效（无需重启）。"
+        )
+        top_bar.addWidget(engine_pool_label)
+        self.ocr_pool_size_input = NoWheelSpinBox()
+        self.ocr_pool_size_input.setRange(1, 4)
+        self.ocr_pool_size_input.setFixedWidth(72)
+        self.ocr_pool_size_input.setValue(int(self.config_manager.get("global", "ocr_engine_pool_size", default=2) or 2))
+        self.ocr_pool_size_input.valueChanged.connect(self._save_engine_pool_size)
+        top_bar.addWidget(self.ocr_pool_size_input)
         top_bar.addSpacing(12)
         top_bar.addWidget(QLabel("设备 IP"))
         self.device_ip_input = QLineEdit()
@@ -1529,8 +1535,13 @@ class MainWindow(QMainWindow):
             self._load_devices()
             self._append_log_line(device_ip, f"[{time.strftime('%H:%M:%S')}] [info] {device_ip}: device removed")
 
-    def _save_ocr_concurrency(self) -> None:
-        self.config_manager.set("global", "ocr_max_concurrency", value=self.ocr_concurrency_input.value())
+    def _save_engine_pool_size(self) -> None:
+        """引擎并发数 → global.ocr_engine_pool_size，worker 每轮热刷新注入。
+
+        旧 global.ocr_max_concurrency 注入链已废弃：它作为显式并发覆盖
+        会把并发槽压回 1（默认值），强制全串行——曾长期抵消引擎池。"""
+        value = min(4, max(1, int(self.ocr_pool_size_input.value() or 2)))
+        self.config_manager.set("global", "ocr_engine_pool_size", value=value)
 
     def _monitor_wall_devices_provider(self) -> list[dict[str, Any]]:
         """监控墙的设备列表源：2 秒 TTL 缓存。
