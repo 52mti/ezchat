@@ -24,12 +24,39 @@ class _FakeEngine:
 
 def test_engine_pool_size_resolution(monkeypatch):
     _use_backend(monkeypatch, "paddle_cuda")
+    monkeypatch.setattr(runtime_module, "adaptive_engine_pool_cap", lambda: 4)
     assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda"}) == 2
     assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 4}) == 4
-    # 上限 4：30 台设备场景显存恒定，不随设备数增长
+    # 自适应上限：请求值恒被空闲显存上限钳制（30 台设备显存也不越界）
     assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 30}) == 4
+    # 小显存卡（cap 2）：请求 4 只给 2；cap 1 时默认 2 也压到 1
+    monkeypatch.setattr(runtime_module, "adaptive_engine_pool_cap", lambda: 2)
+    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda", "ocr_engine_pool_size": 4}) == 2
+    monkeypatch.setattr(runtime_module, "adaptive_engine_pool_cap", lambda: 1)
+    assert runtime_module.engine_pool_size_for({"backend": "paddle_cuda"}) == 1
     _use_backend(monkeypatch, "cpu")
     assert runtime_module.engine_pool_size_for({"backend": "cpu", "ocr_engine_pool_size": 4}) == 1
+
+
+def test_adaptive_engine_pool_cap_from_free_vram(monkeypatch):
+    """自适应上限 = (空闲MB - 1GB 保留) / 1GB 每实例，绝对上限 8，
+    探测失败回退保守 4；结果进程内缓存（探测一次）。"""
+    monkeypatch.setattr(runtime_module, "_ADAPTIVE_POOL_CAP_CACHE", None)
+
+    monkeypatch.setattr(runtime_module, "_probe_gpu_free_mb", lambda: 5980)  # 8GB 卡
+    assert runtime_module.adaptive_engine_pool_cap() == 4
+
+    monkeypatch.setattr(runtime_module, "_ADAPTIVE_POOL_CAP_CACHE", None)
+    monkeypatch.setattr(runtime_module, "_probe_gpu_free_mb", lambda: 14336)  # 16GB 卡
+    assert runtime_module.adaptive_engine_pool_cap() == 8  # 绝对上限
+
+    monkeypatch.setattr(runtime_module, "_ADAPTIVE_POOL_CAP_CACHE", None)
+    monkeypatch.setattr(runtime_module, "_probe_gpu_free_mb", lambda: 1500)  # 小显存
+    assert runtime_module.adaptive_engine_pool_cap() == 1
+
+    monkeypatch.setattr(runtime_module, "_ADAPTIVE_POOL_CAP_CACHE", None)
+    monkeypatch.setattr(runtime_module, "_probe_gpu_free_mb", lambda: None)  # 探测失败
+    assert runtime_module.adaptive_engine_pool_cap() == 4
 
 
 def test_pooled_engine_assigns_instance_per_lane(monkeypatch):

@@ -110,7 +110,7 @@ from services.persona import resolve_persona
 from services.coordinate_cache import load_latest_into_runtime
 from services.vision_usage import reset as reset_vision_usage
 from ui.chat_history_window import ChatHistoryDialog
-from vision.ocr_runtime import normalize_ocr_backend
+from vision.ocr_runtime import adaptive_engine_pool_cap, normalize_ocr_backend
 from vision.screen import ensure_portrait_image
 from workers import DeviceWorker, WorkerEvent
 from workers.device_worker import _ocr_backend_label_from_state, is_stale_worker_event
@@ -718,7 +718,8 @@ class MainWindow(QMainWindow):
         )
         top_bar.addWidget(engine_pool_label)
         self.ocr_pool_size_input = NoWheelSpinBox()
-        self.ocr_pool_size_input.setRange(1, 4)
+        # 上限按空闲显存自适应（探测失败回退 4）：8GB 卡 → 4，16GB 卡 → 8。
+        self.ocr_pool_size_input.setRange(1, adaptive_engine_pool_cap())
         self.ocr_pool_size_input.setFixedWidth(72)
         self.ocr_pool_size_input.setValue(int(self.config_manager.get("global", "ocr_engine_pool_size", default=2) or 2))
         self.ocr_pool_size_input.valueChanged.connect(self._save_engine_pool_size)
@@ -1538,9 +1539,10 @@ class MainWindow(QMainWindow):
     def _save_engine_pool_size(self) -> None:
         """引擎并发数 → global.ocr_engine_pool_size，worker 每轮热刷新注入。
 
-        旧 global.ocr_max_concurrency 注入链已废弃：它作为显式并发覆盖
-        会把并发槽压回 1（默认值），强制全串行——曾长期抵消引擎池。"""
-        value = min(4, max(1, int(self.ocr_pool_size_input.value() or 2)))
+        请求值经引擎侧按空闲显存自适应钳制（cap=(空闲-1GB)/1GB，绝对上限
+        8）；旧 global.ocr_max_concurrency 注入链已废弃——它作为显式并发
+        覆盖会把并发槽压回 1（默认值），强制全串行，曾长期抵消引擎池。"""
+        value = min(adaptive_engine_pool_cap(), max(1, int(self.ocr_pool_size_input.value() or 2)))
         self.config_manager.set("global", "ocr_engine_pool_size", value=value)
 
     def _monitor_wall_devices_provider(self) -> list[dict[str, Any]]:

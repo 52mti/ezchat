@@ -181,7 +181,7 @@ class DeviceWorker(threading.Thread):
             engine_pool_size = int(global_config.get("ocr_engine_pool_size", 2) or 2)
         except (TypeError, ValueError):
             engine_pool_size = 2
-        engine_pool_size = min(4, max(1, engine_pool_size))
+        engine_pool_size = min(8, max(1, engine_pool_size))
         ocr_config = self.app_config.setdefault("ocr", {})
         if not ocr_config.get("ocr_engine_pool_size"):
             ocr_config["ocr_engine_pool_size"] = engine_pool_size
@@ -334,7 +334,7 @@ class DeviceWorker(threading.Thread):
             engine_pool_size = int(global_config.get("ocr_engine_pool_size", 2) or 2)
         except (TypeError, ValueError):
             engine_pool_size = 2
-        engine_pool_size = min(4, max(1, engine_pool_size))
+        engine_pool_size = min(8, max(1, engine_pool_size))
         ocr_config = fresh.setdefault("ocr", {})
         if not ocr_config.get("ocr_engine_pool_size"):
             ocr_config["ocr_engine_pool_size"] = engine_pool_size

@@ -1664,19 +1664,58 @@ _RUNTIME_ENGINE_RELEVANT_KEYS = {
     "text_recognition_model_dir",
 }
 
-# 引擎实例池（车道模型）：GPU 每实例 ~0.6-1GB（大头是 CUDA 上下文），
-# 池大小与设备数解耦——默认 2、上限 4、可配置；超过池大小的调用方在
-# 并发槽排队（车道模型），显存不随设备数增长（30 台设备也恒定 ~2GB）。
-# CPU/DirectML 多实例只会互相抢核，恒为 1。
+# 引擎实例池（车道模型）：GPU 每实例 ~1GB（CUDA 上下文是大头），池大小
+# 与设备数解耦；超过池大小的调用方在并发槽排队（车道模型）。CPU/DirectML
+# 多实例只会互相抢核，恒为 1。
+#
+# 上限按空闲显存自适应（探测一次缓存，进程内不再漂移——池缓存键含大小，
+# 漂移会裂出多个池）：cap = (空闲MB - 1GB 保留) / 1GB 每实例，绝对上限 8。
+# 8GB 卡空闲 ~6GB → cap 4；16GB 卡 → cap 8。探测失败回退保守 4。
+# 实例创建失败（显存被其他程序占用后不足）自动降级共享 0 号车道兜底。
 _DEFAULT_GPU_ENGINE_POOL_SIZE = 2
-_MAX_ENGINE_POOL_SIZE = 4
+_FALLBACK_GPU_ENGINE_POOL_CAP = 4
+_ABSOLUTE_MAX_ENGINE_POOL_SIZE = 8
+_ENGINE_INSTANCE_MB = 1024
+_ENGINE_POOL_VRAM_RESERVE_MB = 1024
 _POOLED_ENGINES: dict[str, list[Any]] = {}
 _POOLED_ENGINES_LOCK = threading.Lock()
+_ADAPTIVE_POOL_CAP_CACHE: int | None = None
+
+
+def _probe_gpu_free_mb() -> int | None:
+    """nvidia-smi 读空闲显存（MB）；失败/无 N 卡返回 None。"""
+    result = _run_command(
+        ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+        timeout_seconds=5,
+    )
+    if result is None or not result.stdout:
+        return None
+    try:
+        return int(str(result.stdout).strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def adaptive_engine_pool_cap() -> int:
+    """按空闲显存自适应的池上限（进程内缓存一次）。"""
+    global _ADAPTIVE_POOL_CAP_CACHE
+    if _ADAPTIVE_POOL_CAP_CACHE is None:
+        free_mb = _probe_gpu_free_mb()
+        if free_mb is None or free_mb <= 0:
+            _ADAPTIVE_POOL_CAP_CACHE = _FALLBACK_GPU_ENGINE_POOL_CAP
+        else:
+            budget = free_mb - _ENGINE_POOL_VRAM_RESERVE_MB
+            cap = budget // _ENGINE_INSTANCE_MB if budget > 0 else 0
+            _ADAPTIVE_POOL_CAP_CACHE = min(
+                _ABSOLUTE_MAX_ENGINE_POOL_SIZE, max(1, int(cap))
+            )
+    return _ADAPTIVE_POOL_CAP_CACHE
 
 
 def _engine_pool_size(config: dict[str, Any], backend: str) -> int:
     if backend != "paddle_cuda":
         return 1
+    requested = _DEFAULT_GPU_ENGINE_POOL_SIZE
     for key in ("ocr_engine_pool_size", "engine_pool_size"):
         if key in config:
             try:
@@ -1684,8 +1723,9 @@ def _engine_pool_size(config: dict[str, Any], backend: str) -> int:
             except (TypeError, ValueError):
                 value = 0
             if value >= 1:
-                return min(_MAX_ENGINE_POOL_SIZE, value)
-    return _DEFAULT_GPU_ENGINE_POOL_SIZE
+                requested = value
+                break
+    return max(1, min(requested, adaptive_engine_pool_cap()))
 
 
 def engine_pool_size_for(config: dict[str, Any]) -> int:
