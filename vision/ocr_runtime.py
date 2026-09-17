@@ -5,6 +5,7 @@ import dataclasses
 import hashlib
 import inspect
 import json
+import logging
 import os
 import platform
 import queue
@@ -40,6 +41,10 @@ SUPPORTED_BACKENDS = ("auto", "paddle_cuda", "onnx_directml", "cpu")
 SUPPORTED_EXECUTION_MODES = ("auto", "inprocess", "subprocess")
 DEFAULT_OCR_GPU_ALLOCATOR_STRATEGY = "auto_growth"
 DEFAULT_OCR_GPU_MEMORY_FRACTION = "0.6"
+# OCR 子进程生命周期留痕：经主程序的 jixiebijiaoben logger 落
+# runtime/logs/app_YYYYMMDD.log。客户机"一轮拉起几次/是否每调用一拉"
+# 由此可直接数行得出（此前 stderr 只进内存环形缓冲，重启无任何痕迹）。
+_OCR_RUNTIME_LOG = logging.getLogger("jixiebijiaoben").getChild("ocr_runtime")
 CUDA_LANE_INDEXES = {
     "cu118": "https://www.paddlepaddle.org.cn/packages/stable/cu118/",
     "cu126": "https://www.paddlepaddle.org.cn/packages/stable/cu126/",
@@ -1249,6 +1254,7 @@ class SubprocessOcrRuntimeEngine:
         self._shm_failed = False
         self._response_queue: "queue.Queue[bytes | None]" = queue.Queue()
         self._stderr_tail: "deque[str]" = deque(maxlen=self.STDERR_TAIL_LINES)
+        self._spawn_count = 0
 
     def _runtime_python_path(self) -> Path:
         root = _package_root()
@@ -1351,6 +1357,14 @@ class SubprocessOcrRuntimeEngine:
             startupinfo=startupinfo,
             creationflags=creationflags,
         )
+        self._spawn_count += 1
+        _OCR_RUNTIME_LOG.info(
+            "[ocr-subprocess] 拉起 #%d backend=%s tier=%s pid=%s",
+            self._spawn_count,
+            self.backend,
+            self.model_tier,
+            getattr(self._process, "pid", "?"),
+        )
         # 每代进程配全新响应队列，避免旧进程残留响应污染新会话。
         self._response_queue = queue.Queue()
         self._start_pipe_workers(self._process)
@@ -1406,13 +1420,24 @@ class SubprocessOcrRuntimeEngine:
             except queue.Empty:
                 # 不再无限挂死：杀进程（下次调用自动重启重载模型），
                 # 全局引擎锁随之释放，其他设备可继续。
-                self.close()
                 tail = "".join(list(self._stderr_tail)[-5:]).strip()
+                _OCR_RUNTIME_LOG.error(
+                    "[ocr-subprocess] 响应超时 %.0fs（第 %d 代），关闭待重拉；stderr 尾部: %s",
+                    self.RESPONSE_TIMEOUT_SECONDS,
+                    self._spawn_count,
+                    tail[:300],
+                )
+                self.close()
                 raise TimeoutError(
                     f"OCR subprocess did not respond within {self.RESPONSE_TIMEOUT_SECONDS:.0f}s. {tail}"
                 ) from None
             if line is None:
                 stderr_output = "".join(list(self._stderr_tail)[-10:]).strip()
+                _OCR_RUNTIME_LOG.error(
+                    "[ocr-subprocess] 子进程意外退出（第 %d 代），关闭待重拉；stderr 尾部: %s",
+                    self._spawn_count,
+                    stderr_output[:300],
+                )
                 self.close()
                 raise RuntimeError(f"OCR subprocess exited unexpectedly. {stderr_output}".strip())
             try:
@@ -1424,8 +1449,14 @@ class SubprocessOcrRuntimeEngine:
                 self.close()
                 raise RuntimeError("OCR subprocess returned an invalid response payload.")
             if not bool(response.get("ok", False)):
+                error_text = str(response.get("error", "OCR subprocess request failed."))
+                _OCR_RUNTIME_LOG.error(
+                    "[ocr-subprocess] 请求报错（第 %d 代），关闭待重拉: %s",
+                    self._spawn_count,
+                    error_text[:300],
+                )
                 self.close()
-                raise RuntimeError(str(response.get("error", "OCR subprocess request failed.")))
+                raise RuntimeError(error_text)
             # predict 响应顺带实际设备与子进程内部分段耗时，记录供观测。
             device_seen = str(response.get("device", "") or "").strip()
             if device_seen:

@@ -522,3 +522,56 @@ def test_build_kwargs_mirrors_custom_non_ascii_model_dir_on_windows(tmp_path, mo
     resolved_path = runtime_module.Path(kwargs["text_detection_model_dir"])
     assert resolved_path.parent == mirror_root
     assert (resolved_path / "inference.json").is_file()
+
+
+def test_subprocess_runtime_logs_lifecycle_events(tmp_path, monkeypatch, caplog):
+    """OCR 子进程拉起必须落盘留痕（runtime/logs/app_*.log 经 jixiebijiaoben
+    logger）：客户机"是否每调用一拉"靠数 [ocr-subprocess] 行判定。存活期间
+    重复 _start_process 不重复拉起。"""
+    import logging as logging_module
+
+    state_path = tmp_path / "runtime" / "install_state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps({"status": "installed", "validation": "ok", "backend": "cpu"}),
+        encoding="utf-8",
+    )
+    runtime_python = tmp_path / "runtime" / "ocr_cpu" / "python.exe"
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_text("python", encoding="utf-8")
+
+    class FakeProcess:
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def __init__(self) -> None:
+            self.pid = 4321
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(runtime_module, "_runtime_state_path", lambda project_root=None: state_path)
+    monkeypatch.setattr(runtime_module, "_package_root", lambda project_root=None: tmp_path)
+    monkeypatch.setattr(runtime_module, "runtime_python", lambda root, runtime_name, gui=False: runtime_python)
+    monkeypatch.setattr(runtime_module.subprocess, "Popen", lambda command, **kwargs: FakeProcess())
+    monkeypatch.setattr(runtime_module.subprocess, "STARTUPINFO", lambda: type("StartupInfo", (), {"dwFlags": 0})())
+    monkeypatch.setattr(runtime_module.subprocess, "STARTF_USESHOWWINDOW", 1, raising=False)
+
+    engine = runtime_module.SubprocessOcrRuntimeEngine(
+        backend="cpu",
+        model_tier="lite",
+        manifest=runtime_module.load_runtime_manifest(),
+        config={},
+    )
+
+    with caplog.at_level(logging_module.INFO, logger="jixiebijiaoben"):
+        engine._start_process()
+        engine._start_process()  # 存活期间复用，不重复拉起
+        engine._process = None  # 模拟进程消亡
+        engine._start_process()
+
+    spawn_logs = [record for record in caplog.records if "拉起 #" in record.getMessage()]
+    assert len(spawn_logs) == 2
+    assert "#1" in spawn_logs[0].getMessage() and "#2" in spawn_logs[1].getMessage()
+    assert engine._spawn_count == 2
