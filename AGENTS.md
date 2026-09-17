@@ -22,6 +22,13 @@ These rules apply to the entire workspace.
 - Before running any build/packaging command, verify the current working directory is the official directory above. If it is not, stop and ask the user first.
 - Reason: a package was once built from a Codex worktree copy and shipped to a customer, which broke the customer's environment. This must never happen again.
 
+## 发版防事故规则（Release Rules）
+
+- **版本三元组硬校验**：`runtime_manifest.json` 的 `appVersion` / `runtimeVersion` / `modelVersion` 任一为空，`build.py` 直接失败（`_require_release_versions`）。不要绕过该校验打包。背景（20260917-02 P0）：空 `runtimeVersion` 的清单曾随更新包下发到客户机，客户机"检查更新"读本地清单即抛错，**更新通道整体卡死，任何修复包都无法再送达**，只能逐台手工修清单解锁。
+- **云端清单和包内清单是两份**：`dist/release.json`（服务端）与更新包 zip 内携带的 `runtime_manifest.json`（会落地到客户机）互为独立产物。修发版链问题时只补云端字段不算修复——包内清单必须在**打包之前**于仓库 `runtime_manifest.json` 修好（打包从工作区取文件）。
+- **发布后必验证**：`curl` 云端 `release.json` 确认 `app_version`/`runtime_version`/`model_version` 非空、`requires_full_package` 符合预期、更新包 URL 200；更新包有变化时抽查 zip 内 `runtime_manifest.json` 字段。
+- **引擎版本变更是大事**：`runtime_version` 与客户机已装版本不一致会强制全量（3.7GB）。只有引擎重组件真变了才允许改它；纯代码提速走轻量更新，版本保持与已装一致。
+
 ## 数据分层规范（Data Layering Rules）
 
 权威口径见 `docs/11-数据分层规范.md`；`build.py`（打包收录）与 `update_apply.py`（更新保护）与其互为镜像。任何新增落盘数据必须按以下三层归位：

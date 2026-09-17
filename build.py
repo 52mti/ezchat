@@ -246,6 +246,32 @@ def _runtime_version(root: Path) -> str:
     return str(payload.get("runtimeVersion", "") or payload.get("version", "") or "").strip()
 
 
+def _require_release_versions(app_version: str, runtime_version: str, model_version: str) -> None:
+    """发版版本三元组硬校验（20260917-02 P0 的直接闸门）。
+
+    事故链：仓库 runtime_manifest.json 的 runtimeVersion/modelVersion 曾被
+    清空 → 构建原样放行 → 更新包把空字段清单发到客户机 → 客户机检查更新
+    读本地清单抛 missing version fields → 更新通道整体卡死，修复包再也
+    到不了现场。任一字段为空一律在打包期失败，绝不带着坏清单出包。
+    """
+    missing = [
+        name
+        for name, value in (
+            ("appVersion", app_version),
+            ("runtimeVersion", runtime_version),
+            ("modelVersion", model_version),
+        )
+        if not str(value or "").strip()
+    ]
+    if missing:
+        raise SystemExit(
+            "[error] runtime_manifest.json 版本字段为空: "
+            + ", ".join(missing)
+            + "。空字段清单随更新包下发会卡死客户机更新通道（20260917-02 P0），"
+            "先在 runtime_manifest.json 补全版本再打包。"
+        )
+
+
 def _model_version(root: Path, *, model_tier: str) -> str:
     payload = _runtime_manifest_payload(root)
     configured = str(payload.get("modelVersion", "") or "").strip()
@@ -1800,6 +1826,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     runtime_version = _runtime_version(root)
     model_version = _model_version(root, model_tier=args.model_tier)
+    _require_release_versions(app_version, runtime_version, model_version)
     cache_dir = _package_cache_dir(root, package_cache_key)
     if _package_cache_complete(
         cache_dir,

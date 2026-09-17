@@ -894,6 +894,16 @@ def test_main_default_builds_update_only(tmp_path, monkeypatch):
     dist_root = tmp_path / "dist"
     package_root = tmp_path / "staging" / build.PACKAGE_NAME
     package_root.mkdir(parents=True)
+    (tmp_path / "runtime_manifest.json").write_text(
+        json.dumps(
+            {
+                "appVersion": "20260917-05",
+                "runtimeVersion": "2026.09.10-engine",
+                "modelVersion": "2026.06.02-lite",
+            }
+        ),
+        encoding="utf-8",
+    )
     update_zip = dist_root / f"{build.PACKAGE_NAME}_update.zip"
     update_zip.parent.mkdir(parents=True)
     update_zip.write_bytes(b"update")
@@ -922,3 +932,16 @@ def test_main_default_builds_update_only(tmp_path, monkeypatch):
     assert build.main(["--skip-release-upload"]) == 0
     assert runtime_calls == []
     assert full_calls == []
+
+
+def test_require_release_versions_rejects_empty_fields():
+    """回归（20260917-02 P0）：空版本字段的清单随更新包下发会卡死客户机
+    更新通道，必须在打包期直接失败。"""
+    build._require_release_versions("20260917-05", "2026.09.10-engine", "2026.06.02-lite")
+
+    with pytest.raises(SystemExit, match="runtimeVersion"):
+        build._require_release_versions("20260917-05", "", "2026.06.02-lite")
+    with pytest.raises(SystemExit, match="modelVersion"):
+        build._require_release_versions("20260917-05", "2026.09.10-engine", "")
+    with pytest.raises(SystemExit, match="appVersion"):
+        build._require_release_versions("", "2026.09.10-engine", "2026.06.02-lite")
