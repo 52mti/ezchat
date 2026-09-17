@@ -110,9 +110,10 @@ from services.persona import resolve_persona
 from services.coordinate_cache import load_latest_into_runtime
 from services.vision_usage import reset as reset_vision_usage
 from ui.chat_history_window import ChatHistoryDialog
+from vision.ocr_runtime import normalize_ocr_backend
 from vision.screen import ensure_portrait_image
 from workers import DeviceWorker, WorkerEvent
-from workers.device_worker import is_stale_worker_event
+from workers.device_worker import _ocr_backend_label_from_state, is_stale_worker_event
 
 
 
@@ -1174,6 +1175,25 @@ class MainWindow(QMainWindow):
         item = self.table.item(row, COL_DEVICE_IP)
         return item.text() if item else ""
 
+    @staticmethod
+    def _device_backend_login_page_html(login_url: str) -> str:
+        escaped = html.escape(login_url, quote=True)
+        return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>正在进入设备后台</title></head>
+<body style="font-family:sans-serif;background:#121212;color:#e0e0e0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="text-align:center"><h3>正在登录设备后台…</h3><p>登录完成后会自动打开后台页面，本页可以关闭。</p></div>
+<iframe id="login" style="display:none"></iframe>
+<script>
+(function () {{
+  var doc = document.getElementById('login').contentWindow.document;
+  doc.open();
+  doc.write('<form id="f" action="{escaped}" method="post"><input type="hidden" name="password" value="admin"></form>');
+  doc.close();
+  doc.getElementById('f').submit();
+}})();
+</script></body></html>
+"""
+
     def _open_device_backend(self, row: int) -> None:
         device_ip = self._device_ip_for_row(row).strip()
         if not device_ip:
@@ -1184,22 +1204,24 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "打开设备后台", "当前设备 IP 格式无效。")
             return
 
-        # 设备后台使用表单会话登录，程序请求登录接口得到的 Cookie 无法交给默认
-        # 浏览器。因此由浏览器打开一次性自动提交页，让 Cookie 在浏览器会话中创建。
+        # 新版后台的会话 Cookie 带 SameSite=Strict：由本地登录页发起的跨站
+        # 表单提交，其重定向请求不会携带 Cookie，浏览器会被弹回登录页
+        # （实测复现）。因此拆成两段：登录页用隐藏 iframe 完成登录（Cookie
+        # 落入浏览器，页面本身不跳转），随后由程序以 OS 级方式再次打开
+        # 后台首页——等价于地址栏访问（无跨站发起方），Strict Cookie 会
+        # 随请求携带，直接进入设置页。老版后台（无 SameSite）同样成立。
         login_url = f"http://{normalized_ip}:8888/login"
+        backend_url = f"http://{normalized_ip}:8888/"
         login_page = Path(tempfile.gettempdir()) / f"jixiebijiaoben_device_backend_{normalized_ip.replace(':', '_')}.html"
-        page_html = f"""<!doctype html>
-<html><head><meta charset=\"utf-8\"><title>Opening device backend</title></head>
-<body><form id=\"login\" action=\"{html.escape(login_url, quote=True)}\" method=\"post\">
-<input type=\"hidden\" name=\"password\" value=\"admin\">
-</form><script>document.getElementById('login').submit();</script></body></html>
-"""
         try:
-            login_page.write_text(page_html, encoding="utf-8")
+            login_page.write_text(self._device_backend_login_page_html(login_url), encoding="utf-8")
         except OSError as exc:
             QMessageBox.warning(self, "打开设备后台", f"无法创建后台登录页：{exc}")
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(login_page)))
+        # 冷启动的浏览器加载登录页要数秒；等 iframe 登录落库后再开后台。
+        # 浏览器已热时登录毫秒级完成，多等一拍无感知。
+        QTimer.singleShot(4000, lambda: QDesktopServices.openUrl(QUrl(backend_url)))
 
     def _show_chat_history(self, row: int) -> None:
         device = self._device_for_row(row)
@@ -3569,6 +3591,33 @@ class AppConfigDialog(QDialog):
         self.det_db_thresh.setValue(float(ocr.get("det_db_thresh", 0.3)))
         form.addRow("OCR det_db_thresh", self.det_db_thresh)
 
+        # OCR 引擎后端：客户可自行在 自动/CPU/GPU 间切换（弱显卡机器 GPU 推理
+        # 可比 CPU 慢几十倍，20260917 客户机 paddle_cuda 单次推理 4~16s）。
+        # 选择写入 dialogue/list 两个模式客户层文件（ocr_backend 键），引擎
+        # 按后端键缓存，下一次 OCR 调用即切换，无需重启。
+        backend_row = QHBoxLayout()
+        self.ocr_backend_combo = QComboBox()
+        for value, label in (
+            ("auto", "自动（按硬件探测）"),
+            ("cpu", "CPU（稳定优先）"),
+            ("paddle_cuda", "GPU 加速（NVIDIA 显卡）"),
+        ):
+            self.ocr_backend_combo.addItem(label, value)
+        configured_backend = self._configured_ocr_backend(overrides)
+        backend_index = self.ocr_backend_combo.findData(configured_backend)
+        self.ocr_backend_combo.setCurrentIndex(max(0, backend_index))
+        backend_row.addWidget(self.ocr_backend_combo, 1)
+        backend_hint = QLabel("切换即时生效（下一次 OCR 起效）。GPU 异常自动回退 CPU；弱显卡的机器选 CPU 通常更快。")
+        backend_hint.setObjectName("HelperLabel")
+        backend_hint.setWordWrap(True)
+        backend_row.addWidget(backend_hint, 1)
+        form.addRow("OCR 引擎", backend_row)
+        effective_backend = _ocr_backend_label_from_state()
+        if effective_backend:
+            effective_label = QLabel(f"当前生效：{effective_backend}")
+            effective_label.setObjectName("HelperLabel")
+            form.addRow("", effective_label)
+
         self.rec_thresh = NoWheelDoubleSpinBox()
         self.rec_thresh.setRange(0.0, 1.0)
         self.rec_thresh.setSingleStep(0.01)
@@ -4048,6 +4097,19 @@ class AppConfigDialog(QDialog):
         if not is_visible:
             self.tabs.setCurrentIndex(self.ocr_tab_index)
 
+    @staticmethod
+    def _configured_ocr_backend(overrides: dict[str, Any]) -> str:
+        """读客户已配置的 OCR 后端（dialogue/list 模式文件同键同值，取首个非 auto）。"""
+        ocr_modes = overrides.get("ocr_modes", {}) if isinstance(overrides.get("ocr_modes", {}), dict) else {}
+        for mode_key in ("list", "dialogue"):
+            mode = ocr_modes.get(mode_key, {})
+            if not isinstance(mode, dict):
+                continue
+            value = normalize_ocr_backend(mode.get("ocr_backend", mode.get("backend", "")))
+            if value != "auto":
+                return value
+        return "auto"
+
     def values(self) -> dict[str, Any]:
         values = dict(self.overrides)
         values.pop("new_greeting_click_x_offset", None)
@@ -4088,6 +4150,17 @@ class AppConfigDialog(QDialog):
                 )
             mode_config["preprocess"] = preprocess
             mode_config["rules"] = rules
+            ocr_modes[mode_key] = mode_config
+        # OCR 引擎选择：写入两个模式的客户层文件；选"自动"时移除键回到
+        # 硬件探测默认（客户层文件若因此为空会被保存链整体清理）。
+        backend_choice = str(self.ocr_backend_combo.currentData() or "auto")
+        for mode_key in ("dialogue", "list"):
+            mode_config = dict(ocr_modes.get(mode_key, {}) if isinstance(ocr_modes.get(mode_key, {}), dict) else {})
+            mode_config.pop("backend", None)
+            if backend_choice == "auto":
+                mode_config.pop("ocr_backend", None)
+            else:
+                mode_config["ocr_backend"] = backend_choice
             ocr_modes[mode_key] = mode_config
 
         values.update({

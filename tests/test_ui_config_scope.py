@@ -693,3 +693,35 @@ def test_vision_calibration_dialog_draws_regions_on_result(qtbot):
 
     dialog.set_result({"ok": False, "reason": "视觉连续两次未返回双方消息，无法标定"})
     assert "标定未生效" in dialog.status_label.text()
+
+
+def test_app_config_ocr_backend_selection_round_trips(qtbot, tmp_path):
+    """OCR 引擎选择：values() 把选择写进 dialogue/list 两个模式的 ocr_backend；
+    选"自动"时移除键回到硬件探测默认。保存链会把 ocr_modes 拆写进客户层
+    两个模式文件，下一次 OCR 调用即切换（引擎按后端键缓存）。"""
+    dialog = AppConfigDialog(
+        {
+            "ocr_modes": {
+                "list": {"ocr_backend": "paddle_cuda", "rules": {"min_confidence": 0.3}},
+                "dialogue": {"ocr_backend": "paddle_cuda"},
+            }
+        },
+        device_ip="192.168.1.108",
+        app_name="xinyu",
+        template_root=tmp_path / "templates",
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.ocr_backend_combo.currentData() == "paddle_cuda"
+
+    dialog.ocr_backend_combo.setCurrentIndex(dialog.ocr_backend_combo.findData("cpu"))
+    values = dialog.values()
+    assert values["ocr_modes"]["list"]["ocr_backend"] == "cpu"
+    assert values["ocr_modes"]["dialogue"]["ocr_backend"] == "cpu"
+    # 既有客户规则不丢
+    assert values["ocr_modes"]["list"]["rules"]["min_confidence"] == 0.3
+
+    dialog.ocr_backend_combo.setCurrentIndex(dialog.ocr_backend_combo.findData("auto"))
+    values = dialog.values()
+    assert "ocr_backend" not in values["ocr_modes"]["list"]
+    assert "ocr_backend" not in values["ocr_modes"]["dialogue"]
