@@ -1103,6 +1103,22 @@ class MainWindow(QMainWindow):
         return write_orchestration_script(script_dir)
 
 
+    def _restored_row_status(self, device_ip: str) -> str:
+        """表格重建（扫描/增删设备）时按存活 worker 恢复行状态。
+
+        不能一律置 "stopped"：正在运行的 worker 会被误标成"已停止"，
+        且 tick 守卫会把这个错误状态锁死——表现为日志照常刷、机器照常
+        动，行却永远显示已停止（客户长跑现场的真实症状）。
+        """
+        worker = self.workers.get(device_ip)
+        if worker is None or not worker.is_alive():
+            return "stopped"
+        if worker.stop_requested:
+            return "stopping"
+        if getattr(worker, "is_paused", False):
+            return "paused"
+        return "running"
+
     def _load_devices(self) -> None:
         devices = self.config_manager.devices()
         self.table.setRowCount(len(devices))
@@ -1114,7 +1130,7 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, COL_LICENSE, QTableWidgetItem(mask_secret(str(device.get("license_key", "")))))
             self.table.setItem(row, COL_EXPIRES, QTableWidgetItem(str(device.get("license_expires", "") or "-")))
             self.table.setItem(row, COL_DEVICE_IP, QTableWidgetItem(str(device.get("ip", ""))))
-            self.table.setItem(row, COL_STATUS, self._status_item("stopped"))
+            self.table.setItem(row, COL_STATUS, self._status_item(self._restored_row_status(str(device.get("ip", "")))))
             self.table.setItem(row, COL_DEVICE_HEALTH, self._device_health_item("unknown"))
             self.table.setItem(row, COL_AVG_REPLY_SECONDS, self._avg_reply_item())
             self.table.setItem(row, COL_UNATTENDED_SECONDS, self._unattended_item(self._unattended_seconds_for_device(str(device.get("ip", "")))))
@@ -2339,7 +2355,13 @@ class MainWindow(QMainWindow):
             self._append_log_event(event)
         if level == "status":
             if self._row_status_for_device(event_ip) in {"stopping", "stopped"}:
-                return
+                # 默认丢弃（拦旧 worker 退出期间的迟到 tick）；但当前注册的
+                # worker 仍存活且未请求停止时，说明行状态是被误置的（表格
+                # 重建等），放行让状态在一个轮询周期内自愈——否则活 worker
+                # 的状态永远回不来，行卡死在"已停止"。
+                worker = self.workers.get(event_ip)
+                if worker is None or not worker.is_alive() or worker.stop_requested:
+                    return
             is_open = bool(payload.get("is_circuit_open"))
             current_step = str(payload.get("current_step", "") or "")
             detail = strip_status_coordinates(str(payload.get("current_step_label", "") or ""))

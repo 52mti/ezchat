@@ -361,6 +361,11 @@ class DeviceWorker(threading.Thread):
     def stop_requested(self) -> bool:
         return self._stop_event.is_set()
 
+    @property
+    def is_paused(self) -> bool:
+        # UI 表格重建时按存活 worker 恢复行状态需要区分"在跑/已暂停"。
+        return not self._pause_event.is_set()
+
     def _emit(self, level: str, message: str, payload: dict[str, Any] | None = None) -> None:
         self._record_log_entry(self._log_entry(level, message, payload))
         self.events.put(WorkerEvent(str(self.device["ip"]), level, message, payload, self.worker_id))
