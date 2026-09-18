@@ -109,6 +109,9 @@ EMPTY_LIST_TARGET_NAMES = {
     "\u6ca1\u6709\u6d88\u606f",
     "\u65e0\u6d88\u606f",
 }
+# 未回复视图兜底行的最低昵称长度：空列表时 OCR 把空态提示撕成单字碎片行
+# （"三"/"日"），真实联系人昵称几乎不可能是单字（20260917 幽灵行点击事故）。
+FALLBACK_ROW_MIN_NAME_LENGTH = 2
 
 SCREEN_TEMPLATE_ALIASES: dict[str, tuple[str, ...]] = {
     CHAT_LIST_SCREEN: ("screen_聊天列表.jpg", "chat_list.jpg", "screen_message_list.jpg"),
@@ -856,8 +859,11 @@ def _select_list_target_from_ocr_result(
 def _fallback_unread_view_target(ocr_result: dict[str, Any]) -> dict[str, Any] | None:
     """未回复视图兜底：行既无角标也无 OCR 可读预览（纯表情/图片消息）时取首行有效会话。
 
-    调用前提：check_unread_button 已确认处于「未回复」过滤视图——该视图内
-    每一行按定义都是待回复会话，行级角标/预览门槛在此是冗余的。
+    调用前提：check_unread_button 已确认处于「未回复」过滤视图。但页签红色判定
+    会误判（20260917 空列表事故：列表已空时选中态页签高亮/残留红点仍判红），空态
+    提示文字被 OCR 撕成的单字碎片（"三"/"日"）也会形成幽灵行——所以兜底行必须过
+    可信度门槛：昵称至少 2 个字符。真实联系人昵称几乎不可能是单字，而空态碎片行
+    恰恰几乎都是单字或纯符号。
     """
     result = ocr_result.get("result", {}) if isinstance(ocr_result, dict) else {}
     rows = result.get("message_list", []) if isinstance(result, dict) else []
@@ -866,7 +872,7 @@ def _fallback_unread_view_target(ocr_result: dict[str, Any]) -> dict[str, Any] |
     for row in rows:
         if not isinstance(row, dict) or _is_empty_list_row(row):
             continue
-        if not _clean_list_text(row.get("name")):
+        if len(_clean_list_text(row.get("name"))) < FALLBACK_ROW_MIN_NAME_LENGTH:
             continue
         bounds = row.get("bounds")
         if not isinstance(bounds, list) or len(bounds) != 4:
@@ -2186,6 +2192,14 @@ def find_unread_target(
             ),
         )
         return fallback
+    # 红门说有未回复、行选择说没有（无角标、无预览、无可信兜底行）→ 信行选择：
+    # 红色像素判定会误报（选中态页签高亮/残留红点），按无消息空转而不是强行点击。
+    _report(
+        reporter,
+        "list_target_red_mismatch",
+        "未回复入口红色与列表内容矛盾，按无消息处理",
+        log_label="未回复入口显示红色，但无角标、无可读预览、无可信兜底行，按无消息处理",
+    )
     return None
 
 
@@ -2392,6 +2406,45 @@ def confirm_chat_window(
     if not _matches_screen(image, cfg, CHAT_WINDOW_SCREEN):
         raise StepUnavailable(f"未匹配到聊天界面模板：{_template_failure_detail(cfg, CHAT_WINDOW_SCREEN, group='screens')}")
     return image
+
+
+def confirm_chat_window_after_list_click(
+    robot: Any,
+    config: dict[str, Any] | None = None,
+    reporter: Reporter | None = None,
+) -> Any | None:
+    """点击列表行后的进入确认（降级版，20260917 幽灵行熔断事故）。
+
+    顺序：
+    1. 优先按原语义匹配聊天界面（首拍未中再复拍一次，容忍慢导航）；
+    2. 仍未进聊天 → 判断是否停留在聊天列表：在列表说明点中的是不可进入的
+       幽灵行（OCR 碎片/空态文字），返回 None 交调用方按无消息空转——
+       不计运行异常、不触发设备复位；
+    3. 既非聊天也非列表（未知状态）→ 保持原异常语义，由上层复位恢复。
+    黑屏/无手机异常不在捕获范围内，保持各自的独立语义。
+    """
+    cfg = _config(config)
+    try:
+        return confirm_chat_window(robot, cfg, reporter=reporter)
+    except StepUnavailable as first_error:
+        error_text = str(first_error)
+    time.sleep(0.8)
+    retry_image = capture_after_popups(robot, cfg, label="chat_window_retry", reporter=reporter)
+    _raise_if_black_screen(retry_image, cfg)
+    if _matches_screen(retry_image, cfg, CHAT_WINDOW_SCREEN):
+        _report(reporter, "enter_chat", "聊天界面复拍确认成功")
+        return retry_image
+    if _matches_screen(retry_image, cfg, CHAT_LIST_SCREEN) or _matches_chat_list_screen(
+        retry_image, cfg, reporter=reporter
+    ):
+        _report(
+            reporter,
+            "enter_chat_still_list",
+            "点击后仍在聊天列表，判定为不可进入行",
+            log_label="点击后仍在聊天列表：该行不可进入，本轮按无消息处理",
+        )
+        return None
+    raise StepUnavailable(error_text)
 
 
 def send_new_greeting_if_available(

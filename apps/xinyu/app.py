@@ -851,7 +851,20 @@ class XinyuApp(BaseApp):
             )
             steps.enter_chat(self.robot, float(target["x"]), float(target["y"]))
             self._mark_activity()
-            chat_image = steps.confirm_chat_window(self.robot, self.config, reporter=reporter)
+            chat_image = steps.confirm_chat_window_after_list_click(self.robot, self.config, reporter=reporter)
+            if chat_image is None:
+                # 点击后仍在列表页：选中的是 OCR 幽灵行/不可进入行（20260917 熔断事故）。
+                # 良性状态按无消息空转，不计运行异常、不触发设备复位。
+                self.emit_runtime_log(
+                    "warning",
+                    "心遇点击后仍在列表页",
+                    {"name": target_name, "x": float(target["x"]), "y": float(target["y"])},
+                )
+                reporter("enter_chat_skipped", "点击后仍在列表，本轮不进入聊天")
+                self._run_idle_maintenance(reporter)
+                self._emit_round_metrics(round_started_at)
+                self.mark_success()
+                return
             if steps.send_new_greeting_if_available(self.robot, self.config, image=chat_image, reporter=reporter):
                 self._mark_activity()
                 # 平台代发的新招呼：文本读不到，写占位轮保证人设知道是自己先开的口（docs/13 4.4）
