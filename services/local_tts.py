@@ -17,6 +17,10 @@ import requests
 DEFAULT_TTS_PORT = 9999
 DEFAULT_DEVICE_BACKEND_PASSWORD = "admin"
 DEFAULT_DEVICE_BACKEND_TIMEOUT_SECONDS = 30.0
+# 新版后台 HTTP 并发能力弱：绑定与设备截图流并发时会被 RST(10054)/超时。
+# 绑定是幂等操作（只重写 tts_url），失败后退避重试即可吃掉拥塞窗口。
+DEFAULT_BIND_ATTEMPTS = 3
+DEFAULT_BIND_RETRY_DELAY_SECONDS = 4.0
 # 必须与 tts/server.py 的 SERVER_VERSION 一致；单测会校验两者同步。
 EXPECTED_SERVER_VERSION = "2"
 _RECOVERY_LOCK = threading.RLock()
@@ -47,17 +51,28 @@ def bind_device_tts(
     *,
     port: int = DEFAULT_TTS_PORT,
     timeout: float = DEFAULT_DEVICE_BACKEND_TIMEOUT_SECONDS,
+    attempts: int = DEFAULT_BIND_ATTEMPTS,
+    retry_delay: float = DEFAULT_BIND_RETRY_DELAY_SECONDS,
 ) -> str:
     """登录设备后台并保存本机 TTS 地址，返回实际写入的地址。"""
     normalized_ip = str(ipaddress.ip_address(device_ip))
     base_url = f"http://{normalized_ip}:8888"
     tts_url = tts_url_for_device(normalized_ip, port=port)
-    session = requests.Session()
-    login = session.post(f"{base_url}/login", data={"password": DEFAULT_DEVICE_BACKEND_PASSWORD}, timeout=timeout)
-    login.raise_for_status()
-    response = session.post(f"{base_url}/save_sys_config", data={"tts_url": tts_url}, timeout=timeout)
-    response.raise_for_status()
-    return tts_url
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        session = requests.Session()
+        try:
+            login = session.post(f"{base_url}/login", data={"password": DEFAULT_DEVICE_BACKEND_PASSWORD}, timeout=timeout)
+            login.raise_for_status()
+            response = session.post(f"{base_url}/save_sys_config", data={"tts_url": tts_url}, timeout=timeout)
+            response.raise_for_status()
+            return tts_url
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts:
+                time.sleep(retry_delay)
+    assert last_error is not None
+    raise last_error
 
 
 class LocalTtsServer:

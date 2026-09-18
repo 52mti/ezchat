@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
+import contextlib
 import copy
-import html
 import importlib
 import ipaddress
 import json
@@ -108,6 +108,7 @@ from services import (
 )
 from services.persona import resolve_persona
 from services.coordinate_cache import load_latest_into_runtime
+from services.device_backend_proxy import DeviceBackendProxyManager
 from services.vision_usage import reset as reset_vision_usage
 from ui.chat_history_window import ChatHistoryDialog
 from vision.ocr_runtime import adaptive_engine_pool_cap, normalize_ocr_backend
@@ -687,6 +688,7 @@ class MainWindow(QMainWindow):
         self._pending_update_decision: ReleaseDecision | None = None
         self._pending_update_package: ResolvedUpdatePackage | None = None
         self.local_tts_server = LocalTtsServer()
+        self.device_backend_proxies = DeviceBackendProxyManager()
         self._tts_bind_lock = threading.Lock()
         self._tts_bind_in_progress: set[str] = set()
         self.setWindowTitle("机械臂视觉控制系统")
@@ -1182,25 +1184,6 @@ class MainWindow(QMainWindow):
         item = self.table.item(row, COL_DEVICE_IP)
         return item.text() if item else ""
 
-    @staticmethod
-    def _device_backend_login_page_html(login_url: str) -> str:
-        escaped = html.escape(login_url, quote=True)
-        return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>正在进入设备后台</title></head>
-<body style="font-family:sans-serif;background:#121212;color:#e0e0e0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
-<div style="text-align:center"><h3>正在登录设备后台…</h3><p>登录完成后会自动打开后台页面，本页可以关闭。</p></div>
-<iframe id="login" style="display:none"></iframe>
-<script>
-(function () {{
-  var doc = document.getElementById('login').contentWindow.document;
-  doc.open();
-  doc.write('<form id="f" action="{escaped}" method="post"><input type="hidden" name="password" value="admin"></form>');
-  doc.close();
-  doc.getElementById('f').submit();
-}})();
-</script></body></html>
-"""
-
     def _open_device_backend(self, row: int) -> None:
         device_ip = self._device_ip_for_row(row).strip()
         if not device_ip:
@@ -1211,25 +1194,25 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "打开设备后台", "当前设备 IP 格式无效。")
             return
 
-        # 新版后台的会话 Cookie 带 SameSite=Strict：由本地登录页发起的跨站
-        # 表单提交，其重定向请求不会携带 Cookie，浏览器会被弹回登录页
-        # （实测复现）。因此拆成两段：登录页用隐藏 iframe 完成登录（Cookie
-        # 落入浏览器，页面本身不跳转），随后由程序以 OS 级方式再次打开
-        # 后台首页——等价于地址栏访问（无跨站发起方），Strict Cookie 会
-        # 随请求携带，直接进入设置页。老版后台（无 SameSite）同样成立。
-        login_url = f"http://{normalized_ip}:8888/login"
-        backend_url = f"http://{normalized_ip}:8888/"
-        login_page = Path(tempfile.gettempdir()) / f"jixiebijiaoben_device_backend_{normalized_ip.replace(':', '_')}.html"
+        # 设备后台一律经本机反向代理打开：浏览器只与 127.0.0.1 同源，登录
+        # Cookie 由代理内部持有。老版后台（Cookie 无 SameSite）与新版后台
+        # （SameSite=Strict，页面发起的跨站跳转带不上 Cookie）走同一条路，
+        # 且不再向 %TEMP% 写跳板页。
+        self._cleanup_legacy_device_backend_login_pages()
         try:
-            login_page.write_text(self._device_backend_login_page_html(login_url), encoding="utf-8")
-        except OSError as exc:
-            QMessageBox.warning(self, "打开设备后台", f"无法创建后台登录页：{exc}")
+            proxy_url = self.device_backend_proxies.open_url(normalized_ip)
+        except Exception as exc:
+            QMessageBox.warning(self, "打开设备后台", f"无法连接设备后台：{exc}")
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(login_page)))
-        # 冷启动的浏览器加载登录页要数秒；等 iframe 登录落库后再开后台。
-        # 浏览器已热时登录毫秒级完成，多等一拍无感知。
-        QTimer.singleShot(4000, lambda: QDesktopServices.openUrl(QUrl(backend_url)))
+        QDesktopServices.openUrl(QUrl(proxy_url))
 
+    @staticmethod
+    def _cleanup_legacy_device_backend_login_pages() -> None:
+        # 旧版本会往 %TEMP% 写 jixiebijiaoben_device_backend_<ip>.html 跳板页；
+        # 顺手清掉历史遗留，新流程不再产生任何文件。
+        for path in Path(tempfile.gettempdir()).glob("jixiebijiaoben_device_backend_*.html"):
+            with contextlib.suppress(OSError):
+                path.unlink()
     def _show_chat_history(self, row: int) -> None:
         device = self._device_for_row(row)
         if not device:
@@ -1673,6 +1656,10 @@ class MainWindow(QMainWindow):
         def stop_tts() -> None:
             try:
                 self.local_tts_server.stop()
+            except Exception:
+                pass
+            try:
+                self.device_backend_proxies.close_all()
             except Exception:
                 pass
 
@@ -2167,6 +2154,11 @@ class MainWindow(QMainWindow):
             contact = str(payload.get("contact", "") or "")
             content = str(payload.get("content", "") or "")
             return f"[{event.level}] {event.device_ip}: 心遇发送后未能返回列表 [{contact}] {content}"
+        if event.message == "心遇点击后仍在列表页":
+            name = str(payload.get("name", "") or "")
+            x = payload.get("x", "")
+            y = payload.get("y", "")
+            return f"[{event.level}] {event.device_ip}: 心遇点击后仍在列表页，跳过该行 [{name}] ({x}, {y})"
         if event.message == "no_phone_detected":
             return f"[{event.level}] {event.device_ip}: 检测到无手机 {payload.get('error', '')}"
         if event.message == "black_screen_detected":

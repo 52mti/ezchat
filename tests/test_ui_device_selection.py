@@ -3,6 +3,7 @@ import pytest
 
 import json
 import re
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PyQt6.QtCore import QPoint
@@ -277,23 +278,37 @@ def test_device_context_menu_lists_app_and_device_settings_actions(qtbot, tmp_pa
     assert "恢复" not in seen
 
 
-def test_open_device_backend_uses_current_device_ip(qtbot, tmp_path, monkeypatch):
+def test_open_device_backend_opens_local_proxy(qtbot, tmp_path, monkeypatch):
     window = _window(qtbot, tmp_path, [{"ip": "192.168.1.133", "selected_app": "wechat"}])
     opened: list[str] = []
+    delayed: list[tuple[int, object]] = []
+    requested_ips: list[str] = []
     monkeypatch.setattr("ui.main_window.tempfile.gettempdir", lambda: str(tmp_path))
+    # 历史版本遗留在 %TEMP% 的跳板页应被顺带清理
+    (tmp_path / "jixiebijiaoben_device_backend_192.168.1.133.html").write_text("legacy", encoding="utf-8")
 
     monkeypatch.setattr(
         "ui.main_window.QDesktopServices.openUrl",
         lambda url: opened.append(url.toString()) or True,
     )
+    monkeypatch.setattr(
+        "ui.main_window.QTimer.singleShot",
+        lambda ms, cb: delayed.append((ms, cb)),
+    )
+    monkeypatch.setattr(
+        window,
+        "device_backend_proxies",
+        SimpleNamespace(open_url=lambda ip: requested_ips.append(ip) or "http://127.0.0.1:41000/"),
+    )
 
     window._open_device_backend(0)
 
-    assert opened == [(tmp_path / "jixiebijiaoben_device_backend_192.168.1.133.html").as_uri()]
-    page = (tmp_path / "jixiebijiaoben_device_backend_192.168.1.133.html").read_text(encoding="utf-8")
-    assert 'action="http://192.168.1.133:8888/login"' in page
-    assert 'name="password" value="admin"' in page
-    assert "submit()" in page
+    # 直接一步打开本机反向代理：浏览器只见后台页面，没有延迟第二跳
+    assert opened == ["http://127.0.0.1:41000/"]
+    assert requested_ips == ["192.168.1.133"]
+    assert delayed == []
+    # 不再向 %TEMP% 写跳板页，历史遗留也被清掉
+    assert not list(tmp_path.glob("jixiebijiaoben_device_backend_*.html"))
 
 
 def test_status_event_shows_current_step_and_average_reply_time(qtbot, tmp_path):
