@@ -1,10 +1,13 @@
-"""列表条带小范围 OCR 行为测试。
+"""列表固定条带 OCR 行为测试。
 
-契约：条带覆盖「未回复」Tab 带，有行即返回（不依赖导航缓存合并，
-不再"同帧门槛失败→回退全屏"每轮双 OCR）；Tab 位置永远来自当前帧。
+契约（20260919 起 compact 固定 [0, 0.05, 1, 0.30]，与顶部条带同区域）：
+条带有行即返回；无行（含横幅把「未回复」Tab/首行压出条带的场景）回退
+完整 OCR，首行不漏；旧版自适应缓存（ocr_regions.list_compact）不再生效。
 """
 
 from __future__ import annotations
+
+import pytest
 
 import apps.xinyu.steps as steps
 
@@ -17,7 +20,8 @@ def _config_with_cache(cache: dict) -> dict:
     }
 
 
-def test_run_list_ocr_returns_compact_without_full_fallback(monkeypatch):
+def test_run_list_ocr_returns_fixed_band_without_full_fallback(monkeypatch):
+    # 缓存里的旧自适应区域应被无视：实际扫描区域恒为固定条带
     cache = {"ocr_regions": {"list_compact": [0.0, 0.06, 1.0, 0.82]}}
     config = _config_with_cache(cache)
     calls: list = []
@@ -37,37 +41,15 @@ def test_run_list_ocr_returns_compact_without_full_fallback(monkeypatch):
     monkeypatch.setattr(steps, "_run_ocr_mode", fake_ocr)
     result = steps._run_list_ocr("img", config)
 
-    assert calls == [[0.0, 0.06, 1.0, 0.82]]  # 只跑一次条带，无全屏回退
+    assert calls[0] == pytest.approx([0.0, 0.05, 1.0, 0.30])  # 只跑一次固定条带，无全屏回退
+    assert len(calls) == 1
     assert result["result"]["message_list"][0]["name"] == "微风"
     item, center = steps._unread_tab_item(result)
     assert item is not None and "未回复" in item.get("name", "")  # 条带结果自带入口位置
 
 
-def test_unread_tab_band_extends_compact_top():
-    cache = {"ocr_regions": {"list_compact": [0.0, 0.28, 1.0, 0.60]}}
-    config = _config_with_cache(cache)
-
-    steps._cache_unread_tab_band(config, [0.0, 0.10, 1.0, 0.15])
-
-    band = cache["ocr_regions"]["unread_tab_band"]
-    compact = cache["ocr_regions"]["list_compact"]
-    assert compact[1] <= band[1]  # 条带上界已盖住 Tab 带
-    assert compact[1] + compact[3] >= 0.85  # 下界不缩水
-
-
-def test_compact_learn_covers_unread_band_even_above_list_region():
-    """Tab 带顶（0.092）可能高于列表区域顶（0.1）：学习不得把它切掉。"""
-    cache = {"ocr_regions": {"unread_tab_band": [0.0, 0.092, 1.0, 0.053]}}
-    config = _config_with_cache(cache)
-    ocr_result = {"result": {"message_list": [{"bounds": [0.1, 0.30, 0.9, 0.40]}]}}
-
-    steps._cache_list_compact_region_from_ocr_result(config, ocr_result)
-
-    compact = cache["ocr_regions"]["list_compact"]
-    assert compact[1] <= 0.092
-
-
 def test_compact_falls_back_to_full_when_rows_empty(monkeypatch):
+    """条带无行（如 Tab/首行被横幅压到 0.30 以下）→ 回退完整 OCR，首行不漏。"""
     cache = {"ocr_regions": {"list_compact": [0.0, 0.06, 1.0, 0.82]}}
     config = _config_with_cache(cache)
     calls: list = []
@@ -85,5 +67,6 @@ def test_compact_falls_back_to_full_when_rows_empty(monkeypatch):
     monkeypatch.setattr(steps, "_run_ocr_mode", fake_ocr)
     result = steps._run_list_ocr("img", config)
 
-    assert calls == [[0.0, 0.06, 1.0, 0.82], None]  # 条带空 → 回退全屏一次
+    assert calls[0] == pytest.approx([0.0, 0.05, 1.0, 0.30])  # 条带空 → 回退全屏一次
+    assert calls[1] is None
     assert result["result"]["message_list"][0]["name"] == "微风"

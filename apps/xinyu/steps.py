@@ -1260,53 +1260,33 @@ def _valid_region(value: Any) -> list[float] | None:
     return [left, top, width, height]
 
 
-def _cache_list_compact_region_from_ocr_result(config: dict[str, Any], ocr_result: dict[str, Any]) -> None:
-    if not _optimization_enabled(config, "enable_compact_list_ocr_region"):
-        return
-    result = ocr_result.get("result", {})
-    rows = result.get("message_list", []) if isinstance(result, dict) else []
-    if not isinstance(rows, list) or not rows:
-        return
-    full_region = _valid_region(_region(config, MESSAGE_LIST_REGION)) or [0.0, 0.1, 1.0, 0.9]
-    row_bounds = [
-        row.get("bounds")
-        for row in rows
-        if isinstance(row, dict) and isinstance(row.get("bounds"), list) and len(row.get("bounds")) == 4
-    ]
-    if not row_bounds:
-        return
-    top_margin = float(config.get("list_compact_top_margin", 0.02) or 0.02)
-    bottom_margin = float(config.get("list_compact_bottom_margin", 0.02) or 0.02)
-    first_row_top = min(float(bounds[1]) for bounds in row_bounds)
-    list_top = max(float(full_region[1]), first_row_top - top_margin)
-    # 「未回复」Tab 带可能高于配置列表区顶（如 0.092 < 0.1）：
-    # 以 Tab 带顶再上探，不被 full_region 顶卡死，否则条带永远看不到 Tab 排。
-    unread_band = _valid_region(_cache_get(config, "ocr_regions", "unread_tab_band"))
-    if unread_band is not None:
-        list_top = min(list_top, max(0.0, float(unread_band[1]) - 0.01))
-    bottom_nav_region = _valid_region(_cache_get(config, "ocr_regions", "bottom_nav"))
-    full_bottom = float(full_region[1]) + float(full_region[3])
-    bottom_nav_top = float(bottom_nav_region[1]) if bottom_nav_region is not None else full_bottom
-    list_bottom = min(full_bottom, bottom_nav_top - bottom_margin)
-    # 档位对齐（形状稳定）：上下边界向外吸附到 bucket 归一化档的整数倍。
-    # 同设备截图尺寸恒定，归一化档即像素档（0.05 档 ≈ 64px）——列表行数
-    # 小变落在同一档，OCR 引擎不再每轮见到新输入尺寸（GPU 引擎对每种
-    # 新形状首次调用要付约 10 秒调机，此前列表 compact 每轮都在触发）。
-    # 向外取整只扩不切，底部半行本就识别不全且有无有效行回退完整 OCR 兜底。
-    # bucket<=0 关闭对齐，回到逐轮精确边界。
+def _fixed_list_band_region(config: dict[str, Any]) -> list[float] | None:
+    """列表固定条带：compact 与顶部条带共用同一区域（20260919 客户口径统一）。
+
+    背景：自适应 compact 从上一轮全扫行界推导并缓存，横幅把「未回复」Tab
+    带压低后缓存边界不再覆盖首行，且只在条带完全无行时才会重算——客户机
+    出现"第一条永远不回复"。固定条带 + 无行回退全扫后：Tab/首行被压到
+    条带之外时条带扫不到任何行，自动回退完整 OCR，首行不漏。
+
+    边界 0.05~list_top_strip_bottom（默认 0.35，即 [0, 0.05, 1, 0.30]
+    高度口径），按 bucket（0.05）档位对齐保持引擎输入形状稳定（GPU 引擎
+    每种新形状首次调用约 10 秒调机）。bucket<=0 关闭对齐。
+    """
+    top = 0.05
+    bottom = float(config.get("list_top_strip_bottom", 0.35) or 0.35)
     bucket = float(config.get("list_compact_region_bucket", 0.05) or 0)
     if bucket > 0:
-        list_top = max(0.0, math.floor(list_top / bucket) * bucket)
-        list_bottom = min(1.0, math.ceil(list_bottom / bucket) * bucket)
-    if list_bottom - list_top < float(config.get("list_compact_min_height", 0.2) or 0.2):
-        return
-    _cache_set(config, "ocr_regions", "list_compact", [0.0, list_top, 1.0, list_bottom - list_top])
+        top = max(0.0, math.floor(top / bucket) * bucket)
+        bottom = min(0.9, math.ceil(bottom / bucket) * bucket)
+    if bottom - top < 0.1:
+        return None
+    return [0.0, top, 1.0, bottom - top]
 
 
 def _list_compact_region(config: dict[str, Any]) -> list[float] | None:
     if not _optimization_enabled(config, "enable_compact_list_ocr_region"):
         return None
-    return _valid_region(_cache_get(config, "ocr_regions", "list_compact"))
+    return _fixed_list_band_region(config)
 
 
 def _bottom_nav_strip_region(config: dict[str, Any]) -> list[float]:
@@ -1326,24 +1306,16 @@ def _bottom_nav_strip_region(config: dict[str, Any]) -> list[float]:
 
 
 def _list_top_strip_region(config: dict[str, Any]) -> list[float] | None:
-    """列表顶部条带：只覆盖最上面几行会话 + 「未回复」Tab 带。
+    """列表顶部条带：与 compact 共用固定区域（20260919 统一口径）。
 
     选目标本就是取最上方带角标的行——批量打招呼场景（全列表角标）条带
     必命中，把每轮主扫描从全列表（30+ 条文字 ~1.5s+）压到 ~10 条文字
     （~0.5s）。未命中（顶部无未读）回落既有 compact/全量链，下方未读
-    不漏。档位对齐与 compact 同口径，保持引擎形状稳定。
+    不漏。两链同区域同形状，引擎只调机一次。
     """
     if not _optimization_enabled(config, "enable_list_top_strip_scan"):
         return None
-    bottom = float(config.get("list_top_strip_bottom", 0.35) or 0.35)
-    bucket = float(config.get("list_compact_region_bucket", 0.05) or 0)
-    top = 0.05
-    if bucket > 0:
-        top = math.floor(top / bucket) * bucket
-        bottom = min(0.9, math.ceil(bottom / bucket) * bucket)
-    if bottom - top < 0.1:
-        return None
-    return [0.0, top, 1.0, bottom - top]
+    return _fixed_list_band_region(config)
 
 
 def _run_list_ocr(
@@ -1378,12 +1350,12 @@ def _run_list_ocr(
         _report(
             reporter,
             "list_ocr_region",
-            "复用列表主体小范围 OCR 结果" if compact_result.get("_cache_hit") else "使用列表主体小范围 OCR",
+            "复用列表固定条带 OCR 结果" if compact_result.get("_cache_hit") else "使用列表固定条带 OCR",
         )
         rows = compact_result.get("result", {}).get("message_list", [])
         if isinstance(rows, list) and rows:
             return compact_result
-        _report(reporter, "list_ocr_region", "列表主体无有效行，回退完整 OCR")
+        _report(reporter, "list_ocr_region", "列表固定条带无有效行，回退完整 OCR")
     ocr_result = _run_ocr_mode(image, config, "list", region=None)
     _report(
         reporter,
@@ -1391,7 +1363,6 @@ def _run_list_ocr(
         "复用上一轮 list OCR 结果" if ocr_result.get("_cache_hit") else "列表 OCR 扫描",
     )
     _cache_bottom_nav_from_ocr_result(config, ocr_result)
-    _cache_list_compact_region_from_ocr_result(config, ocr_result)
     return ocr_result
 
 
@@ -1463,14 +1434,8 @@ def _cache_unread_tab_band(config: dict[str, Any], bounds: list[float]) -> None:
     band_bottom = min(1.0, bottom + pad)
     if band_bottom > band_top:
         _cache_set(config, "ocr_regions", "unread_tab_band", [0.0, band_top, 1.0, band_bottom - band_top])
-        # 已有列表条带时同步上探上界：下一轮条带 OCR 才能覆盖 Tab 排，
-        # Tab 位置永远取当前帧（未回复条带位置可能随横幅漂移）。
-        compact = _valid_region(_cache_get(config, "ocr_regions", "list_compact"))
-        if compact is not None and band_top < float(compact[1]):
-            new_top = max(0.0, band_top - 0.01)
-            new_height = float(compact[1]) + float(compact[3]) - new_top
-            if new_height >= float(config.get("list_compact_min_height", 0.2) or 0.2):
-                _cache_set(config, "ocr_regions", "list_compact", [0.0, new_top, 1.0, new_height])
+        # 列表条带已固定（0.05 起），正常 Tab 带恒在其内；横幅把 Tab 压低时
+        # 条带扫不到行自然回退完整 OCR，无需再动态上探条带上界。
 
 
 def _chat_list_title_region(config: dict[str, Any]) -> tuple[float, float, float, float] | None:
@@ -2055,7 +2020,6 @@ def check_unread_button(
         _report(reporter, "unread_button_check", "当前 OCR 未找到未回复入口，回退完整 OCR")
         full_ocr = _run_ocr_mode(current_image, cfg, "list", region=None)
         _cache_bottom_nav_from_ocr_result(cfg, full_ocr)
-        _cache_list_compact_region_from_ocr_result(cfg, full_ocr)
         unread_item = _unread_tab_item(full_ocr)
         if unread_item is not None:
             ocr_result = full_ocr
@@ -3450,6 +3414,40 @@ def build_list_message(target: dict[str, Any], content: str) -> dict[str, str]:
         "unread_count": str(target.get("unread_count", "")),
         "favorability": str(target.get("favorability", "")),
     }
+
+
+def flush_pending_input(
+    robot: Any,
+    config: dict[str, Any] | None = None,
+    *,
+    image: Any | None = None,
+    reporter: Reporter | None = None,
+) -> bool:
+    """进入聊天后补发输入框残留文本（20260919）。
+
+    背景：语音输入轮次在文本已进入输入框后发送失败（异常/复位中断），
+    下次进入该会话输入框仍有字——此时发送按钮可匹配。再走一遍完整
+    回复流程会造成重复输入，正确动作就是点一下发送、返回聊天列表，
+    本轮即完成。返回 False 表示无残留（发送按钮不可匹配），走正常流程。
+    """
+    cfg = _config(config)
+    current_image = image if image is not None else capture_after_popups(
+        robot, cfg, label="pending_input_check", reporter=reporter
+    )
+    pos = _template_center(current_image, cfg, SEND_BUTTON_KEY, group="buttons")
+    if pos is None:
+        return False
+    _report(
+        reporter,
+        "pending_input_flush",
+        "输入框有残留文本，点击发送",
+        log_label=f"输入框有残留文本，点击发送：{format_point(*pos)}",
+    )
+    click_image_point(robot, *pos)
+    time.sleep(0.5)
+    # go_back 内部 ensure_send_cleared 会在按钮仍在时补点一次发送兜底
+    go_back(robot, cfg, reporter=reporter)
+    return True
 
 
 def focus_input_box(

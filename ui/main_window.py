@@ -2159,6 +2159,9 @@ class MainWindow(QMainWindow):
             x = payload.get("x", "")
             y = payload.get("y", "")
             return f"[{event.level}] {event.device_ip}: 心遇点击后仍在列表页，跳过该行 [{name}] ({x}, {y})"
+        if event.message == "心遇补发输入框残留文本":
+            name = str(payload.get("name", "") or "")
+            return f"[{event.level}] {event.device_ip}: 心遇补发输入框残留文本，本轮完成 [{name}]"
         if event.message == "no_phone_detected":
             return f"[{event.level}] {event.device_ip}: 检测到无手机 {payload.get('error', '')}"
         if event.message == "black_screen_detected":

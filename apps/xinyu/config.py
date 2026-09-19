@@ -82,9 +82,10 @@ DEFAULT_CONFIG = {
     "enable_compact_list_ocr_region": True,
     "enable_compact_dialogue_ocr_region": True,
     "enable_unread_tab_band_cache": True,
-    "list_compact_top_margin": 0.02,
-    "list_compact_bottom_margin": 0.02,
-    "list_compact_min_height": 0.2,
+    # 列表固定条带（compact 与顶部条带共用，[0, 0.05, 1, 0.30] 高度口径）：
+    # 底界与档位对齐仍可调。
+    "list_top_strip_bottom": 0.35,
+    "list_compact_region_bucket": 0.05,
     "dialogue_message_input_box_top_margin": 0.065,
     # 视觉模型确认双方消息后，本地 OCR 坐标向左右扩展的安全边距。
     "dialogue_sender1_left_margin": 0.05,

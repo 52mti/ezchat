@@ -304,7 +304,8 @@ def test_xinyu_reuses_same_screenshot_ocr_and_template_detection(monkeypatch, tm
     reporter = lambda step, label, log_label=None: reports.append((step, label))
     steps._run_list_ocr(image, config, reporter=reporter)
     steps._run_list_ocr(image, config, reporter=reporter)
-    assert ocr_calls == 1
+    # 固定条带恒生效：首轮 = 条带一次 + 全屏一次；第二轮条带与全屏均命中复用缓存
+    assert ocr_calls == 2
     assert ("list_ocr_scan", "复用上一轮 list OCR 结果") in reports
 
     assert steps._matches_screen(image, config, steps.CHAT_LIST_SCREEN)
@@ -767,8 +768,9 @@ def test_xinyu_unreplied_filter_clicks_when_no_red(monkeypatch, tmp_path):
 
     assert image == "after"
     assert robot.clicks == [pytest.approx((0.3, 0.15))]
-    # 顶部条带快路径：重扫先条带、未命中未读再回落——无未读轮次多一次小扫描
-    assert ocr_calls == ["list", "after", "after"]
+    # 固定条带恒生效：初扫条带+全屏各一次；切换后条带（未命中未读，同区域
+    # 条带/compact 共用缓存）+ 全屏各一次
+    assert ocr_calls == ["list", "list", "after", "after"]
 
 
 def test_xinyu_unreplied_filter_does_not_click_when_red(monkeypatch, tmp_path):
@@ -1057,9 +1059,10 @@ def test_xinyu_list_uses_compact_region_after_unread_tab_click(monkeypatch, tmp_
 
     assert target["name"] == "新目标"
     assert robot.clicks == [pytest.approx((0.3, 0.15))]
-    assert regions[0] is None
-    assert isinstance(regions[1], list)
-    assert regions[1] != []
+    # compact 已固定：初扫与切换后重扫都是同一条带（[0, 0.05, 1, 0.30] 高度口径）
+    band = pytest.approx([0.0, 0.05, 1.0, 0.30])
+    assert regions[0] == band
+    assert regions[1] == band
 
 
 def test_xinyu_list_compact_region_falls_back_to_full_ocr(monkeypatch, tmp_path):
@@ -1084,7 +1087,9 @@ def test_xinyu_list_compact_region_falls_back_to_full_ocr(monkeypatch, tmp_path)
     result = steps._run_list_ocr("list", config, prefer_compact=True)
 
     assert result["result"]["message_list"][0]["name"] == "完整结果"
-    assert regions == [[0.0, 0.2, 1.0, 0.5], None]
+    # 缓存里的旧自适应区域被无视：固定条带 + 全屏兜底各一次
+    assert regions[0] == pytest.approx([0.0, 0.05, 1.0, 0.30])
+    assert regions[1] is None
 
 
 def test_xinyu_list_falls_back_to_content_when_unread_is_missing(monkeypatch, tmp_path):

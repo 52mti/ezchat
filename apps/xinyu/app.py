@@ -865,6 +865,15 @@ class XinyuApp(BaseApp):
                 self._emit_round_metrics(round_started_at)
                 self.mark_success()
                 return
+            if steps.flush_pending_input(self.robot, self.config, image=chat_image, reporter=reporter):
+                # 输入框残留的是上一轮已生成的回复，补发即完成本轮，
+                # 不再重复走 TTS 输入，避免同一句话打进两次。
+                self._mark_activity()
+                self.emit_runtime_log("info", "心遇补发输入框残留文本", {"name": target_name})
+                self.record_reply_round(time.monotonic() - round_started_at)
+                self._emit_round_metrics(round_started_at)
+                self.mark_success()
+                return
             if steps.send_new_greeting_if_available(self.robot, self.config, image=chat_image, reporter=reporter):
                 self._mark_activity()
                 # 平台代发的新招呼：文本读不到，写占位轮保证人设知道是自己先开的口（docs/13 4.4）
