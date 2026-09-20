@@ -8,7 +8,7 @@
     }
   ],
   "backends": {},
-  "appVersion": "20260919-01",
+  "appVersion": "20260920-01",
   "runtimeVersion": "2026.09.17-engine-ort",
   "modelVersion": "2026.06.02-full-package-lite"
 }
