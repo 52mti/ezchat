@@ -18,7 +18,7 @@ def test_scan():
 
 def test():
     # 初始化时设置旋转角度
-    robot = RobotInterface("192.168.3.53", rotate=90)
+    robot = RobotInterface("192.168.0.101", rotate=90)
     
     # 1. 获取设备状态
     print("=== 获取设备状态 ===")

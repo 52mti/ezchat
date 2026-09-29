@@ -15,7 +15,6 @@ from services import (
     cleanup_old_logs,
     setup_runtime_logging,
 )
-from ui.main_window import run_app
 from vision.ocr_runtime import create_ocr_runtime_engine
 
 
@@ -129,6 +128,14 @@ def _preload_ocr_runtime() -> str:
         return str(engine.preload() or "")
 
 
+def run_web_console(argv: list[str] | None = None) -> int:
+    """启动本机网页控制台。关掉浏览器不会停止值守。"""
+    del argv
+    from server.console_server import serve
+
+    return serve()
+
+
 def main() -> int:
     _configure_quiet_native_runtime()
     _prune_legacy_engine_layout()
@@ -138,9 +145,9 @@ def main() -> int:
     cleanup_old_error_captures(retention_days=_log_retention_days(config_manager), max_files=200)
     try:
         # OCR 引擎改为首次业务调用时懒加载：启动期后台预热曾在客户机
-        # pythonw 环境把原生引擎加载与 UI 打开叠在一起（崩溃提前到 UI 阶段），
-        # 预热只是提速优化，不值得为此冒险。_preload_ocr_runtime 保留供调试。
-        return run_app(sys.argv)
+        # 把原生引擎加载与界面打开叠在一起。预热只是提速优化。
+        # _preload_ocr_runtime 保留供调试。
+        return run_web_console(sys.argv)
     except KeyboardInterrupt:
         return 130
     except Exception as exc:

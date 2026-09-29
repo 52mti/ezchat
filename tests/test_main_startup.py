@@ -87,16 +87,15 @@ def test_main_starts_ui_without_waiting_for_ocr_preload(monkeypatch):
     monkeypatch.setattr(main, "cleanup_old_logs", lambda **kwargs: None)
     monkeypatch.setattr(main, "cleanup_old_error_captures", lambda **kwargs: None)
     monkeypatch.setattr(main, "_preload_ocr_runtime", lambda: calls.append("preload") or "cpu")
-    def fake_run_app(argv, *, on_ready=None):
-        calls.append("run_app")
-        # 2026-09-14：启动期后台预热已移除（客户机原生崩溃），引擎改懒加载。
+    def fake_run_web(argv, *, on_ready=None):
+        calls.append("run_web")
         assert on_ready is None
         return 0
 
-    monkeypatch.setattr(main, "run_app", fake_run_app)
+    monkeypatch.setattr(main, "run_web_console", fake_run_web)
 
     assert main.main() == 0
-    assert calls == ["run_app"]
+    assert calls == ["run_web"]
 
 
 def test_main_continues_when_ocr_preload_fails(monkeypatch):
@@ -116,15 +115,15 @@ def test_main_continues_when_ocr_preload_fails(monkeypatch):
         raise RuntimeError("broken ocr")
 
     monkeypatch.setattr(main, "_preload_ocr_runtime", fail_preload)
-    def fake_run_app(argv, *, on_ready=None):
-        calls.append("run_app")
+    def fake_run_web(argv, *, on_ready=None):
+        calls.append("run_web")
         assert on_ready is None
         return 0
 
-    monkeypatch.setattr(main, "run_app", fake_run_app)
+    monkeypatch.setattr(main, "run_web_console", fake_run_web)
 
     assert main.main() == 0
-    assert calls == ["run_app"]
+    assert calls == ["run_web"]
 
 
 def test_startup_no_longer_wires_background_preload():

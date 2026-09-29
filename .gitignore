@@ -7,8 +7,10 @@ __pycache__/
 .coverage
 htmlcov/
 build/
-dist/
+/dist/
+web/node_modules/
 *.spec
+node_modules
 
 # 打包引导资源（由 prepare_bootstrap.py 生成，体积大，不入库）
 _bootstrap/
