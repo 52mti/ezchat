@@ -19,7 +19,7 @@ from typing import Any
 
 from apps import get_registered_apps, resolve_app_name
 from services.defaults import with_app_defaults
-from apps.visual_assets import back_button_template_paths
+from apps.visual_assets import back_button_template_paths, machine_template_id
 from lgb.lgb import RobotInterface
 from services import (
     ChatHistoryStore,
@@ -234,7 +234,6 @@ class DeviceWorker(threading.Thread):
             pass
         self.license_client = LicenseClient(
             api_url=str(global_config.get("license_api_url", "")),
-            project_uuid=str(global_config.get("project_uuid", "")),
             project_secret=str(global_config.get("project_secret", "")),
         )
         self.chat_history_store = ChatHistoryStore()
@@ -583,7 +582,12 @@ class DeviceWorker(threading.Thread):
         if not license_api_url:
             self._emit("warning", "license_api_url not configured; skipping online license check")
             return True
-        result = self.license_client.verify_with_offline(str(self.device["ip"]), license_key, expires)
+        result = self.license_client.verify_with_offline(
+            str(self.device["ip"]),
+            license_key,
+            expires,
+            machine_id=machine_template_id(),
+        )
         if not result.ok:
             self._emit("error", result.message, {"status": result.status})
             self.pause()

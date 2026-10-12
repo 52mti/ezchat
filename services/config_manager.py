@@ -15,7 +15,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "schema_version": 1,
     "global": {
         "license_api_url": "",
-        "project_uuid": "",
         "project_secret": "",
         "greetings_dir": "runtime/greetings",
         "ocr_max_concurrency": 1,

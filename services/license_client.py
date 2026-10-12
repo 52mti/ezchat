@@ -20,28 +20,26 @@ class LicenseClient:
     def __init__(
         self,
         api_url: str = "",
-        project_uuid: str = "",
         project_secret: str = "",
         timeout: float = 10.0,
         session: requests.Session | None = None,
     ) -> None:
         self.api_url = api_url
-        self.project_uuid = project_uuid
         self.project_secret = project_secret
         self.timeout = timeout
         self.session = session or requests.Session()
 
-    def verify(self, device_ip: str, license_key: str) -> LicenseResult:
+    def verify(self, device_ip: str, license_key: str, machine_id: str = "") -> LicenseResult:
         if not self.api_url:
             return LicenseResult(False, "not_configured", "license_api_url is not configured")
         if not license_key:
             return LicenseResult(False, "missing_key", "license_key is empty")
 
         payload = {
-            "project_uuid": self.project_uuid,
             "project_secret": self.project_secret,
             "device_ip": device_ip,
             "license_key": license_key,
+            "machine_id": machine_id,
         }
         try:
             response = self.session.post(self.api_url, json=payload, timeout=self.timeout)
@@ -61,8 +59,9 @@ class LicenseClient:
         device_ip: str,
         license_key: str,
         cached_expires_at: str = "",
+        machine_id: str = "",
     ) -> LicenseResult:
-        result = self.verify(device_ip, license_key)
+        result = self.verify(device_ip, license_key, machine_id=machine_id)
         if result.ok:
             return result
         if result.status == "request_failed" and _is_future_time(cached_expires_at):

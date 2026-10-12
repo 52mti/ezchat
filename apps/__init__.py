@@ -4,12 +4,14 @@ import importlib
 from typing import TYPE_CHECKING
 
 from apps.xinyu.app import XinyuApp
+from apps.xinyu_graph.app import XinyuGraphApp
 
 if TYPE_CHECKING:
     from .base import BaseApp
 
 REGISTERED_APPS: dict[str, type["BaseApp"]] = {
     "xinyu": XinyuApp,
+    "xinyu_graph": XinyuGraphApp,
 }
 LEGACY_APP_ALIASES: dict[str, str] = {
     "wechat": "xinyu",
@@ -50,6 +52,7 @@ def run_ocr_mode_for(app_name: str | None):
 
 __all__ = [
     "XinyuApp",
+    "XinyuGraphApp",
     "REGISTERED_APPS",
     "LEGACY_APP_ALIASES",
     "get_registered_apps",

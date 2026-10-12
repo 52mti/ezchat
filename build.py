@@ -908,6 +908,9 @@ def _archive_excludes(relative: str, *, update_payload: bool) -> bool:
     # 已由更新器 runtime/ 不可触碰规则整体保护。
     if relative == "package_manifest.json":
         return True
+    # 发卡后台和数据库口令不能进客户包。
+    if relative == "license_admin" or _relative_matches_prefix(relative, "license_admin"):
+        return True
     if update_payload:
         # 更新包结构隔离：engine/、models/、runtime/ 只随全量包变化，
         # 客户运行状态（runtime/）任何情况下都不随包下发；tts/piper 是

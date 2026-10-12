@@ -9,6 +9,9 @@ htmlcov/
 build/
 /dist/
 web/node_modules/
+license_admin/.env
+license_admin/web/dist/
+license_admin/**/*.sqlite
 *.spec
 node_modules
 

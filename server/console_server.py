@@ -105,7 +105,10 @@ def create_app(console: ConsoleApp) -> FastAPI:
     def set_app(device_ip: str, body: AppBody) -> dict[str, Any]:
         if console.config_manager.find_device(device_ip) is None:
             raise HTTPException(status_code=404, detail="设备不存在")
-        console.set_selected_app(device_ip, body.app_name)
+        try:
+            console.set_selected_app(device_ip, body.app_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "devices": console.list_devices()}
 
     @app.post("/api/devices/{device_ip}/license")

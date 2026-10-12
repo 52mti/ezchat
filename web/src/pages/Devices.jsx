@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Button, Card, Input, Modal, Space, Statistic, Table, Typography, message } from "antd";
+import { Button, Card, Input, Modal, Select, Space, Statistic, Table, Typography, message } from "antd";
 import { STATUS_LABELS, api } from "../api";
 
 export default function DevicesPage({ devices, status, update, onChanged }) {
@@ -29,7 +29,22 @@ export default function DevicesPage({ devices, status, update, onChanged }) {
 
   const columns = [
     { title: "设备 IP", dataIndex: "ip" },
-    { title: "App", dataIndex: "selected_app" },
+    {
+      title: "App",
+      dataIndex: "selected_app",
+      render: (value, row) => (
+        <span onMouseDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()}>
+          <Select
+            size="small"
+            className="min-w-28"
+            value={value}
+            disabled={["running", "paused", "stopping", "circuit_open"].includes(row.status)}
+            options={(status.apps || []).map((item) => ({ value: item.name, label: item.label || item.name }))}
+            onChange={(appName) => run(() => api.setApp(row.ip, appName))}
+          />
+        </span>
+      ),
+    },
     {
       title: "状态",
       dataIndex: "status",

@@ -223,6 +223,29 @@ def test_ocr_mode_label_follows_install_state(tmp_path):
     assert console.status_snapshot()["ocr_mode"] == "OCR: GPU"
 
 
+def test_running_device_rejects_app_switch(tmp_path):
+    console = _console(tmp_path, [{"ip": "192.168.1.20", "selected_app": "xinyu"}])
+    worker = _LiveWorker()
+    worker.start()
+    console.workers["192.168.1.20"] = worker
+    try:
+        try:
+            console.set_selected_app("192.168.1.20", "xinyu_graph")
+        except ValueError as exc:
+            assert "停止" in str(exc)
+        else:
+            raise AssertionError("运行中的设备不应切换 App")
+        assert console.config_manager.find_device("192.168.1.20")["selected_app"] == "xinyu"
+        worker.release()
+        worker.join(2)
+        console.workers.pop("192.168.1.20", None)
+        console.set_selected_app("192.168.1.20", "xinyu_graph")
+        assert console.config_manager.find_device("192.168.1.20")["selected_app"] == "xinyu_graph"
+    finally:
+        worker.release()
+        worker.join(2)
+
+
 def test_instance_lock_rejects_a_second_holder(tmp_path):
     first = InstanceLock(tmp_path / "main_ui.lock")
     second = InstanceLock(tmp_path / "main_ui.lock")

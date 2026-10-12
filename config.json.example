@@ -1,8 +1,7 @@
 {
   "schema_version": 3,
   "global": {
-    "license_api_url": "",
-    "project_uuid": "",
+    "license_api_url": "https://license.example.com/api/verify",
     "project_secret": "",
     "chat_api_base": "http://liaotianbao.icu",
     "chat_bearer": "",

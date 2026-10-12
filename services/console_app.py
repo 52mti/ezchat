@@ -22,6 +22,7 @@ from typing import Any, Callable
 import requests
 
 from apps import get_default_app_name, get_registered_apps, resolve_app_name
+from apps.visual_assets import machine_template_id
 from services.config_manager import ConfigManager
 from services.device_backend_proxy import DeviceBackendProxyManager
 from services.license_client import LicenseClient
@@ -484,6 +485,10 @@ class ConsoleApp:
         return removed
 
     def set_selected_app(self, device_ip: str, app_name: str) -> None:
+        worker = self.workers.get(device_ip)
+        alive = worker is not None and bool(getattr(worker, "is_alive", lambda: False)())
+        if alive and not bool(getattr(worker, "stop_requested", False)):
+            raise ValueError("设备正在运行，停止后再切换 App")
         self.config_manager.update_device(device_ip, {"selected_app": resolve_app_name(app_name)})
 
     def start_device(self, device_ip: str) -> dict[str, Any]:
@@ -634,14 +639,18 @@ class ConsoleApp:
         factory = self.license_client_factory or LicenseClient
         client = factory(
             api_url=str(global_config.get("license_api_url", "")),
-            project_uuid=str(global_config.get("project_uuid", "")),
             project_secret=str(global_config.get("project_secret", "")),
         )
         self.append_log(device_ip, f"[{time.strftime('%H:%M:%S')}] [info] {device_ip}: 卡密校验中…")
 
         def verify() -> None:
             try:
-                result = client.verify_with_offline(device_ip, license_key, str(device.get("license_expires", "")))
+                result = client.verify_with_offline(
+                    device_ip,
+                    license_key,
+                    str(device.get("license_expires", "")),
+                    machine_id=machine_template_id(),
+                )
             except Exception as exc:
                 self.update_events.put(
                     ("license_verified", {"device_ip": device_ip, "license_key": license_key, "error": str(exc)})

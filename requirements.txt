@@ -9,6 +9,8 @@ pywin32; platform_system == "Windows"
 piper-tts==1.7.0
 fastapi
 uvicorn
+langgraph>=0.2.60
+langgraph-checkpoint-sqlite>=2.0.0
 
 # Full-package OCR runtimes are assembled during build:
 # - NVIDIA: paddlepaddle-gpu + paddleocr/paddlex (Paddle-CUDA)

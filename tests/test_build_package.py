@@ -58,6 +58,35 @@ def test_bundled_dependency_specs_exclude_shared_runtime_packages(tmp_path):
     assert build._bundled_dependency_specs(tmp_path) == ["opencv-python", "PyQt6"]
 
 
+def test_copy_sources_skips_license_admin(tmp_path):
+    root = tmp_path / "repo"
+    package_root = tmp_path / "package"
+    (root / "license_admin" / "backend").mkdir(parents=True)
+    (root / "license_admin" / "backend" / "app.py").write_text("print('admin')\n", encoding="utf-8")
+    (root / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+    build._copy_sources(root, package_root)
+
+    assert (package_root / "main.py").is_file()
+    assert not (package_root / "license_admin").exists()
+
+
+def test_archive_excludes_license_admin_even_if_present(tmp_path):
+    assert build._archive_excludes("license_admin/backend/app/main.py", update_payload=False)
+    assert build._archive_excludes("license_admin/docker-compose.yml", update_payload=True)
+    package_root = tmp_path / build.PACKAGE_NAME
+    (package_root / "license_admin").mkdir(parents=True)
+    (package_root / "license_admin" / "secret.env").write_text("JWT_SECRET=x\n", encoding="utf-8")
+    (package_root / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+    archive_path = build._write_full_package_archive(package_root, tmp_path / "dist")
+
+    with zipfile.ZipFile(archive_path) as archive:
+        names = archive.namelist()
+    assert any(name.endswith("main.py") for name in names)
+    assert all("license_admin" not in name for name in names)
+
+
 def test_copy_sources_does_not_package_release_manifest(tmp_path):
     root = tmp_path / "repo"
     package_root = tmp_path / "package"

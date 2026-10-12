@@ -1,0 +1,15 @@
+{
+  "match_threshold": 0.7,
+  "selected_tab_region": [0.02, 0.06, 0.2, 0.1],
+  "templates": {
+    "buttons": "apps/xinyu/templates/buttons",
+    "screens": "apps/xinyu/templates/screens"
+  },
+  "ocr": {
+    "lang": "ch",
+    "runtime_enabled": true,
+    "backend": "auto",
+    "model_tier": "lite",
+    "use_gpu": true
+  }
+}
